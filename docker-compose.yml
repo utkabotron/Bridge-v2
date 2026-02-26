@@ -1,0 +1,116 @@
+
+services:
+  # ── Infrastructure ────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridge
+      POSTGRES_DB: bridge
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Application Services ──────────────────────────────────
+  wa-service:
+    build: ./wa-service
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - S3_BUCKET=${S3_BUCKET:-bridge-v2-media}
+      - PORT=3000
+    volumes:
+      - wa_sessions:/app/.wwebjs_auth
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  processor:
+    build: ./processor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LANGCHAIN_TRACING_V2=${LANGCHAIN_TRACING_V2:-false}
+      - LANGCHAIN_ENDPOINT=${LANGCHAIN_ENDPOINT}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-bridge-v2}
+      - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Hebrew}
+      - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  bot:
+    build: ./bot
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
+      - WA_SERVICE_URL=http://wa-service:3000
+      - WA_SERVICE_PUBLIC_URL=${WA_SERVICE_PUBLIC_URL:-http://localhost:3000}
+      - ADMIN_TG_IDS=${ADMIN_TG_IDS}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  analytics:
+    build: ./analytics
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
+      - BIGQUERY_PROJECT=${BIGQUERY_PROJECT}
+      - BIGQUERY_DATASET=${BIGQUERY_DATASET:-bridge_analytics}
+      - PREFECT_API_URL=${PREFECT_API_URL}
+      - PREFECT_API_KEY=${PREFECT_API_KEY}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa.json
+    volumes:
+      # Mount only if file exists locally — skip for local dev without BigQuery
+      - ${GCP_SA_PATH:-/dev/null}:/app/gcp-sa.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  redis_data:
+  postgres_data:
+  wa_sessions:
