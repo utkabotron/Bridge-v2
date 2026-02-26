@@ -7,10 +7,9 @@
 
 terraform {
   backend "s3" {
-    bucket         = "bridge-v2-tfstate"   # replace with your bucket name
-    key            = "prod/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "bridge-v2-tflock"
-    encrypt        = true
+    bucket  = "bridge-v2-tfstate-882951811725"
+    key     = "prod/terraform.tfstate"
+    region  = "us-east-1"
+    encrypt = true
   }
 }
