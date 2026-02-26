@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars and fill in values
+# terraform.tfvars is gitignored — never commit it
+
+aws_region          = "us-east-1"
+project             = "bridge-v2"
+env                 = "prod"
+
+telegram_bot_token  = "123456789:AAF..."
+openai_api_key      = "sk-..."
+langchain_api_key   = "ls__..."
+db_password         = "generate-strong-password-here"
+admin_tg_ids        = "191440421"

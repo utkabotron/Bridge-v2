@@ -96,6 +96,11 @@ resource "aws_ecs_service" "wa_service" {
     security_groups  = [aws_security_group.services.id]
     assign_public_ip = true
   }
+
+  # Cloud Map: bot reaches wa-service at http://wa-service.bridge-v2-prod.local:3000
+  service_registries {
+    registry_arn = aws_service_discovery_service.wa_service.arn
+  }
 }
 
 # ── processor Task ────────────────────────────────────────
@@ -146,6 +151,10 @@ resource "aws_ecs_service" "processor" {
     security_groups  = [aws_security_group.services.id]
     assign_public_ip = true
   }
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.processor.arn
+  }
 }
 
 # ── bot Task ──────────────────────────────────────────────
@@ -167,7 +176,7 @@ resource "aws_ecs_task_definition" "bot" {
       { name = "TELEGRAM_BOT_TOKEN", value = var.telegram_bot_token },
       { name = "REDIS_HOST",         value = local.redis_host },
       { name = "DATABASE_URL",       value = local.db_url },
-      { name = "WA_SERVICE_URL",     value = "http://wa-service:3000" },
+      { name = "WA_SERVICE_URL",     value = "http://wa-service.${local.name}.local:3000" },
       { name = "ADMIN_TG_IDS",       value = var.admin_tg_ids },
     ]
 

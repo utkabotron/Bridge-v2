@@ -55,6 +55,33 @@ migrate:
 db-shell:
 	docker compose exec postgres psql -U bridge -d bridge
 
+# ── ECR push (manual, requires AWS_ACCOUNT_ID env var) ───
+ECR_REGISTRY ?= $(AWS_ACCOUNT_ID).dkr.ecr.us-east-1.amazonaws.com
+TAG          ?= latest
+
+ecr-login:
+	aws ecr get-login-password --region us-east-1 | \
+	  docker login --username AWS --password-stdin $(ECR_REGISTRY)
+
+ecr-push: ecr-login
+	@for svc in wa-service processor bot analytics; do \
+	  docker build -t $(ECR_REGISTRY)/bridge-v2-$$svc:$(TAG) ./$$svc && \
+	  docker push $(ECR_REGISTRY)/bridge-v2-$$svc:$(TAG); \
+	done
+
+# ── Terraform ─────────────────────────────────────────────
+tf-init:
+	cd infra/terraform && terraform init
+
+tf-plan:
+	cd infra/terraform && terraform plan -var-file=terraform.tfvars
+
+tf-apply:
+	cd infra/terraform && terraform apply -var-file=terraform.tfvars
+
+tf-destroy:
+	cd infra/terraform && terraform destroy -var-file=terraform.tfvars
+
 # ── Production deploy helpers ─────────────────────────────
 deploy-processor:
 	aws ecs update-service --cluster bridge-v2 --service processor --force-new-deployment
