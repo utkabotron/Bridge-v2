@@ -35,8 +35,8 @@ build-no-cache:
 
 # ── Testing ───────────────────────────────────────────────
 test:
-	cd processor && python -m pytest tests/ -v
-	cd bot && python -m pytest tests/ -v
+	cd processor && python3 -m pytest tests/ -v
+	cd bot && python3 -m pytest tests/ -v
 
 lint:
 	cd processor && ruff check src/
