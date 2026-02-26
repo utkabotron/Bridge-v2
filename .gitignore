@@ -30,3 +30,4 @@ infra/terraform/.terraform/
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
 infra/terraform/*.tfvars
+bridge-v2-deploy_accessKeys.csv

@@ -105,12 +105,31 @@ resource "aws_security_group" "services" {
     protocol    = "tcp"
     cidr_blocks = [data.aws_vpc.default.cidr_block]
   }
+
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = [data.aws_vpc.default.cidr_block]
+  }
 }
 
 # ── ElastiCache Redis ─────────────────────────────────────
 resource "aws_elasticache_subnet_group" "redis" {
   name       = "${local.name}-redis"
   subnet_ids = data.aws_subnets.default.ids
+}
+
+resource "aws_security_group" "redis" {
+  name   = "${local.name}-redis"
+  vpc_id = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.services.id]
+  }
 }
 
 resource "aws_elasticache_cluster" "redis" {
@@ -120,6 +139,7 @@ resource "aws_elasticache_cluster" "redis" {
   num_cache_nodes      = 1
   parameter_group_name = "default.redis7"
   subnet_group_name    = aws_elasticache_subnet_group.redis.name
+  security_group_ids   = [aws_security_group.redis.id]
   port                 = 6379
 }
 
