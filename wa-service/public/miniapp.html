@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Bridge — Connect WhatsApp</title>
+  <title>Bridge — WhatsApp Hub</title>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
@@ -157,7 +157,7 @@
       color: var(--tg-theme-button-color, #3390ec);
     }
 
-    .add-bot-btn {
+    .primary-btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
@@ -171,8 +171,27 @@
       cursor: pointer;
       margin-bottom: 16px;
       transition: transform 0.15s;
+      text-decoration: none;
     }
-    .add-bot-btn:active {
+    .primary-btn:active {
+      transform: scale(0.97);
+    }
+
+    .secondary-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 20px;
+      border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+      color: var(--tg-theme-text-color, #000);
+      font-size: 14px;
+      font-weight: 500;
+      border: none;
+      cursor: pointer;
+      transition: transform 0.15s;
+    }
+    .secondary-btn:active {
       transform: scale(0.97);
     }
 
@@ -188,12 +207,124 @@
       margin-top: 12px;
       text-align: center;
     }
+
+    /* ── Home screen ─────────────────────────── */
+    .pair-card {
+      display: flex;
+      align-items: center;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+      width: 100%;
+      margin-bottom: 8px;
+    }
+    .pair-card.paused { opacity: 0.6; }
+
+    .pair-info { flex: 1; min-width: 0; }
+    .pair-wa {
+      font-weight: 500;
+      font-size: 15px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .pair-tg {
+      font-size: 12px;
+      color: var(--tg-theme-hint-color, #888);
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .pair-status {
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .pair-status.active { color: #4caf50; }
+    .pair-status.paused { color: #ff9800; }
+
+    .pair-actions {
+      display: flex;
+      gap: 8px;
+      margin-left: 12px;
+      flex-shrink: 0;
+    }
+    .pair-actions button {
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--tg-theme-bg-color, #fff);
+      transition: transform 0.15s;
+    }
+    .pair-actions button:active { transform: scale(0.9); }
+
+    .hint-box {
+      margin-top: 20px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #888);
+      line-height: 1.5;
+      width: 100%;
+      max-width: 400px;
+    }
+    .hint-box strong {
+      color: var(--tg-theme-text-color, #000);
+    }
+
+    .copy-toast {
+      position: fixed;
+      bottom: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--tg-theme-text-color, #000);
+      color: var(--tg-theme-bg-color, #fff);
+      padding: 10px 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    .copy-toast.show { opacity: 1; }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      text-align: center;
+    }
+    .empty-state .emoji { font-size: 48px; margin-bottom: 16px; }
   </style>
 </head>
 <body>
 
-<!-- Step 1: QR Code -->
-<div id="step-qr" class="screen active">
+<!-- Loading -->
+<div id="screen-loading" class="screen active">
+  <div style="margin-top: 40vh;"><div class="spinner"></div></div>
+</div>
+
+<!-- Home (pairs management) -->
+<div id="screen-home" class="screen">
+  <h2>Your Chats</h2>
+  <p class="subtitle">Manage your WhatsApp → Telegram pairs</p>
+  <div id="pairs-list" style="width:100%;max-width:400px;"></div>
+  <button id="btn-add-pair" class="primary-btn" style="margin-top:16px;">+ Add new pair</button>
+  <div class="hint-box">
+    <strong>How it works:</strong> Messages from your WhatsApp groups are forwarded to linked Telegram groups with automatic translation.
+  </div>
+</div>
+
+<!-- QR Code -->
+<div id="screen-qr" class="screen">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
     <div class="step-dot"></div>
@@ -209,11 +340,12 @@
     <div class="spinner"></div>
   </div>
   <p id="qr-status">Generating QR code...</p>
+  <button id="btn-copy-qr" class="secondary-btn" style="margin-top:12px;">Copy QR link</button>
   <p id="qr-error" class="error-msg" style="display:none"></p>
 </div>
 
-<!-- Step 2: WA Groups -->
-<div id="step-groups" class="screen">
+<!-- WA Groups -->
+<div id="screen-wa-groups" class="screen">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
@@ -222,11 +354,11 @@
   </div>
   <h2>Select WhatsApp Group</h2>
   <p class="subtitle">Choose which group to forward messages from:</p>
-  <div id="group-list" class="group-list"></div>
+  <div id="wa-group-list" class="group-list"></div>
 </div>
 
-<!-- Step 3: Add bot to TG group -->
-<div id="step-add-bot" class="screen">
+<!-- Add bot to TG group -->
+<div id="screen-add-bot" class="screen">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
@@ -236,13 +368,13 @@
   <h2>Add Bot to Telegram Group</h2>
   <div id="selected-wa-group" class="selected-group"></div>
   <p class="subtitle">Add the bot to an existing Telegram group, or create a new one:</p>
-  <button id="add-bot-btn" class="add-bot-btn">Add bot to group</button>
+  <button id="btn-add-bot" class="primary-btn">Add bot to group</button>
   <p class="waiting-text">After adding, come back here — the group will appear below.</p>
   <div id="tg-group-list" class="group-list" style="margin-top: 16px;"></div>
 </div>
 
-<!-- Step 4: Select TG group -->
-<div id="step-tg-groups" class="screen">
+<!-- Select TG group -->
+<div id="screen-tg-groups" class="screen">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
@@ -255,6 +387,9 @@
   <div id="tg-group-list-final" class="group-list"></div>
 </div>
 
+<!-- Toast -->
+<div id="copy-toast" class="copy-toast">Link copied!</div>
+
 <script>
 (function() {
   var tg = window.Telegram.WebApp;
@@ -263,6 +398,7 @@
 
   var user = tg.initDataUnsafe.user;
   if (!user || !user.id) {
+    showScreen('screen-qr');
     document.getElementById('qr-error').textContent = 'Could not identify user. Open this from Telegram.';
     document.getElementById('qr-error').style.display = 'block';
     return;
@@ -274,8 +410,8 @@
   var pollTimer = null;
   var qrTimer = null;
   var tgPollTimer = null;
+  var isAddingPair = false;
 
-  // Get bot username from query param
   var params = new URLSearchParams(window.location.search);
   var botUsername = params.get('bot') || '';
 
@@ -283,12 +419,21 @@
   function showScreen(id) {
     document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
     document.getElementById(id).classList.add('active');
+    tg.MainButton.hide();
+    tg.BackButton.hide();
   }
 
   function escapeHtml(str) {
     var div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+  }
+
+  function showToast(msg) {
+    var toast = document.getElementById('copy-toast');
+    toast.textContent = msg;
+    toast.classList.add('show');
+    setTimeout(function() { toast.classList.remove('show'); }, 2000);
   }
 
   function renderGroupCards(groups, container, onClickFn) {
@@ -302,13 +447,143 @@
         '<div class="group-icon">' + title.charAt(0).toUpperCase() + '</div>' +
         '<div class="group-info">' +
           '<div class="group-name">' + escapeHtml(title) + '</div>' +
+          (g.participants ? '<div class="group-members">' + g.participants + ' members</div>' : '') +
         '</div>';
       btn.onclick = function() { onClickFn(g); };
       container.appendChild(btn);
     });
   }
 
-  // ── Step 1: QR ───────────────────────────────────────────
+  // ── Load chat pairs (entry point) ─────────────────────────
+  function loadPairs() {
+    showScreen('screen-loading');
+    fetch('/chat-pairs/' + userId)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var pairs = data.pairs || [];
+        if (pairs.length === 0 && !isAddingPair) {
+          // First time: go to QR
+          startQRFlow();
+        } else {
+          showHome(pairs);
+        }
+      })
+      .catch(function(err) {
+        console.error('loadPairs error:', err);
+        // Fallback: go to QR
+        startQRFlow();
+      });
+  }
+
+  // ── Home screen ───────────────────────────────────────────
+  function showHome(pairs) {
+    showScreen('screen-home');
+    var list = document.getElementById('pairs-list');
+    list.innerHTML = '';
+
+    if (pairs.length === 0) {
+      list.innerHTML =
+        '<div class="empty-state">' +
+          '<div class="emoji">📭</div>' +
+          '<p class="subtitle">No pairs yet. Add your first one!</p>' +
+        '</div>';
+      return;
+    }
+
+    pairs.forEach(function(p) {
+      var card = document.createElement('div');
+      card.className = 'pair-card' + (p.status === 'paused' ? ' paused' : '');
+
+      var toggleIcon = p.status === 'paused' ? '▶️' : '⏸';
+      var statusClass = p.status === 'paused' ? 'paused' : 'active';
+      var statusText = p.status === 'paused' ? 'Paused' : 'Active';
+
+      card.innerHTML =
+        '<div class="pair-info">' +
+          '<div class="pair-wa">' + escapeHtml(p.wa_chat_name || 'WhatsApp') + '</div>' +
+          '<div class="pair-tg">→ ' + escapeHtml(p.tg_chat_title || 'Telegram') + '</div>' +
+          '<div class="pair-status ' + statusClass + '">' + statusText + '</div>' +
+        '</div>' +
+        '<div class="pair-actions">' +
+          '<button class="btn-toggle" data-id="' + p.id + '" data-status="' + p.status + '">' + toggleIcon + '</button>' +
+          '<button class="btn-delete" data-id="' + p.id + '">🗑</button>' +
+        '</div>';
+      list.appendChild(card);
+    });
+
+    // Bind events
+    list.querySelectorAll('.btn-toggle').forEach(function(btn) {
+      btn.onclick = function() {
+        var pairId = btn.dataset.id;
+        var newStatus = btn.dataset.status === 'active' ? 'paused' : 'active';
+        togglePair(pairId, newStatus);
+      };
+    });
+    list.querySelectorAll('.btn-delete').forEach(function(btn) {
+      btn.onclick = function() {
+        var pairId = btn.dataset.id;
+        deletePairConfirm(pairId);
+      };
+    });
+  }
+
+  function togglePair(pairId, newStatus) {
+    fetch('/chat-pairs/' + pairId, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function() { loadPairs(); })
+    .catch(function(err) { showToast('Error: ' + err.message); });
+  }
+
+  function deletePairConfirm(pairId) {
+    if (!confirm('Delete this pair?')) return;
+    fetch('/chat-pairs/' + pairId, { method: 'DELETE' })
+      .then(function(r) { return r.json(); })
+      .then(function() { loadPairs(); })
+      .catch(function(err) { showToast('Error: ' + err.message); });
+  }
+
+  // ── Add new pair button ───────────────────────────────────
+  document.getElementById('btn-add-pair').onclick = function() {
+    isAddingPair = true;
+    selectedWaGroup = null;
+    selectedTgGroup = null;
+    startQRFlow();
+  };
+
+  // ── QR flow ───────────────────────────────────────────────
+  function startQRFlow() {
+    showScreen('screen-qr');
+
+    // Back button → home (only if adding pair)
+    if (isAddingPair) {
+      tg.BackButton.show();
+      tg.BackButton.onClick(function backHandler() {
+        tg.BackButton.offClick(backHandler);
+        isAddingPair = false;
+        clearTimeout(qrTimer);
+        clearTimeout(pollTimer);
+        loadPairs();
+      });
+    }
+
+    // Check if already connected
+    fetch('/status/' + userId)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.isReady) {
+          clearTimeout(qrTimer);
+          showWaGroupList(data.groups || []);
+        } else {
+          startConnect();
+        }
+      })
+      .catch(function() { startConnect(); });
+  }
+
   function startConnect() {
     fetch('/connect/' + userId, { method: 'POST' })
       .then(function() { loadQR(); pollStatus(); })
@@ -355,10 +630,32 @@
     el.style.display = 'block';
   }
 
-  // ── Step 2: WA Groups ────────────────────────────────────
+  // Copy QR link
+  document.getElementById('btn-copy-qr').onclick = function() {
+    var link = window.location.origin + '/qr/page/' + userId;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(link).then(function() {
+        showToast('Link copied!');
+      });
+    } else {
+      showToast(link);
+    }
+  };
+
+  // ── WA Groups ─────────────────────────────────────────────
   function showWaGroupList(groups) {
-    showScreen('step-groups');
-    var list = document.getElementById('group-list');
+    showScreen('screen-wa-groups');
+
+    // Back button
+    tg.BackButton.show();
+    tg.BackButton.onClick(function backHandler() {
+      tg.BackButton.offClick(backHandler);
+      clearTimeout(tgPollTimer);
+      if (isAddingPair) { loadPairs(); isAddingPair = false; }
+      else { startQRFlow(); }
+    });
+
+    var list = document.getElementById('wa-group-list');
     list.innerHTML = '';
 
     if (groups.length === 0) {
@@ -380,7 +677,7 @@
     });
   }
 
-  // ── Step 3: Add bot to TG group ──────────────────────────
+  // ── Add bot to TG group ───────────────────────────────────
   function selectWaGroup(g) {
     selectedWaGroup = { wa_chat_id: g.id, wa_chat_name: g.name };
 
@@ -389,18 +686,32 @@
     document.getElementById('selected-wa-group2').innerHTML =
       'WhatsApp: <strong>' + escapeHtml(g.name) + '</strong>';
 
-    showScreen('step-add-bot');
-    tg.MainButton.hide();
+    showScreen('screen-add-bot');
+
+    tg.BackButton.show();
+    tg.BackButton.onClick(function backHandler() {
+      tg.BackButton.offClick(backHandler);
+      stopTgGroupPolling();
+      // Go back to WA groups — re-fetch status
+      fetch('/status/' + userId)
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.isReady) showWaGroupList(data.groups || []);
+          else startQRFlow();
+        })
+        .catch(function() { startQRFlow(); });
+    });
+
     startTgGroupPolling();
   }
 
-  document.getElementById('add-bot-btn').onclick = function() {
+  document.getElementById('btn-add-bot').onclick = function() {
     if (botUsername) {
       tg.openTelegramLink('https://t.me/' + botUsername + '?startgroup=true');
     }
   };
 
-  // ── Step 3/4: Poll TG groups ─────────────────────────────
+  // ── Poll TG groups ────────────────────────────────────────
   function startTgGroupPolling() {
     clearTimeout(tgPollTimer);
     pollTgGroups();
@@ -415,7 +726,6 @@
       .then(function(r) { return r.json(); })
       .then(function(data) {
         var groups = data.groups || [];
-        // Show found groups inline on step-add-bot
         var inlineList = document.getElementById('tg-group-list');
         if (groups.length > 0) {
           renderGroupCards(groups, inlineList, function(g) {
@@ -431,27 +741,32 @@
       });
   }
 
-  // Restart polling when user comes back to the app
   document.addEventListener('visibilitychange', function() {
     if (!document.hidden && selectedWaGroup && !selectedTgGroup) {
       startTgGroupPolling();
     }
   });
 
-  // ── Step 4: Select TG group ──────────────────────────────
+  // ── Select TG group ───────────────────────────────────────
   function selectTgGroup(g) {
     selectedTgGroup = { tg_chat_id: g.chat_id, tg_chat_title: g.title };
     stopTgGroupPolling();
 
-    showScreen('step-tg-groups');
+    showScreen('screen-tg-groups');
     var list = document.getElementById('tg-group-list-final');
     renderGroupCards([g], list, function() {});
 
-    // Highlight selected
     var cards = list.querySelectorAll('.group-card');
     if (cards.length > 0) {
       cards[0].style.border = '2px solid var(--tg-theme-button-color, #3390ec)';
     }
+
+    tg.BackButton.show();
+    tg.BackButton.onClick(function backHandler() {
+      tg.BackButton.offClick(backHandler);
+      selectedTgGroup = null;
+      selectWaGroup({ id: selectedWaGroup.wa_chat_id, name: selectedWaGroup.wa_chat_name });
+    });
 
     tg.MainButton.setText('Complete Setup');
     tg.MainButton.show();
@@ -472,8 +787,8 @@
     tg.sendData(JSON.stringify(payload));
   }
 
-  // ── Start ────────────────────────────────────────────────
-  startConnect();
+  // ── Start ─────────────────────────────────────────────────
+  loadPairs();
 })();
 </script>
 </body>

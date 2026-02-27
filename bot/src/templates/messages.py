@@ -7,6 +7,13 @@ TEMPLATES = {
         "This bot is invite-only. Contact the administrator to get access."
     ),
 
+    # ── /start (universal) ─────────────────────────────────
+    "welcome_start": (
+        "👋 *Bridge — WhatsApp → Telegram*\n\n"
+        "I forward WhatsApp messages to Telegram groups with automatic translation.\n\n"
+        "Open the app below to connect WhatsApp and manage your chat pairs."
+    ),
+
     # ── /start (authorized, first time) ──────────────────
     "welcome_new": (
         "👋 *Welcome!*\n\n"
@@ -117,6 +124,12 @@ TEMPLATES = {
     "admin_whitelist_removed": "❌ @{username} removed from whitelist.",
     "admin_users_header": "*All users:*\n\n",
     "admin_user_item": "• {tg_user_id} @{username} — {status}\n",
+
+    # ── Bot added to group ─────────────────────────────────
+    "bot_added_as_admin": (
+        "✅ *Ready!*\n\n"
+        "Use /add to link a WhatsApp group to this chat."
+    ),
 
     # ── Errors ────────────────────────────────────────────
     "error_generic": "Something went wrong. Please try again.",

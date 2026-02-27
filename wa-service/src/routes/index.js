@@ -3,6 +3,7 @@ const path = require('path');
 const QRCode = require('qrcode');
 const { clients, createWhatsAppClient } = require('../whatsapp-client');
 const { redis } = require('../redis-publisher');
+const { getChatPairs, setChatPairStatus, deleteChatPair } = require('../db');
 
 const router = express.Router();
 
@@ -195,6 +196,54 @@ router.post('/reconnect/:userId', async (req, res) => {
     createWhatsAppClient(userId).catch(console.error);
     res.json({ message: 'Reconnecting', qrPageUrl: `/qr/page/${userId}` });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Chat Pairs CRUD ──────────────────────────────────────
+
+router.get('/chat-pairs/:userId', async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
+
+  try {
+    const pairs = await getChatPairs(userId);
+    res.json({ pairs });
+  } catch (err) {
+    console.error('getChatPairs error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch('/chat-pairs/:pairId', async (req, res) => {
+  const pairId = parseInt(req.params.pairId, 10);
+  if (isNaN(pairId)) return res.status(400).json({ error: 'Invalid pairId' });
+
+  const { status } = req.body || {};
+  if (!['active', 'paused'].includes(status)) {
+    return res.status(400).json({ error: 'Status must be "active" or "paused"' });
+  }
+
+  try {
+    const ok = await setChatPairStatus(pairId, status);
+    if (!ok) return res.status(404).json({ error: 'Pair not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('setChatPairStatus error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/chat-pairs/:pairId', async (req, res) => {
+  const pairId = parseInt(req.params.pairId, 10);
+  if (isNaN(pairId)) return res.status(400).json({ error: 'Invalid pairId' });
+
+  try {
+    const ok = await deleteChatPair(pairId);
+    if (!ok) return res.status(404).json({ error: 'Pair not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('deleteChatPair error:', err);
     res.status(500).json({ error: err.message });
   }
 });

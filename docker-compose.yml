@@ -97,6 +97,7 @@ services:
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}
       - S3_BUCKET=${S3_BUCKET:-bridge-media}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - PORT=3000
     volumes:
       - wa_sessions:/app/.wwebjs_auth
@@ -104,6 +105,8 @@ services:
       redis:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
   processor:

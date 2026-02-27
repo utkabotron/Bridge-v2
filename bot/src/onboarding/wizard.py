@@ -73,35 +73,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await create_user(tg_id, user.username)
-    state = await get_onboarding_state(tg_id)
 
+    # Fallback: migrated users without onboarding record
+    state = await get_onboarding_state(tg_id)
     if state != DONE:
-        # Fallback: user migrated or added via DB without onboarding record
         pairs = await get_chat_pairs(tg_id)
         if pairs:
             logger.info("Fallback: user %s has %d chat pairs but state=%s, marking done", tg_id, len(pairs), state)
             await set_onboarding_state(tg_id, DONE)
-            state = DONE
 
-    if state == DONE:
-        kb = [
-            [InlineKeyboardButton("📋 My chats", callback_data="nav:chats")],
-            [InlineKeyboardButton("➕ Add chat", callback_data="nav:add")],
-        ]
-        await update.message.reply_text(
-            render("welcome_back"),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    # First time or incomplete onboarding → open Mini App
-    await set_onboarding_state(tg_id, IDLE)
+    # Always show description + Mini App button
     me = await ctx.bot.get_me()
     miniapp_url = f"{MINIAPP_URL}?bot={me.username}"
-    kb = [[InlineKeyboardButton("🔗 Connect WhatsApp", web_app=WebAppInfo(url=miniapp_url))]]
+    kb = [[InlineKeyboardButton("📱 Open Mini App", web_app=WebAppInfo(url=miniapp_url))]]
     await update.message.reply_text(
-        render("welcome_new"),
+        render("welcome_start"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )

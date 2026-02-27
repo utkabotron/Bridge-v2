@@ -11,8 +11,10 @@ import logging
 import os
 
 import redis.asyncio as aioredis
-from telegram import ChatMemberUpdated, Update
+from telegram import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
+
+from ..templates.messages import render
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,33 @@ async def handle_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await r.hset(key, str(chat.id), value)
         await r.expire(key, TTL_SECONDS)
         logger.info("Bot added to group %s (%s) by user %s", chat.id, chat.title, from_user.id)
+
+        # If added as admin → send ready message with /add hint
+        if new_status == "administrator":
+            try:
+                kb = [[InlineKeyboardButton("➕ Link WhatsApp group", callback_data="cmd:add")]]
+                await ctx.bot.send_message(
+                    chat_id=chat.id,
+                    text=render("bot_added_as_admin"),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                )
+            except Exception as exc:
+                logger.warning("Could not send admin message to %s: %s", chat.id, exc)
+
+    elif new_status == "administrator" and old_status == "member":
+        # Bot promoted to admin in existing group
+        logger.info("Bot promoted to admin in group %s (%s) by user %s", chat.id, chat.title, from_user.id)
+        try:
+            kb = [[InlineKeyboardButton("➕ Link WhatsApp group", callback_data="cmd:add")]]
+            await ctx.bot.send_message(
+                chat_id=chat.id,
+                text=render("bot_added_as_admin"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+        except Exception as exc:
+            logger.warning("Could not send admin message to %s: %s", chat.id, exc)
 
     elif new_status in ("left", "kicked") and old_status in ("member", "administrator"):
         # Bot was removed from a group
