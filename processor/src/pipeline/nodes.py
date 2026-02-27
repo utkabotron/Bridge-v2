@@ -67,14 +67,14 @@ async def validate_node(state: MessageState) -> MessageState:
                     "fallback_to_admins": True}
 
         return {**state, "chat_pair_id": None, "tg_chat_id": None,
-                "target_language": state.get("target_language", "Hebrew"),
+                "target_language": state.get("target_language", "Russian"),
                 "delivery_status": "failed", "error": "no_chat_pair"}
 
     return {
         **state,
         "chat_pair_id": pair["id"],
         "tg_chat_id": pair["tg_chat_id"],
-        "target_language": pair.get("target_language") or "Hebrew",
+        "target_language": pair.get("target_language") or "Russian",
     }
 
 
@@ -87,7 +87,7 @@ async def translate_node(state: MessageState) -> MessageState:
     if not text:
         return {**state, "translated_text": text, "translation_ms": 0, "cache_hit": False}
 
-    lang = state.get("target_language", "Hebrew")
+    lang = state.get("target_language", "Russian")
 
     # Cache lookup
     cached = await get_cached(text, lang)

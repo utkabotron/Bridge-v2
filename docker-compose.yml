@@ -4,6 +4,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "6379:6379"
     volumes:
@@ -17,6 +22,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: bridge
       POSTGRES_PASSWORD: bridge
@@ -35,6 +41,7 @@ services:
   minio:
     image: minio/minio
     restart: unless-stopped
+    logging: *default-logging
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -64,6 +71,7 @@ services:
   wa-service:
     build: ./wa-service
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "3000:3000"
     environment:
@@ -87,6 +95,7 @@ services:
   processor:
     build: ./processor
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8000:8000"
     environment:
@@ -99,7 +108,7 @@ services:
       - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
       - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-bridge-v2}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Hebrew}
+      - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Russian}
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
     depends_on:
@@ -111,6 +120,7 @@ services:
   bot:
     build: ./bot
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "8001:8001"
     environment:
@@ -130,6 +140,7 @@ services:
   analytics:
     build: ./analytics
     restart: unless-stopped
+    logging: *default-logging
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - BIGQUERY_PROJECT=${BIGQUERY_PROJECT}
