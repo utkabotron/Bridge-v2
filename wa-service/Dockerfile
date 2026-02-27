@@ -21,6 +21,7 @@ COPY package*.json ./
 RUN npm install --only=production
 
 COPY src/ ./src/
+COPY public/ ./public/
 
 # Auth directory for WhatsApp sessions (EFS mount in production)
 RUN mkdir -p .wwebjs_auth

@@ -8,7 +8,7 @@ const router = express.Router();
 
 // ── Mini App ─────────────────────────────────────────────
 router.get('/miniapp', (req, res) => {
-  res.sendFile('miniapp.html', { root: path.join(__dirname, '..', 'public') });
+  res.sendFile('miniapp.html', { root: path.join(__dirname, '..', '..', 'public') });
 });
 
 // ── Health ────────────────────────────────────────────────
