@@ -11,7 +11,7 @@ create table if not exists public.users (
   is_active       boolean not null default true,
   wa_session_id   text,
   wa_connected    boolean not null default false,
-  target_language text not null default 'Hebrew',
+  target_language text not null default 'Russian',
   created_at      timestamptz not null default now()
 );
 

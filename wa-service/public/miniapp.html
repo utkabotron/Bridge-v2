@@ -368,7 +368,7 @@
   <h2>Add Bot to Telegram Group</h2>
   <div id="selected-wa-group" class="selected-group"></div>
   <p class="subtitle">Add the bot to an existing Telegram group, or create a new one:</p>
-  <button id="btn-add-bot" class="primary-btn">Add bot to group</button>
+  <a id="btn-add-bot" class="primary-btn" href="#" target="_blank">Add bot to group</a>
   <p class="waiting-text">After adding, come back here — the group will appear below.</p>
   <div id="tg-group-list" class="group-list" style="margin-top: 16px;"></div>
 </div>
@@ -455,14 +455,22 @@
   }
 
   // ── Load chat pairs (entry point) ─────────────────────────
+  var needsReconnect = false;
+
   function loadPairs() {
     showScreen('screen-loading');
     fetch('/chat-pairs/' + userId)
       .then(function(r) { return r.json(); })
       .then(function(data) {
         var pairs = data.pairs || [];
-        if (pairs.length === 0 && !isAddingPair) {
-          // First time: go to QR
+        var waConnected = data.wa_connected;
+
+        if (!waConnected) {
+          // WA disconnected → show QR, then go to Home after connect
+          needsReconnect = true;
+          startQRFlow();
+        } else if (pairs.length === 0 && !isAddingPair) {
+          // First time, WA connected but no pairs
           startQRFlow();
         } else {
           showHome(pairs);
@@ -470,7 +478,6 @@
       })
       .catch(function(err) {
         console.error('loadPairs error:', err);
-        // Fallback: go to QR
         startQRFlow();
       });
   }
@@ -576,7 +583,12 @@
       .then(function(data) {
         if (data.isReady) {
           clearTimeout(qrTimer);
-          showWaGroupList(data.groups || []);
+          if (needsReconnect) {
+            needsReconnect = false;
+            loadPairs();
+          } else {
+            showWaGroupList(data.groups || []);
+          }
         } else {
           startConnect();
         }
@@ -614,7 +626,12 @@
       .then(function(data) {
         if (data.isReady) {
           clearTimeout(qrTimer);
-          showWaGroupList(data.groups || []);
+          if (needsReconnect) {
+            needsReconnect = false;
+            loadPairs();
+          } else {
+            showWaGroupList(data.groups || []);
+          }
           return;
         }
         pollTimer = setTimeout(pollStatus, 2000);
@@ -705,11 +722,10 @@
     startTgGroupPolling();
   }
 
-  document.getElementById('btn-add-bot').onclick = function() {
-    if (botUsername) {
-      tg.openTelegramLink('https://t.me/' + botUsername + '?startgroup=true');
-    }
-  };
+  // Set add-bot link href (Telegram handles natively)
+  if (botUsername) {
+    document.getElementById('btn-add-bot').href = 'https://t.me/' + botUsername + '?startgroup=true';
+  }
 
   // ── Poll TG groups ────────────────────────────────────────
   function startTgGroupPolling() {

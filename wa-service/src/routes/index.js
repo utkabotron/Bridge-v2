@@ -3,7 +3,7 @@ const path = require('path');
 const QRCode = require('qrcode');
 const { clients, createWhatsAppClient } = require('../whatsapp-client');
 const { redis } = require('../redis-publisher');
-const { getChatPairs, setChatPairStatus, deleteChatPair } = require('../db');
+const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair } = require('../db');
 
 const router = express.Router();
 
@@ -207,8 +207,11 @@ router.get('/chat-pairs/:userId', async (req, res) => {
   if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   try {
-    const pairs = await getChatPairs(userId);
-    res.json({ pairs });
+    const [pairs, waConnected] = await Promise.all([
+      getChatPairs(userId),
+      getWaConnected(userId),
+    ]);
+    res.json({ pairs, wa_connected: waConnected });
   } catch (err) {
     console.error('getChatPairs error:', err);
     res.status(500).json({ error: err.message });

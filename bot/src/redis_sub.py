@@ -50,7 +50,10 @@ async def handle_qr_event(data: dict) -> None:
     if not user_id or not _bot_app:
         return
 
-    from .db import get_onboarding_state, set_onboarding_state
+    from .db import get_onboarding_state, set_onboarding_state, set_wa_connected
+
+    # Always mark WA as connected in users table
+    await set_wa_connected(int(user_id), str(user_id))
 
     state = await get_onboarding_state(int(user_id))
     if state != "qr_pending":

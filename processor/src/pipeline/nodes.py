@@ -10,8 +10,8 @@ import os
 import time
 from typing import Any
 
-from langdetect import detect, LangDetectException
 
+from langdetect import detect, LangDetectException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
@@ -51,20 +51,24 @@ async def validate_node(state: MessageState) -> MessageState:
 
     if not pair:
         logger.debug("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
-        text = state.get("original_text", "").strip()
-        if text:
-            try:
-                lang = detect(text)
-            except LangDetectException:
-                lang = "ru"
-        else:
-            lang = "ru"
 
-        if lang != "ru":
-            logger.info("No chat pair, non-Russian message (lang=%s) → fallback to admins", lang)
-            return {**state, "chat_pair_id": None, "tg_chat_id": None,
-                    "target_language": "Russian",
-                    "fallback_to_admins": True}
+        # Fallback to admins only for admin's own WA messages
+        admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+        if state["user_id"] in admin_ids:
+            text = state.get("original_text", "").strip()
+            if text:
+                try:
+                    lang = detect(text)
+                except LangDetectException:
+                    lang = "ru"
+            else:
+                lang = "ru"
+
+            if lang != "ru":
+                logger.info("Admin no-pair fallback (lang=%s) → send to admins", lang)
+                return {**state, "chat_pair_id": None, "tg_chat_id": None,
+                        "target_language": "Russian",
+                        "fallback_to_admins": True}
 
         return {**state, "chat_pair_id": None, "tg_chat_id": None,
                 "target_language": state.get("target_language", "Russian"),
