@@ -136,6 +136,20 @@ router.get('/status/:userId', async (req, res) => {
   }
 });
 
+// ── TG groups (from Redis, written by bot) ───────────────
+router.get('/tg-groups/:userId', async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
+
+  try {
+    const raw = await redis.hgetall(`bot:user_groups:${userId}`);
+    const groups = Object.values(raw || {}).map((v) => JSON.parse(v));
+    res.json({ groups });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Connect (create new client) ───────────────────────────
 router.post('/connect/:userId', async (req, res) => {
   const userId = parseInt(req.params.userId, 10);

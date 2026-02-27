@@ -15,6 +15,7 @@ load_dotenv()
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     filters,
@@ -22,6 +23,7 @@ from telegram.ext import (
 
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
 from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
+from .handlers.groups import handle_my_chat_member
 from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
 from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop
 
@@ -65,13 +67,19 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_link_chat, pattern=r"^link:"))
     app.add_handler(CallbackQueryHandler(cb_chat_action, pattern=r"^chat:(pause|resume):"))
 
+    # ── Group tracking (my_chat_member) ───────────────────
+    app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
     # ── Admin ─────────────────────────────────────────────
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
 
     logger.info("Bot starting (polling)")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query", "my_chat_member"],
+    )
 
 
 if __name__ == "__main__":

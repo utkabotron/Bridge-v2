@@ -97,7 +97,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # First time or incomplete onboarding → open Mini App
     await set_onboarding_state(tg_id, IDLE)
-    kb = [[InlineKeyboardButton("🔗 Connect WhatsApp", web_app=WebAppInfo(url=MINIAPP_URL))]]
+    me = await ctx.bot.get_me()
+    miniapp_url = f"{MINIAPP_URL}?bot={me.username}"
+    kb = [[InlineKeyboardButton("🔗 Connect WhatsApp", web_app=WebAppInfo(url=miniapp_url))]]
     await update.message.reply_text(
         render("welcome_new"),
         parse_mode="Markdown",
@@ -192,6 +194,19 @@ async def handle_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(render("error_generic"))
         return
 
+    # New flow: Mini App sends both WA and TG group data
+    tg_chat_id = payload.get("tg_chat_id")
+    tg_chat_title = payload.get("tg_chat_title")
+
+    if tg_chat_id and tg_chat_title:
+        await finish_onboarding(tg_id, wa_chat_id, wa_chat_name, int(tg_chat_id), tg_chat_title)
+        await update.message.reply_text(
+            render("onboarding_done_success", wa_name=wa_chat_name, tg_title=tg_chat_title),
+            parse_mode="Markdown",
+        )
+        return
+
+    # Fallback: old flow (only WA data, user finishes via /done in TG group)
     ctx.user_data["pending_wa_chat"] = {
         "wa_chat_id": wa_chat_id,
         "wa_chat_name": wa_chat_name,

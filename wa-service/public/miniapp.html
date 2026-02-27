@@ -145,34 +145,6 @@
       margin-top: 2px;
     }
 
-    .instructions {
-      width: 100%;
-      max-width: 400px;
-    }
-    .instruction-step {
-      display: flex;
-      align-items: flex-start;
-      margin-bottom: 16px;
-    }
-    .instruction-num {
-      width: 28px; height: 28px;
-      border-radius: 50%;
-      background: var(--tg-theme-button-color, #3390ec);
-      color: var(--tg-theme-button-text-color, #fff);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 14px;
-      font-weight: 600;
-      margin-right: 12px;
-      flex-shrink: 0;
-    }
-    .instruction-text {
-      font-size: 15px;
-      line-height: 1.5;
-      padding-top: 3px;
-    }
-
     .selected-group {
       padding: 12px 16px;
       border-radius: 12px;
@@ -183,6 +155,31 @@
     }
     .selected-group strong {
       color: var(--tg-theme-button-color, #3390ec);
+    }
+
+    .add-bot-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 14px 28px;
+      border-radius: 12px;
+      background: var(--tg-theme-button-color, #3390ec);
+      color: var(--tg-theme-button-text-color, #fff);
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      margin-bottom: 16px;
+      transition: transform 0.15s;
+    }
+    .add-bot-btn:active {
+      transform: scale(0.97);
+    }
+
+    .waiting-text {
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #888);
+      text-align: center;
     }
 
     .error-msg {
@@ -199,6 +196,7 @@
 <div id="step-qr" class="screen active">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
+    <div class="step-dot"></div>
     <div class="step-dot"></div>
     <div class="step-dot"></div>
   </div>
@@ -220,60 +218,94 @@
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
     <div class="step-dot"></div>
+    <div class="step-dot"></div>
   </div>
   <h2>Select WhatsApp Group</h2>
   <p class="subtitle">Choose which group to forward messages from:</p>
   <div id="group-list" class="group-list"></div>
 </div>
 
-<!-- Step 3: Instructions -->
-<div id="step-done" class="screen">
+<!-- Step 3: Add bot to TG group -->
+<div id="step-add-bot" class="screen">
   <div class="step-indicator">
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
     <div class="step-dot filled"></div>
+    <div class="step-dot"></div>
   </div>
-  <h2>Almost Done!</h2>
-  <div id="selected-group" class="selected-group"></div>
-  <div class="instructions">
-    <div class="instruction-step">
-      <div class="instruction-num">1</div>
-      <div class="instruction-text">Create a new Telegram group (any name you like)</div>
-    </div>
-    <div class="instruction-step">
-      <div class="instruction-num">2</div>
-      <div class="instruction-text">Add <strong id="bot-name">the bot</strong> to the group</div>
-    </div>
-    <div class="instruction-step">
-      <div class="instruction-num">3</div>
-      <div class="instruction-text">Type <code>/done</code> in that group</div>
-    </div>
+  <h2>Add Bot to Telegram Group</h2>
+  <div id="selected-wa-group" class="selected-group"></div>
+  <p class="subtitle">Add the bot to an existing Telegram group, or create a new one:</p>
+  <button id="add-bot-btn" class="add-bot-btn">Add bot to group</button>
+  <p class="waiting-text">After adding, come back here — the group will appear below.</p>
+  <div id="tg-group-list" class="group-list" style="margin-top: 16px;"></div>
+</div>
+
+<!-- Step 4: Select TG group -->
+<div id="step-tg-groups" class="screen">
+  <div class="step-indicator">
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
   </div>
-  <p class="subtitle">Press the button below to finish setup.</p>
+  <h2>Select Telegram Group</h2>
+  <div id="selected-wa-group2" class="selected-group"></div>
+  <p class="subtitle">Choose the Telegram group to receive messages:</p>
+  <div id="tg-group-list-final" class="group-list"></div>
 </div>
 
 <script>
 (function() {
-  const tg = window.Telegram.WebApp;
+  var tg = window.Telegram.WebApp;
   tg.ready();
   tg.expand();
 
-  const user = tg.initDataUnsafe.user;
+  var user = tg.initDataUnsafe.user;
   if (!user || !user.id) {
     document.getElementById('qr-error').textContent = 'Could not identify user. Open this from Telegram.';
     document.getElementById('qr-error').style.display = 'block';
     return;
   }
 
-  const userId = user.id;
-  let selectedGroup = null;
-  let pollTimer = null;
-  let qrTimer = null;
+  var userId = user.id;
+  var selectedWaGroup = null;
+  var selectedTgGroup = null;
+  var pollTimer = null;
+  var qrTimer = null;
+  var tgPollTimer = null;
+
+  // Get bot username from query param
+  var params = new URLSearchParams(window.location.search);
+  var botUsername = params.get('bot') || '';
 
   // ── Helpers ──────────────────────────────────────────────
   function showScreen(id) {
     document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
     document.getElementById(id).classList.add('active');
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  function renderGroupCards(groups, container, onClickFn) {
+    container.innerHTML = '';
+    if (groups.length === 0) return;
+    groups.forEach(function(g) {
+      var btn = document.createElement('button');
+      btn.className = 'group-card';
+      var title = g.name || g.title || '';
+      btn.innerHTML =
+        '<div class="group-icon">' + title.charAt(0).toUpperCase() + '</div>' +
+        '<div class="group-info">' +
+          '<div class="group-name">' + escapeHtml(title) + '</div>' +
+        '</div>';
+      btn.onclick = function() { onClickFn(g); };
+      container.appendChild(btn);
+    });
   }
 
   // ── Step 1: QR ───────────────────────────────────────────
@@ -297,7 +329,6 @@
     };
     img.src = '/qr/image/' + userId + '?t=' + Date.now();
 
-    // Refresh QR every 3 seconds
     clearTimeout(qrTimer);
     qrTimer = setTimeout(loadQR, 3000);
   }
@@ -308,7 +339,7 @@
       .then(function(data) {
         if (data.isReady) {
           clearTimeout(qrTimer);
-          showGroupList(data.groups || []);
+          showWaGroupList(data.groups || []);
           return;
         }
         pollTimer = setTimeout(pollStatus, 2000);
@@ -324,10 +355,9 @@
     el.style.display = 'block';
   }
 
-  // ── Step 2: Groups ──────────────────────────────────────
-  function showGroupList(groups) {
+  // ── Step 2: WA Groups ────────────────────────────────────
+  function showWaGroupList(groups) {
     showScreen('step-groups');
-
     var list = document.getElementById('group-list');
     list.innerHTML = '';
 
@@ -345,40 +375,104 @@
           '<div class="group-name">' + escapeHtml(g.name) + '</div>' +
           '<div class="group-members">' + (g.participants || 0) + ' members</div>' +
         '</div>';
-      btn.onclick = function() { selectGroup(g); };
+      btn.onclick = function() { selectWaGroup(g); };
       list.appendChild(btn);
     });
   }
 
-  function escapeHtml(str) {
-    var div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+  // ── Step 3: Add bot to TG group ──────────────────────────
+  function selectWaGroup(g) {
+    selectedWaGroup = { wa_chat_id: g.id, wa_chat_name: g.name };
+
+    document.getElementById('selected-wa-group').innerHTML =
+      'WhatsApp: <strong>' + escapeHtml(g.name) + '</strong>';
+    document.getElementById('selected-wa-group2').innerHTML =
+      'WhatsApp: <strong>' + escapeHtml(g.name) + '</strong>';
+
+    showScreen('step-add-bot');
+    tg.MainButton.hide();
+    startTgGroupPolling();
   }
 
-  // ── Step 3: Done ────────────────────────────────────────
-  function selectGroup(g) {
-    selectedGroup = { wa_chat_id: g.id, wa_chat_name: g.name };
+  document.getElementById('add-bot-btn').onclick = function() {
+    if (botUsername) {
+      tg.openTelegramLink('https://t.me/' + botUsername + '?startgroup=true');
+    }
+  };
 
-    document.getElementById('selected-group').innerHTML =
-      'Selected: <strong>' + escapeHtml(g.name) + '</strong>';
+  // ── Step 3/4: Poll TG groups ─────────────────────────────
+  function startTgGroupPolling() {
+    clearTimeout(tgPollTimer);
+    pollTgGroups();
+  }
 
-    showScreen('step-done');
+  function stopTgGroupPolling() {
+    clearTimeout(tgPollTimer);
+  }
 
-    // Show Telegram MainButton
-    tg.MainButton.setText('Done');
+  function pollTgGroups() {
+    fetch('/tg-groups/' + userId)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        var groups = data.groups || [];
+        // Show found groups inline on step-add-bot
+        var inlineList = document.getElementById('tg-group-list');
+        if (groups.length > 0) {
+          renderGroupCards(groups, inlineList, function(g) {
+            selectTgGroup(g);
+          });
+        } else {
+          inlineList.innerHTML = '';
+        }
+        tgPollTimer = setTimeout(pollTgGroups, 2000);
+      })
+      .catch(function() {
+        tgPollTimer = setTimeout(pollTgGroups, 3000);
+      });
+  }
+
+  // Restart polling when user comes back to the app
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden && selectedWaGroup && !selectedTgGroup) {
+      startTgGroupPolling();
+    }
+  });
+
+  // ── Step 4: Select TG group ──────────────────────────────
+  function selectTgGroup(g) {
+    selectedTgGroup = { tg_chat_id: g.chat_id, tg_chat_title: g.title };
+    stopTgGroupPolling();
+
+    showScreen('step-tg-groups');
+    var list = document.getElementById('tg-group-list-final');
+    renderGroupCards([g], list, function() {});
+
+    // Highlight selected
+    var cards = list.querySelectorAll('.group-card');
+    if (cards.length > 0) {
+      cards[0].style.border = '2px solid var(--tg-theme-button-color, #3390ec)';
+    }
+
+    tg.MainButton.setText('Complete Setup');
     tg.MainButton.show();
     tg.MainButton.onClick(sendData);
   }
 
   function sendData() {
-    if (!selectedGroup) return;
+    if (!selectedWaGroup || !selectedTgGroup) return;
     tg.MainButton.offClick(sendData);
     tg.MainButton.showProgress();
-    tg.sendData(JSON.stringify(selectedGroup));
+
+    var payload = {
+      wa_chat_id: selectedWaGroup.wa_chat_id,
+      wa_chat_name: selectedWaGroup.wa_chat_name,
+      tg_chat_id: selectedTgGroup.tg_chat_id,
+      tg_chat_title: selectedTgGroup.tg_chat_title
+    };
+    tg.sendData(JSON.stringify(payload));
   }
 
-  // ── Start ───────────────────────────────────────────────
+  // ── Start ────────────────────────────────────────────────
   startConnect();
 })();
 </script>
