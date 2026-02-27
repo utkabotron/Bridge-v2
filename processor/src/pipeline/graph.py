@@ -17,6 +17,8 @@ def _should_translate(state: MessageState) -> str:
     """Route after validate: translate only when chat pair was resolved."""
     if state.get("delivery_status") == "failed":
         return "deliver"
+    if state.get("fallback_to_admins"):
+        return "translate"
     text = state.get("original_text", "").strip()
     if not text:
         return "format"

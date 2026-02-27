@@ -32,6 +32,34 @@ services:
       timeout: 3s
       retries: 5
 
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: bridge
+      MINIO_ROOT_PASSWORD: bridgeminio
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: /init.sh
+    volumes:
+      - ./infra/minio-init.sh:/init.sh:ro
+
   # ── Application Services ──────────────────────────────────
   wa-service:
     build: ./wa-service
@@ -41,15 +69,19 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-bridge}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-bridgeminio}
       - AWS_REGION=${AWS_REGION:-us-east-1}
-      - S3_BUCKET=${S3_BUCKET:-bridge-v2-media}
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}
+      - S3_BUCKET=${S3_BUCKET:-bridge-media}
       - PORT=3000
     volumes:
       - wa_sessions:/app/.wwebjs_auth
     depends_on:
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   processor:
@@ -66,8 +98,10 @@ services:
       - LANGCHAIN_ENDPOINT=${LANGCHAIN_ENDPOINT}
       - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
       - LANGCHAIN_PROJECT=${LANGCHAIN_PROJECT:-bridge-v2}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Hebrew}
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
+      - ADMIN_TG_IDS=${ADMIN_TG_IDS}
     depends_on:
       redis:
         condition: service_healthy
@@ -102,6 +136,9 @@ services:
       - BIGQUERY_DATASET=${BIGQUERY_DATASET:-bridge_analytics}
       - PREFECT_API_URL=${PREFECT_API_URL}
       - PREFECT_API_KEY=${PREFECT_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_TG_IDS=${ADMIN_TG_IDS}
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa.json
     volumes:
       # Mount only if file exists locally — skip for local dev without BigQuery
@@ -114,3 +151,4 @@ volumes:
   redis_data:
   postgres_data:
   wa_sessions:
+  minio_data:

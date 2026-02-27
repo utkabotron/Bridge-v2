@@ -54,12 +54,31 @@ def cleanup_onboarding_sessions() -> int:
     return deleted
 
 
+@task(retries=2, name="cleanup-old-analysis")
+def cleanup_old_analysis() -> int:
+    """Delete nightly analysis data older than 90 days (cascades to issues/evaluations/suggestions)."""
+    logger = get_run_logger()
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
+    cur.execute(
+        "delete from public.nightly_analysis_runs where created_at < now() - interval '%s days'",
+        (RETAIN_DAYS,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("Deleted %d old analysis runs (cascaded to issues/evaluations/suggestions)", deleted)
+    return deleted
+
+
 @flow(name="daily-cleanup", log_prints=True)
 def daily_cleanup():
-    """Daily cleanup: old messages + stale onboarding sessions."""
+    """Daily cleanup: old messages + stale onboarding sessions + old analysis."""
     msgs = cleanup_old_messages()
     sessions = cleanup_onboarding_sessions()
-    return {"messages_deleted": msgs, "sessions_deleted": sessions}
+    analysis = cleanup_old_analysis()
+    return {"messages_deleted": msgs, "sessions_deleted": sessions, "analysis_deleted": analysis}
 
 
 if __name__ == "__main__":

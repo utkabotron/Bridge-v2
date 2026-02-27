@@ -10,6 +10,8 @@ import os
 import time
 from typing import Any
 
+from langdetect import detect, LangDetectException
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
@@ -49,6 +51,21 @@ async def validate_node(state: MessageState) -> MessageState:
 
     if not pair:
         logger.debug("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
+        text = state.get("original_text", "").strip()
+        if text:
+            try:
+                lang = detect(text)
+            except LangDetectException:
+                lang = "ru"
+        else:
+            lang = "ru"
+
+        if lang != "ru":
+            logger.info("No chat pair, non-Russian message (lang=%s) → fallback to admins", lang)
+            return {**state, "chat_pair_id": None, "tg_chat_id": None,
+                    "target_language": "Russian",
+                    "fallback_to_admins": True}
+
         return {**state, "chat_pair_id": None, "tg_chat_id": None,
                 "target_language": state.get("target_language", "Hebrew"),
                 "delivery_status": "failed", "error": "no_chat_pair"}
@@ -98,15 +115,25 @@ async def translate_node(state: MessageState) -> MessageState:
 # ── Node: format ──────────────────────────────────────────
 
 def format_node(state: MessageState) -> MessageState:
-    """Compose the final Telegram message text."""
-    translated = state.get("translated_text") or state.get("original_text", "")
+    """Compose the final Telegram message text.
+
+    Format:
+        *Sender Name*
+        original text
+
+        translated text
+    """
+    original = state.get("original_text", "")
+    translated = state.get("translated_text") or original
     sender = state.get("sender_name", "")
-    wa_chat = state.get("wa_chat_name", "")
     media_url = state.get("media_s3_url")
 
     parts = []
     if sender:
-        parts.append(f"*{sender}* ({wa_chat}):")
+        parts.append(f"*{sender}*")
+        parts.append("")
+    parts.append(original)
+    parts.append("")
     parts.append(translated)
 
     if media_url:
@@ -125,6 +152,10 @@ async def deliver_node(state: MessageState) -> MessageState:
         await _persist_event(state)
         return state
 
+    # Fallback: send to each admin personally
+    if state.get("fallback_to_admins"):
+        return await _deliver_to_admins(state)
+
     tg_chat_id = state.get("tg_chat_id")
     if not tg_chat_id:
         return {**state, "delivery_status": "failed", "error": "missing tg_chat_id"}
@@ -139,6 +170,44 @@ async def deliver_node(state: MessageState) -> MessageState:
 
     new_status = "delivered" if ok else "failed"
     result = {**state, "delivery_status": new_status, "error": error}
+
+    await _persist_event(result)
+    return result
+
+
+async def _deliver_to_admins(state: MessageState) -> MessageState:
+    """Send message to all admin Telegram IDs from ADMIN_TG_IDS env."""
+    from ..telegram_sender import send_message
+
+    raw_ids = os.getenv("ADMIN_TG_IDS", "")
+    admin_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
+
+    if not admin_ids:
+        logger.warning("fallback_to_admins=True but ADMIN_TG_IDS is empty")
+        result = {**state, "delivery_status": "failed", "error": "no_admin_ids"}
+        await _persist_event(result)
+        return result
+
+    chat_name = state.get("wa_chat_name", "Unknown")
+    text = f"[WA: {chat_name}]\n{state.get('formatted_text', '')}"
+
+    errors = []
+    for admin_id in admin_ids:
+        ok, error = await send_message(
+            chat_id=admin_id,
+            text=text,
+            media_url=state.get("media_s3_url"),
+            message_type=state.get("message_type", "text"),
+        )
+        if not ok:
+            errors.append(f"admin {admin_id}: {error}")
+            logger.error("Failed to send to admin %s: %s", admin_id, error)
+
+    if errors:
+        result = {**state, "delivery_status": "failed", "error": "; ".join(errors)}
+    else:
+        result = {**state, "delivery_status": "delivered"}
+        logger.info("Fallback message sent to %d admins", len(admin_ids))
 
     await _persist_event(result)
     return result

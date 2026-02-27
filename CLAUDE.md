@@ -32,11 +32,9 @@ make format        # ruff format
 make db-shell      # psql -U bridge -d bridge
 make migrate       # применить migrations (обычно не нужно — initdb.d делает это автоматически)
 
-# Деплой в production (AWS ECS)
-make deploy-processor
-make deploy-bot
-make deploy-analytics
-# wa-service деплоится вручную (EFS-сессии требуют stop→start, не rolling update)
+# Деплой в production (VPS)
+ssh bridge              # подключиться к серверу
+# Docker Compose деплой — настраивается
 ```
 
 **Запуск одного теста:**
@@ -90,6 +88,15 @@ whatsapp-web.js не поддерживает кластеризацию. В doc
 ### Processor — LangGraph pipeline
 Граф в `processor/src/pipeline/graph.py`. Узлы в `nodes.py`. Если у сообщения нет активной пары чатов — узел `validate` устанавливает `delivery_status=failed` и граф пропускает translate/format, переходя сразу к `deliver` (который записывает failed в БД). Промпт версионирован: `PROMPT_VERSION` в `prompts.py`.
 
+Pipeline использует `astream(state, stream_mode="updates")` для потоковой обработки — каждый узел эмитит события через `pipeline/events.py` (in-memory event bus с asyncio.Queue subscribers).
+
+### Processor — Real-time Dashboard
+`/dashboard` — ASCII-терминальный дашборд в реальном времени (SSE endpoint `/events`):
+- Два столбца по 600px: слева pipeline visualization, справа user statistics
+- Pipeline показывает детали каждого узла (chat_pair_id, translation preview, delivery_status)
+- Events bus: `processor/src/pipeline/events.py` — emit/subscribe, deque history (50 events)
+- `TELEGRAM_BOT_TOKEN` обязателен в env processor (для deliver node)
+
 ### Bot — смешанный sync/async
 python-telegram-bot работает в asyncio. Redis subscriber (`redis_sub.py`) — отдельный daemon thread. Коммуникация между ними через `asyncio.run_coroutine_threadsafe(coro, bot_loop)`, где `bot_loop` захватывается при старте в `main.py`.
 
@@ -107,14 +114,12 @@ python-telegram-bot работает в asyncio. Redis subscriber (`redis_sub.py
 
 Все операции с БД через `asyncpg` без ORM. Пулы соединений создаются при старте сервиса и переиспользуются.
 
-## Production (AWS)
+## Production (VPS)
 
-- **Оркестрация:** ECS Fargate
-- **БД:** RDS PostgreSQL t3.micro
-- **Кэш:** ElastiCache Redis t3.micro
-- **Хранилище сессий:** EFS (смонтирован в wa-service)
-- **Медиа:** S3
-- **CI/CD:** GitHub Actions → ECR → ECS (`.github/workflows/`)
-- **Аналитика:** Prefect Cloud → BigQuery (GCP free tier 10GB)
-
-**wa-service деплоится вручную** — остальные сервисы через `make deploy-{service}` или автоматически через CI при пуше в `main`.
+- **Сервер:** Ubuntu 24.04, 3.8GB RAM, 48GB диск — `ssh bridge` (deploy@83.217.222.126)
+- **Деплой:** Docker Compose на VPS
+- **CI/CD:** GitHub Actions (`.github/workflows/`) — ci.yml (lint/test/build), deploy.yml (push to server)
+- **Безопасность:** SSH по ключу (`~/.ssh/id_bridge_vps`), UFW (22/80/443), fail2ban
+- **AWS инфраструктура удалена** — Terraform configs в `infra/terraform/` сохранены для справки
+- **LangSmith:** трассировка включена (`LANGCHAIN_TRACING_V2=true`), проект `bridge-v2-prod`
+- **Формат Telegram-сообщений:** `*Sender*\n\noriginal\n\ntranslated` (bold имя, пустая строка, оригинал, пустая строка, перевод)

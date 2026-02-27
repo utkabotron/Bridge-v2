@@ -34,6 +34,9 @@ class MessageState(TypedDict):
     # Set by format node
     formatted_text: Optional[str]
 
+    # Fallback routing
+    fallback_to_admins: bool
+
     # Set by deliver node
     delivery_status: str       # pending | delivered | failed
     error: Optional[str]

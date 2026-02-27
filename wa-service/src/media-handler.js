@@ -2,13 +2,17 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || 'us-east-1',
+  endpoint: process.env.S3_ENDPOINT || undefined,
+  forcePathStyle: true,
   credentials: process.env.AWS_ACCESS_KEY_ID
     ? {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID,
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
       }
-    : undefined, // falls back to IAM role in ECS
+    : undefined,
 });
+
+const S3_PUBLIC_URL = process.env.S3_PUBLIC_URL || 'http://localhost:9000';
 
 const BUCKET = process.env.S3_BUCKET || 'bridge-v2-media';
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
@@ -63,7 +67,7 @@ async function handleMedia(message, userId) {
     ContentType: baseMime,
   }));
 
-  const s3Url = `https://${BUCKET}.s3.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com/${s3Key}`;
+  const s3Url = `${S3_PUBLIC_URL}/${BUCKET}/${s3Key}`;
   console.log(`Media uploaded to S3: ${s3Key}`);
 
   return {
