@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "postToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CC_EDITED_FILE\" | grep -q '\\.py$'; then python3 -m py_compile \"$CC_EDITED_FILE\" 2>&1 || echo 'SYNTAX ERROR in edited file'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}
