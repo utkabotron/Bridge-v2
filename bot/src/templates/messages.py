@@ -58,6 +58,32 @@ TEMPLATES = {
         "Use /chats to manage, /add to add more chats."
     ),
 
+    "onboarding_webapp_linked": (
+        "✅ *WhatsApp connected!*\n\n"
+        "Selected group: *{wa_name}*\n\n"
+        "Now:\n"
+        "1. Create a new Telegram group\n"
+        "2. Add @{bot_username} to the group\n"
+        "3. Type /done in that group"
+    ),
+
+    "onboarding_done_success": (
+        "✅ *All set!*\n\n"
+        "Linked *{wa_name}* → *{tg_title}*\n\n"
+        "Messages from this WhatsApp group will now arrive here with translation.\n\n"
+        "Use /chats to manage, /add to add more chats."
+    ),
+
+    "onboarding_done_no_pending": (
+        "No pending WhatsApp connection.\n\n"
+        "Use /start in a private chat with me first to connect WhatsApp."
+    ),
+
+    "onboarding_done_group_only": (
+        "This command only works in a Telegram group.\n\n"
+        "Add me to a group first, then type /done there."
+    ),
+
     "onboarding_wa_connected": (
         "🔵🔵🔵⚪⚪\n\n"
         "✅ *WhatsApp connected!*\n\n"

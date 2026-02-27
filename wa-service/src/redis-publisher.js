@@ -20,8 +20,15 @@ redis.on('error', (err) => console.error('Redis error:', err.message));
 /**
  * Push a WhatsApp message to the processor queue.
  * Processor does BRPOP on "messages:in".
+ * Uses Redis SET NX to deduplicate — whatsapp-web.js can emit the same message twice.
  */
 async function publishMessage(payload) {
+  const dedupKey = `dedup:msg:${payload.wa_message_id}`;
+  const isNew = await redis.set(dedupKey, '1', 'EX', 300, 'NX');
+  if (!isNew) {
+    console.log(`Dedup: skipping duplicate message ${payload.wa_message_id}`);
+    return;
+  }
   await redis.lpush('messages:in', JSON.stringify(payload));
 }
 

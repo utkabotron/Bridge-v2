@@ -9,11 +9,12 @@ Steps:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
 
 from ..db import (
@@ -33,6 +34,7 @@ from ..templates.messages import render
 logger = logging.getLogger(__name__)
 
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
+MINIAPP_URL = os.getenv("WA_SERVICE_PUBLIC_URL", "http://localhost:3000") + "/miniapp"
 
 
 async def _wa_connect(user_id: int) -> dict:
@@ -84,9 +86,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # First time or incomplete onboarding → step 1
+    # First time or incomplete onboarding → open Mini App
     await set_onboarding_state(tg_id, IDLE)
-    kb = [[InlineKeyboardButton("🔗 Connect WhatsApp", callback_data="onboarding:connect_wa")]]
+    kb = [[InlineKeyboardButton("🔗 Connect WhatsApp", web_app=WebAppInfo(url=MINIAPP_URL))]]
     await update.message.reply_text(
         render("welcome_new"),
         parse_mode="Markdown",
@@ -164,3 +166,31 @@ async def finish_onboarding(
 ) -> None:
     await add_chat_pair(tg_user_id, wa_chat_id, wa_chat_name, tg_chat_id, tg_chat_title)
     await mark_onboarding_done(tg_user_id)
+
+
+# ── WebApp data handler (Mini App sends selected WA group) ─
+
+async def handle_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    data = update.effective_message.web_app_data.data
+    tg_id = update.effective_user.id
+
+    try:
+        payload = json.loads(data)
+        wa_chat_id = payload["wa_chat_id"]
+        wa_chat_name = payload["wa_chat_name"]
+    except (json.JSONDecodeError, KeyError) as exc:
+        logger.error("Invalid webapp data from %s: %s", tg_id, exc)
+        await update.message.reply_text(render("error_generic"))
+        return
+
+    ctx.user_data["pending_wa_chat"] = {
+        "wa_chat_id": wa_chat_id,
+        "wa_chat_name": wa_chat_name,
+    }
+    await set_onboarding_state(tg_id, LINKING)
+
+    me = await ctx.bot.get_me()
+    await update.message.reply_text(
+        render("onboarding_webapp_linked", wa_name=wa_chat_name, bot_username=me.username),
+        parse_mode="Markdown",
+    )

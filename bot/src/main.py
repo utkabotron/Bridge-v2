@@ -16,12 +16,13 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    MessageHandler,
     filters,
 )
 
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
-from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats
-from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start
+from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
+from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
 from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop
 
 logging.basicConfig(
@@ -54,9 +55,13 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_group_created, pattern="^onboarding:group_created$"))
     app.add_handler(CallbackQueryHandler(cb_bot_added, pattern="^onboarding:bot_added$"))
 
+    # ── WebApp data (Mini App sends WA group selection) ──
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
+
     # ── Chat management ───────────────────────────────────
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CallbackQueryHandler(cb_link_chat, pattern=r"^link:"))
     app.add_handler(CallbackQueryHandler(cb_chat_action, pattern=r"^chat:(pause|resume):"))
 

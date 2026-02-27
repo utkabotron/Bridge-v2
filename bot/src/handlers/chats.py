@@ -146,3 +146,40 @@ async def cb_chat_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     msg = render("chat_paused") if new_status == "paused" else render("chat_resumed")
     await query.edit_message_text(msg, parse_mode="Markdown")
+
+
+# ── /done (link pending WA group to this TG group) ───────
+
+async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    tg_id = update.effective_user.id
+
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            render("onboarding_done_group_only"), parse_mode="Markdown"
+        )
+        return
+
+    if not await is_whitelisted(tg_id):
+        await update.message.reply_text(render("not_authorized"), parse_mode="Markdown")
+        return
+
+    pending = ctx.user_data.get("pending_wa_chat")
+    if not pending:
+        await update.message.reply_text(
+            render("onboarding_done_no_pending"), parse_mode="Markdown"
+        )
+        return
+
+    wa_chat_id = pending["wa_chat_id"]
+    wa_chat_name = pending["wa_chat_name"]
+
+    await finish_onboarding(tg_id, wa_chat_id, wa_chat_name, chat.id, chat.title or str(chat.id))
+
+    # Clear pending data
+    ctx.user_data.pop("pending_wa_chat", None)
+
+    await update.message.reply_text(
+        render("onboarding_done_success", wa_name=wa_chat_name, tg_title=chat.title or str(chat.id)),
+        parse_mode="Markdown",
+    )

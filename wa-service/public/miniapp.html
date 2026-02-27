@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bridge — Connect WhatsApp</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--tg-theme-bg-color, #fff);
+      color: var(--tg-theme-text-color, #000);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    .screen {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 20px;
+      min-height: 100vh;
+      animation: fadeIn 0.3s ease;
+    }
+    .screen.active { display: flex; }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .step-indicator {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+    .step-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--tg-theme-hint-color, #ccc);
+      transition: background 0.3s;
+    }
+    .step-dot.filled {
+      background: var(--tg-theme-button-color, #3390ec);
+    }
+
+    h2 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      text-align: center;
+    }
+
+    .subtitle {
+      color: var(--tg-theme-hint-color, #888);
+      font-size: 14px;
+      text-align: center;
+      margin-bottom: 20px;
+      line-height: 1.4;
+    }
+
+    #qr-container {
+      width: 260px; height: 260px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 16px;
+      background: #fff;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+    #qr-container img {
+      width: 100%; height: 100%;
+      object-fit: contain;
+    }
+
+    #qr-status {
+      font-size: 14px;
+      color: var(--tg-theme-hint-color, #888);
+    }
+
+    .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid var(--tg-theme-hint-color, #ccc);
+      border-top-color: var(--tg-theme-button-color, #3390ec);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .group-list {
+      width: 100%;
+      max-width: 400px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .group-card {
+      display: flex;
+      align-items: center;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+      border: none;
+      width: 100%;
+      text-align: left;
+      font-size: 15px;
+      color: var(--tg-theme-text-color, #000);
+      font-family: inherit;
+    }
+    .group-card:active {
+      transform: scale(0.97);
+    }
+
+    .group-icon {
+      width: 40px; height: 40px;
+      border-radius: 50%;
+      background: var(--tg-theme-button-color, #3390ec);
+      color: var(--tg-theme-button-text-color, #fff);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 600;
+      margin-right: 12px;
+      flex-shrink: 0;
+    }
+
+    .group-info { flex: 1; min-width: 0; }
+    .group-name {
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .group-members {
+      font-size: 12px;
+      color: var(--tg-theme-hint-color, #888);
+      margin-top: 2px;
+    }
+
+    .instructions {
+      width: 100%;
+      max-width: 400px;
+    }
+    .instruction-step {
+      display: flex;
+      align-items: flex-start;
+      margin-bottom: 16px;
+    }
+    .instruction-num {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      background: var(--tg-theme-button-color, #3390ec);
+      color: var(--tg-theme-button-text-color, #fff);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      font-weight: 600;
+      margin-right: 12px;
+      flex-shrink: 0;
+    }
+    .instruction-text {
+      font-size: 15px;
+      line-height: 1.5;
+      padding-top: 3px;
+    }
+
+    .selected-group {
+      padding: 12px 16px;
+      border-radius: 12px;
+      background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+      margin-bottom: 20px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .selected-group strong {
+      color: var(--tg-theme-button-color, #3390ec);
+    }
+
+    .error-msg {
+      color: #e53935;
+      font-size: 14px;
+      margin-top: 12px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Step 1: QR Code -->
+<div id="step-qr" class="screen active">
+  <div class="step-indicator">
+    <div class="step-dot filled"></div>
+    <div class="step-dot"></div>
+    <div class="step-dot"></div>
+  </div>
+  <h2>Connect WhatsApp</h2>
+  <p class="subtitle">
+    Open WhatsApp on your phone:<br>
+    <strong>Settings &rarr; Linked Devices &rarr; Link a Device</strong>
+  </p>
+  <div id="qr-container">
+    <div class="spinner"></div>
+  </div>
+  <p id="qr-status">Generating QR code...</p>
+  <p id="qr-error" class="error-msg" style="display:none"></p>
+</div>
+
+<!-- Step 2: WA Groups -->
+<div id="step-groups" class="screen">
+  <div class="step-indicator">
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
+    <div class="step-dot"></div>
+  </div>
+  <h2>Select WhatsApp Group</h2>
+  <p class="subtitle">Choose which group to forward messages from:</p>
+  <div id="group-list" class="group-list"></div>
+</div>
+
+<!-- Step 3: Instructions -->
+<div id="step-done" class="screen">
+  <div class="step-indicator">
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
+    <div class="step-dot filled"></div>
+  </div>
+  <h2>Almost Done!</h2>
+  <div id="selected-group" class="selected-group"></div>
+  <div class="instructions">
+    <div class="instruction-step">
+      <div class="instruction-num">1</div>
+      <div class="instruction-text">Create a new Telegram group (any name you like)</div>
+    </div>
+    <div class="instruction-step">
+      <div class="instruction-num">2</div>
+      <div class="instruction-text">Add <strong id="bot-name">the bot</strong> to the group</div>
+    </div>
+    <div class="instruction-step">
+      <div class="instruction-num">3</div>
+      <div class="instruction-text">Type <code>/done</code> in that group</div>
+    </div>
+  </div>
+  <p class="subtitle">Press the button below to finish setup.</p>
+</div>
+
+<script>
+(function() {
+  const tg = window.Telegram.WebApp;
+  tg.ready();
+  tg.expand();
+
+  const user = tg.initDataUnsafe.user;
+  if (!user || !user.id) {
+    document.getElementById('qr-error').textContent = 'Could not identify user. Open this from Telegram.';
+    document.getElementById('qr-error').style.display = 'block';
+    return;
+  }
+
+  const userId = user.id;
+  let selectedGroup = null;
+  let pollTimer = null;
+  let qrTimer = null;
+
+  // ── Helpers ──────────────────────────────────────────────
+  function showScreen(id) {
+    document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
+    document.getElementById(id).classList.add('active');
+  }
+
+  // ── Step 1: QR ───────────────────────────────────────────
+  function startConnect() {
+    fetch('/connect/' + userId, { method: 'POST' })
+      .then(function() { loadQR(); pollStatus(); })
+      .catch(function(err) { showQRError('Failed to start: ' + err.message); });
+  }
+
+  function loadQR() {
+    var container = document.getElementById('qr-container');
+    var status = document.getElementById('qr-status');
+    var img = new Image();
+    img.onload = function() {
+      container.innerHTML = '';
+      container.appendChild(img);
+      status.textContent = 'Scan this QR code with WhatsApp';
+    };
+    img.onerror = function() {
+      status.textContent = 'Waiting for QR code...';
+    };
+    img.src = '/qr/image/' + userId + '?t=' + Date.now();
+
+    // Refresh QR every 3 seconds
+    clearTimeout(qrTimer);
+    qrTimer = setTimeout(loadQR, 3000);
+  }
+
+  function pollStatus() {
+    fetch('/status/' + userId)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.isReady) {
+          clearTimeout(qrTimer);
+          showGroupList(data.groups || []);
+          return;
+        }
+        pollTimer = setTimeout(pollStatus, 2000);
+      })
+      .catch(function() {
+        pollTimer = setTimeout(pollStatus, 3000);
+      });
+  }
+
+  function showQRError(msg) {
+    var el = document.getElementById('qr-error');
+    el.textContent = msg;
+    el.style.display = 'block';
+  }
+
+  // ── Step 2: Groups ──────────────────────────────────────
+  function showGroupList(groups) {
+    showScreen('step-groups');
+
+    var list = document.getElementById('group-list');
+    list.innerHTML = '';
+
+    if (groups.length === 0) {
+      list.innerHTML = '<p class="subtitle">No WhatsApp groups found. Make sure you have groups in WhatsApp.</p>';
+      return;
+    }
+
+    groups.forEach(function(g) {
+      var btn = document.createElement('button');
+      btn.className = 'group-card';
+      btn.innerHTML =
+        '<div class="group-icon">' + g.name.charAt(0).toUpperCase() + '</div>' +
+        '<div class="group-info">' +
+          '<div class="group-name">' + escapeHtml(g.name) + '</div>' +
+          '<div class="group-members">' + (g.participants || 0) + ' members</div>' +
+        '</div>';
+      btn.onclick = function() { selectGroup(g); };
+      list.appendChild(btn);
+    });
+  }
+
+  function escapeHtml(str) {
+    var div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // ── Step 3: Done ────────────────────────────────────────
+  function selectGroup(g) {
+    selectedGroup = { wa_chat_id: g.id, wa_chat_name: g.name };
+
+    document.getElementById('selected-group').innerHTML =
+      'Selected: <strong>' + escapeHtml(g.name) + '</strong>';
+
+    showScreen('step-done');
+
+    // Show Telegram MainButton
+    tg.MainButton.setText('Done');
+    tg.MainButton.show();
+    tg.MainButton.onClick(sendData);
+  }
+
+  function sendData() {
+    if (!selectedGroup) return;
+    tg.MainButton.offClick(sendData);
+    tg.MainButton.showProgress();
+    tg.sendData(JSON.stringify(selectedGroup));
+  }
+
+  // ── Start ───────────────────────────────────────────────
+  startConnect();
+})();
+</script>
+</body>
+</html>

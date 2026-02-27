@@ -1,9 +1,15 @@
 const express = require('express');
+const path = require('path');
 const QRCode = require('qrcode');
 const { clients, createWhatsAppClient } = require('../whatsapp-client');
 const { redis } = require('../redis-publisher');
 
 const router = express.Router();
+
+// ── Mini App ─────────────────────────────────────────────
+router.get('/miniapp', (req, res) => {
+  res.sendFile('miniapp.html', { root: path.join(__dirname, '..', 'public') });
+});
 
 // ── Health ────────────────────────────────────────────────
 router.get('/health', (req, res) => {
