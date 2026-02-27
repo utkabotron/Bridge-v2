@@ -67,13 +67,27 @@ services:
     volumes:
       - ./infra/minio-init.sh:/init.sh:ro
 
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - certbot_webroot:/var/www/certbot:ro
+    depends_on:
+      - wa-service
+
   # ── Application Services ──────────────────────────────────
   wa-service:
     build: ./wa-service
     restart: unless-stopped
     logging: *default-logging
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -163,3 +177,4 @@ volumes:
   postgres_data:
   wa_sessions:
   minio_data:
+  certbot_webroot:

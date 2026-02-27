@@ -22,6 +22,7 @@ from ..db import (
     add_to_whitelist,
     count_users,
     create_user,
+    get_chat_pairs,
     get_onboarding_state,
     get_pool,
     is_whitelisted,
@@ -73,6 +74,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await create_user(tg_id, user.username)
     state = await get_onboarding_state(tg_id)
+
+    if state != DONE:
+        # Fallback: user migrated or added via DB without onboarding record
+        pairs = await get_chat_pairs(tg_id)
+        if pairs:
+            logger.info("Fallback: user %s has %d chat pairs but state=%s, marking done", tg_id, len(pairs), state)
+            await set_onboarding_state(tg_id, DONE)
+            state = DONE
 
     if state == DONE:
         kb = [
