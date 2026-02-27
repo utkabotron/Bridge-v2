@@ -126,6 +126,13 @@ async function createWhatsAppClient(userId) {
 // ── Incoming message handler ──────────────────────────────
 
 async function handleIncomingMessage(userId, message, isEdited) {
+  // Skip old messages (e.g. after session restore) — 2 min threshold
+  const ageSeconds = Math.floor(Date.now() / 1000) - (message.timestamp || 0);
+  if (ageSeconds > 120) {
+    console.log(`Skipping old message ${message.id._serialized} (age=${ageSeconds}s)`);
+    return;
+  }
+
   const chat = await message.getChat();
   const chatId = chat.id._serialized;
 
