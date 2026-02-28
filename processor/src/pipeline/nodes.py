@@ -130,7 +130,6 @@ def format_node(state: MessageState) -> MessageState:
     original = state.get("original_text", "")
     translated = state.get("translated_text") or original
     sender = state.get("sender_name", "")
-    media_url = state.get("media_s3_url")
 
     parts = []
     if sender:
@@ -139,9 +138,6 @@ def format_node(state: MessageState) -> MessageState:
     parts.append(original)
     parts.append("")
     parts.append(translated)
-
-    if media_url:
-        parts.append(f"\n[Media]({media_url})")
 
     formatted = "\n".join(parts)
     return {**state, "formatted_text": formatted}
@@ -170,6 +166,7 @@ async def deliver_node(state: MessageState) -> MessageState:
         text=state["formatted_text"],
         media_url=state.get("media_s3_url"),
         message_type=state.get("message_type", "text"),
+        media_filename=state.get("media_filename"),
     )
 
     new_status = "delivered" if ok else "failed"
@@ -202,6 +199,7 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
             text=text,
             media_url=state.get("media_s3_url"),
             message_type=state.get("message_type", "text"),
+            media_filename=state.get("media_filename"),
         )
         if not ok:
             errors.append(f"admin {admin_id}: {error}")

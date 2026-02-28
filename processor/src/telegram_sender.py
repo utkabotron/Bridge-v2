@@ -1,8 +1,8 @@
 """Thin Telegram API client for the processor.
 
 We use raw HTTPX calls (not python-telegram-bot) to keep the processor
-dependency-free from the bot library. Only sendMessage/sendPhoto/sendVideo
-are needed here.
+dependency-free from the bot library. Only sendMessage/sendPhoto/sendVideo/
+sendDocument/sendAudio are needed here.
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ async def send_message(
     text: str,
     media_url: Optional[str] = None,
     message_type: str = "text",
+    media_filename: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Send a message to Telegram. Returns (success, error_message)."""
     try:
@@ -41,6 +42,8 @@ async def send_message(
             return await _send_video(chat_id, text, media_url)
         elif media_url and message_type in ("audio", "voice"):
             return await _send_audio(chat_id, text, media_url)
+        elif media_url and message_type == "document":
+            return await _send_document(chat_id, text, media_url, media_filename)
         else:
             return await _send_text(chat_id, text)
     except Exception as exc:
@@ -82,8 +85,26 @@ async def _send_video(chat_id: int, caption: str, url: str) -> Tuple[bool, Optio
 async def _send_audio(chat_id: int, caption: str, url: str) -> Tuple[bool, Optional[str]]:
     r = await get_client().post(
         f"{BASE_URL}/sendAudio",
-        json={"chat_id": chat_id, "audio": url, "caption": caption},
+        json={"chat_id": chat_id, "audio": url, "caption": caption, "parse_mode": "Markdown"},
     )
     if r.status_code == 200:
         return True, None
     return await _send_text(chat_id, f"{caption}\n[Audio: {url}]")
+
+
+async def _send_document(
+    chat_id: int, caption: str, url: str, filename: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    payload = {
+        "chat_id": chat_id,
+        "document": url,
+        "caption": caption,
+        "parse_mode": "Markdown",
+    }
+    if filename:
+        # Telegram uses this to display the file name in the chat
+        payload["filename"] = filename
+    r = await get_client().post(f"{BASE_URL}/sendDocument", json=payload)
+    if r.status_code == 200:
+        return True, None
+    return await _send_text(chat_id, f"{caption}\n[Document: {url}]")

@@ -17,6 +17,8 @@ class MessageState(TypedDict):
     original_text: str
     message_type: str          # text | image | video | audio | document
     media_s3_url: Optional[str]
+    media_mime: Optional[str]
+    media_filename: Optional[str]
     timestamp: int
     from_me: bool
     is_edited: bool

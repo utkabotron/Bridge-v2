@@ -130,6 +130,7 @@ def test_format_node_with_sender():
 
 
 def test_format_node_with_media():
+    """Media URL is no longer embedded in formatted_text — sent natively via Telegram API."""
     from processor.src.pipeline.nodes import format_node
 
     state = _base_state(
@@ -137,7 +138,9 @@ def test_format_node_with_media():
         media_s3_url="https://s3.amazonaws.com/bucket/file.jpg",
     )
     result = format_node(state)
-    assert "s3.amazonaws.com" in result["formatted_text"]
+    # Media link removed from formatted text — delivered natively by telegram_sender
+    assert "s3.amazonaws.com" not in result["formatted_text"]
+    assert "Check this out" in result["formatted_text"]
 
 
 # ── graph routing ─────────────────────────────────────────

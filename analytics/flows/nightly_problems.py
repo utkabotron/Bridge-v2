@@ -229,11 +229,31 @@ def store_results(stats: dict, analysis: dict) -> int:
             ),
         )
 
+    # Copy critical issues to persistent backlog
+    for issue in issues:
+        if issue["severity"] == "critical":
+            cur.execute(
+                """
+                INSERT INTO issues_backlog
+                    (source_run_date, severity, category, title, description, suggested_fix)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    date.today(),
+                    issue["severity"],
+                    issue["category"],
+                    issue["title"],
+                    issue.get("description", ""),
+                    issue.get("suggested_fix", ""),
+                ),
+            )
+
     conn.commit()
     cur.close()
     conn.close()
 
-    logger.info("Stored run_id=%d with %d issues", run_id, len(issues))
+    critical_count = len([i for i in issues if i["severity"] == "critical"])
+    logger.info("Stored run_id=%d with %d issues (%d critical → backlog)", run_id, len(issues), critical_count)
     return run_id
 
 

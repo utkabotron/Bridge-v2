@@ -64,6 +64,8 @@ services:
         condition: service_healthy
     entrypoint: /bin/sh
     command: /init.sh
+    environment:
+      - S3_BUCKET=${S3_BUCKET:-bridge-media}
     volumes:
       - ./infra/minio-init.sh:/init.sh:ro
 
@@ -103,6 +105,12 @@ services:
       - PORT=3000
     volumes:
       - wa_sessions:/app/.wwebjs_auth
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health | grep -q ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       redis:
         condition: service_healthy

@@ -114,7 +114,7 @@ wa-service DB: `wa-service/src/db.js` (pg Pool → Postgres, chat-pairs CRUD).
 wa-service → Redis LPUSH "messages:in"                → processor (BRPOP)
 wa-service → Redis PUBLISH "onboarding:qr_scanned:*"  → bot (PSUBSCRIBE, daemon thread)
 bot        → HTTP GET/POST wa-service /connect/, /status/  (onboarding)
-processor  → HTTP POST Telegram API sendMessage        (доставка, напрямую без bot)
+processor  → HTTP POST Telegram API send*                (доставка, напрямую без bot)
 analytics  → HTTP GET wa-service /health               (мониторинг)
 analytics  → Telegram API sendMessage                  (алерты админам)
 ```
@@ -142,14 +142,21 @@ docker run --rm -v bridge-v2_wa_sessions:/data alpine find /data -name Singleton
 docker compose start wa-service
 ```
 
+### Медиа-пайплайн
+wa-service загружает медиа в S3/MinIO (`uploadMedia()`), кладёт `media_s3_url`, `media_mime`, `media_filename` в payload. При ошибке загрузки — сообщение всё равно отправляется (без медиа, с текстом). Processor передаёт медиа-поля в state (`MessageState` в `models/message.py`). `telegram_sender.py` отправляет медиа нативно через Telegram API (sendPhoto/sendVideo/sendAudio/sendDocument) с fallback на текстовую ссылку. Медиа-ссылка **не** включается в `formatted_text` — формат текста всегда `*Sender*\n\noriginal\n\ntranslated`.
+
+Локально S3 заменён на **MinIO** (порт 9000, консоль 9001). Бакет `bridge-media` создаётся автоматически через `minio-init` сервис в docker-compose.
+
 ### Processor — LangGraph pipeline
 Граф в `processor/src/pipeline/graph.py`. Узлы в `nodes.py`. Условная маршрутизация: нет пары → сразу deliver(failed), нет текста → skip translate. Промпт версионирован: `PROMPT_VERSION` в `prompts.py`. Fallback to admins при отсутствии пары работает только для admin users (ADMIN_TG_IDS).
 
 Pipeline использует `astream(state, stream_mode="updates")` — каждый узел эмитит события через `pipeline/events.py` (in-memory event bus с asyncio.Queue, deque history 50 events). SSE endpoint `/events` и ASCII-дашборд `/dashboard`.
 
-Дашборд processor'а (`/dashboard`): realtime pipeline + users + analytics reports. API:
+Дашборд processor'а (`/dashboard`): realtime pipeline + users + analytics reports + critical backlog. API:
 - `GET /api/stats` — статистика по пользователям (delivered/failed/avg_ms)
 - `GET /api/reports?date=YYYY-MM-DD` — nightly problems + translation quality из БД (default: today)
+- `GET /api/backlog` — открытые critical issues из persistent бэклога
+- `PATCH /api/backlog/{id}` — обновить статус (resolved/wontfix)
 
 ### Bot — смешанный sync/async
 python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдельный daemon thread. Коммуникация: `asyncio.run_coroutine_threadsafe(coro, bot_loop)`, где `bot_loop` захватывается в `main.py:post_init`.
@@ -159,7 +166,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 Хранятся в `onboarding_sessions`. Мигрированные из v1 получают `done`. Bot /start всегда показывает описание + кнопку Mini App (независимо от состояния). При добавлении бота как admin в TG группу — автосообщение с кнопкой /add.
 
 ### Analytics — Prefect flows
-5 flow с cron-расписанием в `analytics/flows/`. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день.
+5 flow с cron-расписанием в `analytics/flows/`. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
 
 | Flow | Cron | Назначение |
 |------|------|------------|
@@ -185,6 +192,12 @@ PostgreSQL 16. Все операции через `asyncpg` без ORM. Пулы
 - `translation_evaluations` — quality/accuracy/naturalness scores 1-5
 - `prompt_suggestions` — status: pending/applied/rejected
 
+**003_prompt_registry.sql**:
+- `prompt_registry` — key PK, version, content. Processor регистрирует текущий промпт при старте (`register_prompt()` в `pipeline/prompts.py`)
+
+**004_issues_backlog.sql**:
+- `issues_backlog` — persistent бэклог critical issues. status: open/resolved/wontfix. Не перезаписывается при повторных nightly runs
+
 ## Production (VPS)
 
 - **Сервер:** Ubuntu 24.04, 3.8GB RAM — `ssh bridge` (deploy@83.217.222.126)
@@ -198,4 +211,5 @@ PostgreSQL 16. Все операции через `asyncpg` без ORM. Пулы
 - **CI/CD:** GitHub Actions — `ci.yml` (lint/test/build на push/PR)
 - **Безопасность:** SSH по ключу, UFW (22/80/443), fail2ban
 - **LangSmith:** `LANGCHAIN_TRACING_V2=true`, проект `bridge-v2-prod`
-- **Формат Telegram-сообщений:** `*Sender*\n\noriginal\n\ntranslated`
+- **Формат Telegram-сообщений:** `*Sender*\n\noriginal\n\ntranslated` (медиа отправляется нативно как caption)
+- **Nginx:** reverse proxy в docker-compose, basic auth (`.htpasswd`) для `/dashboard`

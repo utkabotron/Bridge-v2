@@ -5,11 +5,13 @@ const redis = new Redis({
   port: parseInt(process.env.REDIS_PORT) || 6379,
   db: parseInt(process.env.REDIS_DB) || 0,
   retryStrategy: (times) => {
-    if (times > 3) {
-      console.error('Redis: failed after 3 retries');
+    if (times > 10) {
+      console.error('Redis: failed after 10 retries');
       return null;
     }
-    return Math.min(times * 100, 2000);
+    const delay = Math.min(times * 500, 5000);
+    console.warn(`Redis: retry attempt ${times}/10 in ${delay}ms`);
+    return delay;
   },
   lazyConnect: false,
 });

@@ -15,8 +15,117 @@ const clients = new Map();
 const MAX_CONCURRENT_CLIENTS = parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 10;
 const MAX_PARALLEL_INIT = parseInt(process.env.MAX_PARALLEL_INIT) || 3;
 
+// Reconnect settings
+const RECONNECT_DELAYS = [5000, 15000, 45000]; // 5s, 15s, 45s
+const HEALTH_CHECK_INTERVAL = 60000; // 60s
+const HEALTH_CHECK_TIMEOUT = 10000; // 10s
+
 function getClientId(userId) {
   return `user-${userId}`;
+}
+
+// ── SingletonLock cleanup ─────────────────────────────────
+
+function cleanupSingletonLocks() {
+  const authDir = '.wwebjs_auth';
+  if (!fs.existsSync(authDir)) return;
+
+  let cleaned = 0;
+  const entries = fs.readdirSync(authDir, { recursive: true });
+  for (const entry of entries) {
+    const entryStr = typeof entry === 'string' ? entry : entry.toString();
+    if (path.basename(entryStr) === 'SingletonLock') {
+      const fullPath = path.join(authDir, entryStr);
+      try {
+        fs.unlinkSync(fullPath);
+        cleaned++;
+      } catch (err) {
+        console.warn(`Failed to remove SingletonLock ${fullPath}: ${err.message}`);
+      }
+    }
+  }
+  if (cleaned > 0) {
+    console.log(`Cleaned up ${cleaned} SingletonLock file(s)`);
+  }
+}
+
+// ── Reconnect with exponential backoff ────────────────────
+
+async function reconnectClient(userId, reason) {
+  for (let attempt = 0; attempt < RECONNECT_DELAYS.length; attempt++) {
+    const delay = RECONNECT_DELAYS[attempt];
+    console.log(`Reconnect attempt ${attempt + 1}/${RECONNECT_DELAYS.length} for user ${userId} in ${delay / 1000}s (reason: ${reason})`);
+    await new Promise((r) => setTimeout(r, delay));
+
+    // If someone else already reconnected this user, stop
+    const existing = clients.get(userId);
+    if (existing && existing.isReady) {
+      console.log(`User ${userId} already reconnected, skipping`);
+      return;
+    }
+
+    // Clean up old client if still in map
+    clients.delete(userId);
+
+    try {
+      await createWhatsAppClient(userId);
+      console.log(`Reconnect successful for user ${userId} on attempt ${attempt + 1}`);
+      return;
+    } catch (err) {
+      console.error(`Reconnect attempt ${attempt + 1} failed for user ${userId}: ${err.message}`);
+    }
+  }
+
+  console.error(`CRITICAL: All ${RECONNECT_DELAYS.length} reconnect attempts exhausted for user ${userId}. Session lost.`);
+}
+
+// ── Periodic health check ─────────────────────────────────
+
+let healthCheckTimer = null;
+
+async function checkClientHealth() {
+  for (const [userId, clientData] of clients) {
+    if (!clientData.isReady) continue;
+
+    try {
+      const statePromise = clientData.client.getState();
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('getState timeout')), HEALTH_CHECK_TIMEOUT)
+      );
+      const state = await Promise.race([statePromise, timeoutPromise]);
+
+      if (state !== 'CONNECTED') {
+        console.warn(`Health check: user ${userId} state=${state}, triggering reconnect`);
+        clientData.isReady = false;
+        try { await clientData.client.destroy(); } catch { /* ignore */ }
+        clients.delete(userId);
+        reconnectClient(userId, `health_check_state_${state}`).catch(console.error);
+      }
+    } catch (err) {
+      console.warn(`Health check: user ${userId} failed (${err.message}), triggering reconnect`);
+      clientData.isReady = false;
+      try { await clientData.client.destroy(); } catch { /* ignore */ }
+      clients.delete(userId);
+      reconnectClient(userId, 'health_check_error').catch(console.error);
+    }
+  }
+}
+
+function startHealthCheck() {
+  if (healthCheckTimer) return;
+  healthCheckTimer = setInterval(() => {
+    checkClientHealth().catch((err) =>
+      console.error('Health check loop error:', err.message)
+    );
+  }, HEALTH_CHECK_INTERVAL);
+  console.log(`Session health check started (every ${HEALTH_CHECK_INTERVAL / 1000}s)`);
+}
+
+function stopHealthCheck() {
+  if (healthCheckTimer) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = null;
+  }
 }
 
 // ── Create / manage a single client ──────────────────────
@@ -88,13 +197,32 @@ async function createWhatsAppClient(userId) {
   client.on('auth_failure', (msg) => {
     console.error(`Auth failed for user ${userId}:`, msg);
     clientData.isReady = false;
+
+    // Destroy zombie client and clean up broken session
+    client.destroy().catch(() => {});
+    clients.delete(userId);
+
+    const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
+    if (fs.existsSync(sessionDir)) {
+      try {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        console.log(`Removed broken session dir: ${sessionDir}`);
+      } catch (err) {
+        console.error(`Failed to remove session dir ${sessionDir}: ${err.message}`);
+      }
+    }
+
+    console.error(`User ${userId}: session lost after auth_failure, new QR scan required`);
   });
 
   client.on('disconnected', (reason) => {
-    console.log(`WhatsApp disconnected for user ${userId}:`, reason);
+    console.log(`WhatsApp disconnected for user ${userId}: ${reason}`);
     clientData.isReady = false;
     clientData.qr = null;
     clients.delete(userId);
+
+    // Auto-reconnect with exponential backoff
+    reconnectClient(userId, reason).catch(console.error);
   });
 
   client.on('message', async (message) => {
@@ -177,8 +305,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
   }
 
   if (mediaFailed) {
-    console.warn(`Skipping message ${message.id._serialized} — media failed`);
-    return;
+    console.warn(`Media failed for ${message.id._serialized} — sending without media`);
   }
 
   const payload = {
@@ -204,6 +331,9 @@ async function handleIncomingMessage(userId, message, isEdited) {
 // ── Restore persisted sessions on startup ─────────────────
 
 async function restoreExistingSessions() {
+  // Clean up stale SingletonLock files before restoring
+  cleanupSingletonLocks();
+
   const authDir = '.wwebjs_auth';
   if (!fs.existsSync(authDir)) {
     console.log('No .wwebjs_auth directory — skipping session restore');
@@ -239,6 +369,27 @@ async function restoreExistingSessions() {
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
+
+  // Start periodic health checks after all sessions restored
+  startHealthCheck();
 }
 
-module.exports = { clients, createWhatsAppClient, restoreExistingSessions };
+// ── Graceful shutdown ─────────────────────────────────────
+
+async function destroyAllClients() {
+  stopHealthCheck();
+  const destroyPromises = [];
+  for (const [userId, clientData] of clients) {
+    console.log(`Destroying client for user ${userId}...`);
+    destroyPromises.push(
+      clientData.client.destroy().catch((err) =>
+        console.error(`Error destroying client for user ${userId}: ${err.message}`)
+      )
+    );
+  }
+  await Promise.allSettled(destroyPromises);
+  clients.clear();
+  console.log('All WhatsApp clients destroyed');
+}
+
+module.exports = { clients, createWhatsAppClient, restoreExistingSessions, destroyAllClients, stopHealthCheck };

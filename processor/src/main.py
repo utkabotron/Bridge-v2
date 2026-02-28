@@ -16,8 +16,9 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 import uvicorn
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Query, Path
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
@@ -190,6 +191,45 @@ async def api_reports(date: str = Query(default="")):
     }
 
 
+# ── Backlog API ──────────────────────────────────────────
+
+class BacklogUpdate(BaseModel):
+    status: str
+
+
+@app.get("/api/backlog")
+async def api_backlog():
+    """Open critical issues from the persistent backlog."""
+    from .db import get_pool
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT id, source_run_date, severity, category, title, description,
+               suggested_fix, status, resolved_at, created_at
+        FROM issues_backlog
+        WHERE status = 'open'
+        ORDER BY created_at DESC
+    """)
+    return [dict(r) for r in rows]
+
+
+@app.patch("/api/backlog/{issue_id}")
+async def api_backlog_update(issue_id: int = Path(...), body: BacklogUpdate = ...):
+    """Update backlog issue status (resolved / wontfix)."""
+    from .db import get_pool
+    if body.status not in ("resolved", "wontfix"):
+        return JSONResponse({"error": "status must be 'resolved' or 'wontfix'"}, status_code=400)
+    pool = await get_pool()
+    row = await pool.fetchrow("""
+        UPDATE issues_backlog
+        SET status = $1, resolved_at = CASE WHEN $1 = 'resolved' THEN now() ELSE resolved_at END
+        WHERE id = $2
+        RETURNING id, status
+    """, body.status, issue_id)
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return dict(row)
+
+
 # ── Redis consumer ────────────────────────────────────────
 
 NODES = ["validate", "translate", "format", "deliver"]
@@ -224,6 +264,8 @@ async def consume_loop():
                 "original_text": payload.get("body", ""),
                 "message_type": payload.get("message_type", "text"),
                 "media_s3_url": payload.get("media_s3_url"),
+                "media_mime": payload.get("media_mime"),
+                "media_filename": payload.get("media_filename"),
                 "timestamp": payload.get("timestamp", 0),
                 "from_me": payload.get("from_me", False),
                 "is_edited": payload.get("is_edited", False),
@@ -345,6 +387,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .reports pre { white-space:pre-wrap; }
   .date-nav { cursor:pointer; user-select:none; }
   .date-nav:hover { color:#068; }
+  .bl-btn { cursor:pointer; padding:0 4px; user-select:none; }
+  .bl-btn:hover { text-decoration:underline; }
 </style>
 </head>
 <body>
@@ -354,6 +398,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 <div class="reports">
   <pre id="reports"></pre>
+</div>
+<div class="reports">
+  <pre id="backlog"></pre>
 </div>
 <script>
 const NN = ['validate','translate','format','deliver'];
@@ -701,6 +748,44 @@ function renderReports() {
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
+// ── Backlog section ─────────────────────────────────────
+let backlogData=[];
+
+function loadBacklog() {
+  fetch('/api/backlog').then(r=>r.json()).then(d=>{backlogData=d;renderBacklog();}).catch(()=>{});
+}
+
+function updateBacklog(id,status) {
+  fetch('/api/backlog/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:status})})
+    .then(r=>r.json()).then(()=>{loadBacklog();}).catch(()=>{});
+}
+
+function renderBacklog() {
+  const el=document.getElementById('backlog');
+  if(!el) return;
+  const W=120;
+  let o='';
+  o+=c('d','='.repeat(W))+'\n';
+  o+=c('r','\uD83D\uDEA8 Critical Backlog')+'\n';
+  o+=c('d','='.repeat(W))+'\n\n';
+
+  if(backlogData.length===0){
+    o+=' '+c('g','No open critical issues')+'\n';
+  } else {
+    o+=' '+c('w','Open issues: '+backlogData.length)+'\n\n';
+    backlogData.forEach(i=>{
+      const dt=i.source_run_date||'—';
+      o+='  '+c('r','\u2022')+' '+c('w','#'+i.id)+' '+c('d','['+dt+']')+' '+c('w',esc(i.title))+'\n';
+      if(i.description) o+='    '+c('d',esc(i.description).substring(0,W-6))+'\n';
+      if(i.suggested_fix) o+='    fix: '+c('c',esc(i.suggested_fix).substring(0,W-10))+'\n';
+      o+='    '+c('d','cat: '+esc(i.category));
+      o+='  <span class="bl-btn g" onclick="updateBacklog('+i.id+',\'resolved\')">[resolve]</span>';
+      o+='  <span class="bl-btn y" onclick="updateBacklog('+i.id+',\'wontfix\')">[wontfix]</span>\n\n';
+    });
+  }
+  el.innerHTML=o;
+}
+
 window.addEventListener('resize',()=>{measured=false;render();});
 // ensure DOM is ready before measuring
 requestAnimationFrame(()=>{
@@ -708,7 +793,9 @@ requestAnimationFrame(()=>{
   connect();
   loadUsers();
   loadReports();
+  loadBacklog();
   setInterval(loadUsers,15000);
+  setInterval(loadBacklog,30000);
   setInterval(()=>{if(reportDate===new Date().toISOString().slice(0,10))loadReports();},60000);
   render();
 });
