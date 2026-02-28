@@ -35,6 +35,7 @@ build-no-cache:
 
 # ── Testing ───────────────────────────────────────────────
 test:
+	cd wa-service && npm test
 	cd processor && python3 -m pytest tests/ -v
 	cd bot && python3 -m pytest tests/ -v
 
