@@ -76,10 +76,12 @@ services:
       - "443:443"
     volumes:
       - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./infra/nginx/.htpasswd:/etc/nginx/.htpasswd:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - certbot_webroot:/var/www/certbot:ro
     depends_on:
       - wa-service
+      - processor
 
   # ── Application Services ──────────────────────────────────
   wa-service:

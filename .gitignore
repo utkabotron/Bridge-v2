@@ -21,6 +21,9 @@ node_modules/
 # Docker
 *.log
 
+# Nginx auth
+.htpasswd
+
 # GCP service account key
 gcp-sa.json
 *.json.key
