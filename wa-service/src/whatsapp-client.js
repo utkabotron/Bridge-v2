@@ -15,6 +15,9 @@ const clients = new Map();
 const MAX_CONCURRENT_CLIENTS = parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 10;
 const MAX_PARALLEL_INIT = parseInt(process.env.MAX_PARALLEL_INIT) || 3;
 
+// QR timeout — destroy client if user doesn't scan within this period
+const QR_TIMEOUT_MS = parseInt(process.env.QR_TIMEOUT_MS) || 10 * 60 * 1000;
+
 // Reconnect settings
 const RECONNECT_DELAYS = [5000, 15000, 45000]; // 5s, 15s, 45s
 const HEALTH_CHECK_INTERVAL = 60000; // 60s
@@ -142,7 +145,7 @@ async function createWhatsAppClient(userId) {
     throw new Error(`Max clients reached (${MAX_CONCURRENT_CLIENTS})`);
   }
 
-  const clientData = { client: null, qr: null, isReady: false, userId };
+  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null };
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
@@ -178,10 +181,33 @@ async function createWhatsAppClient(userId) {
     console.log(`QR received for user ${userId}`);
     clientData.qr = qr;
     clientData.isReady = false;
+
+    // Start QR timeout on first QR event — destroy client if user never scans
+    if (clientData.qrTimer === null) {
+      console.log(`QR timeout started for user ${userId} (${QR_TIMEOUT_MS / 1000}s)`);
+      clientData.qrTimer = setTimeout(() => {
+        console.warn(`QR timeout expired for user ${userId} — destroying idle client`);
+        clientData.qrTimer = null;
+        client.destroy().catch(() => {});
+        clients.delete(userId);
+
+        const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
+        if (fs.existsSync(sessionDir)) {
+          try {
+            fs.rmSync(sessionDir, { recursive: true, force: true });
+            console.log(`Removed unused session dir: ${sessionDir}`);
+          } catch (err) {
+            console.error(`Failed to remove session dir ${sessionDir}: ${err.message}`);
+          }
+        }
+      }, QR_TIMEOUT_MS);
+    }
   });
 
   client.on('ready', async () => {
     console.log(`WhatsApp ready for user ${userId}`);
+    clearTimeout(clientData.qrTimer);
+    clientData.qrTimer = null;
     clientData.isReady = true;
     clientData.qr = null;
     await publishQrScanned(userId, 'ready').catch(console.error);
@@ -189,6 +215,8 @@ async function createWhatsAppClient(userId) {
 
   client.on('authenticated', async () => {
     console.log(`WhatsApp authenticated for user ${userId}`);
+    clearTimeout(clientData.qrTimer);
+    clientData.qrTimer = null;
     clientData.isReady = true;
     clientData.qr = null;
     await publishQrScanned(userId, 'authenticated').catch(console.error);
@@ -196,6 +224,8 @@ async function createWhatsAppClient(userId) {
 
   client.on('auth_failure', (msg) => {
     console.error(`Auth failed for user ${userId}:`, msg);
+    clearTimeout(clientData.qrTimer);
+    clientData.qrTimer = null;
     clientData.isReady = false;
 
     // Destroy zombie client and clean up broken session
@@ -217,6 +247,8 @@ async function createWhatsAppClient(userId) {
 
   client.on('disconnected', (reason) => {
     console.log(`WhatsApp disconnected for user ${userId}: ${reason}`);
+    clearTimeout(clientData.qrTimer);
+    clientData.qrTimer = null;
     clientData.isReady = false;
     clientData.qr = null;
     clients.delete(userId);
@@ -380,6 +412,7 @@ async function destroyAllClients() {
   stopHealthCheck();
   const destroyPromises = [];
   for (const [userId, clientData] of clients) {
+    clearTimeout(clientData.qrTimer);
     console.log(`Destroying client for user ${userId}...`);
     destroyPromises.push(
       clientData.client.destroy().catch((err) =>

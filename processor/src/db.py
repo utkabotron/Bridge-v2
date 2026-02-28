@@ -27,7 +27,13 @@ async def get_pool() -> asyncpg.Pool:
 
 
 async def fetch_active_chat_pair(user_id: int, wa_chat_id: str) -> Optional[dict]:
-    """Return the active chat_pair for a user+WA chat, or None."""
+    """Return the active chat_pair for a user+WA chat, or None.
+
+    First tries exact match by user_id + wa_chat_id.
+    If not found, falls back to ANY active pair for this wa_chat_id
+    (handles race condition when multiple WA clients are in the same group
+    and a different client wins the Redis dedup race).
+    """
     pool = await get_pool()
     row = await pool.fetchrow(
         """
@@ -42,6 +48,24 @@ async def fetch_active_chat_pair(user_id: int, wa_chat_id: str) -> Optional[dict
         user_id,
         wa_chat_id,
     )
+    if row:
+        return dict(row)
+
+    # Fallback: any active pair for this wa_chat_id regardless of user
+    row = await pool.fetchrow(
+        """
+        select cp.id, cp.tg_chat_id, u.target_language
+        from public.chat_pairs cp
+        join public.users u on u.id = cp.user_id
+        where cp.wa_chat_id = $1
+          and cp.status = 'active'
+        limit 1
+        """,
+        wa_chat_id,
+    )
+    if row:
+        logger.info("Chat pair fallback: user_id=%s not matched, using pair %s for chat %s",
+                     user_id, row["id"], wa_chat_id)
     return dict(row) if row else None
 
 

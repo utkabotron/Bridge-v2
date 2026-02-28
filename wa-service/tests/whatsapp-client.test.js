@@ -294,6 +294,68 @@ describe('startHealthCheck / stopHealthCheck idempotency', () => {
   });
 });
 
+// ── QR timeout ────────────────────────────────────────────
+
+describe('QR timeout', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('destroys client after QR timeout expires', async () => {
+    fs.existsSync.mockReturnValue(false);
+    const clientData = await createWhatsAppClient(42);
+    const client = clientData.client;
+
+    // Emit QR to start the timer
+    client.emit('qr', 'qr-code-data');
+
+    expect(clientData.qrTimer).not.toBeNull();
+
+    // Advance past QR_TIMEOUT_MS (10 minutes)
+    jest.advanceTimersByTime(10 * 60 * 1000);
+
+    expect(mockDestroy).toHaveBeenCalled();
+    expect(clients.has(42)).toBe(false);
+  });
+
+  test('cancels QR timeout on ready event', async () => {
+    const clientData = await createWhatsAppClient(42);
+    const client = clientData.client;
+
+    client.emit('qr', 'qr-code-data');
+    expect(clientData.qrTimer).not.toBeNull();
+
+    client.emit('ready');
+    expect(clientData.qrTimer).toBeNull();
+
+    // Advance past timeout — client should still exist
+    jest.advanceTimersByTime(10 * 60 * 1000);
+    expect(clients.has(42)).toBe(true);
+    // destroy should not have been called (only from ready handler is not expected)
+    expect(mockDestroy).not.toHaveBeenCalled();
+  });
+
+  test('cancels QR timeout on authenticated event', async () => {
+    const clientData = await createWhatsAppClient(42);
+    const client = clientData.client;
+
+    client.emit('qr', 'qr-code-data');
+    expect(clientData.qrTimer).not.toBeNull();
+
+    client.emit('authenticated');
+    expect(clientData.qrTimer).toBeNull();
+
+    // Advance past timeout — client should still exist
+    jest.advanceTimersByTime(10 * 60 * 1000);
+    expect(clients.has(42)).toBe(true);
+    expect(mockDestroy).not.toHaveBeenCalled();
+  });
+});
+
 // ── destroyAllClients ────────────────────────────────────
 
 describe('destroyAllClients', () => {

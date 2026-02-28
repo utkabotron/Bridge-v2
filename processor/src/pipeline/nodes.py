@@ -50,7 +50,7 @@ async def validate_node(state: MessageState) -> MessageState:
     pair = await _fetch_chat_pair(state["user_id"], state["wa_chat_id"])
 
     if not pair:
-        logger.debug("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
+        logger.warning("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
 
         # Fallback to admins only for admin's own WA messages
         admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
