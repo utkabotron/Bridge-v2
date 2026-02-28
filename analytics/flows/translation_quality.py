@@ -24,7 +24,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
-EVAL_MODEL = "gpt-4o-mini"
+EVAL_MODEL = "o3-mini"
 
 # Current translation prompt (kept in sync manually with processor/src/pipeline/prompts.py)
 CURRENT_PROMPT_VERSION = "v1.0"
@@ -54,13 +54,17 @@ def sample_translations() -> list[dict]:
 
     # Short messages (< 100 chars original)
     cur.execute("""
-        SELECT id, original_text, translated_text, translation_ms, delivery_status, error_message
-        FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
-          AND original_text IS NOT NULL
-          AND translated_text IS NOT NULL
-          AND length(original_text) < 100
-          AND delivery_status = 'delivered'
+        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
+               me.delivery_status, me.error_message,
+               COALESCE(u.target_language, 'Unknown') AS target_language
+        FROM message_events me
+        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+        LEFT JOIN users u ON cp.user_id = u.id
+        WHERE me.created_at >= now() - interval '24 hours'
+          AND me.original_text IS NOT NULL
+          AND me.translated_text IS NOT NULL
+          AND length(me.original_text) < 100
+          AND me.delivery_status = 'delivered'
         ORDER BY random()
         LIMIT 20
     """)
@@ -68,13 +72,17 @@ def sample_translations() -> list[dict]:
 
     # Long messages (>= 100 chars original)
     cur.execute("""
-        SELECT id, original_text, translated_text, translation_ms, delivery_status, error_message
-        FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
-          AND original_text IS NOT NULL
-          AND translated_text IS NOT NULL
-          AND length(original_text) >= 100
-          AND delivery_status = 'delivered'
+        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
+               me.delivery_status, me.error_message,
+               COALESCE(u.target_language, 'Unknown') AS target_language
+        FROM message_events me
+        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+        LEFT JOIN users u ON cp.user_id = u.id
+        WHERE me.created_at >= now() - interval '24 hours'
+          AND me.original_text IS NOT NULL
+          AND me.translated_text IS NOT NULL
+          AND length(me.original_text) >= 100
+          AND me.delivery_status = 'delivered'
         ORDER BY random()
         LIMIT 20
     """)
@@ -82,11 +90,15 @@ def sample_translations() -> list[dict]:
 
     # Failed translations
     cur.execute("""
-        SELECT id, original_text, translated_text, translation_ms, delivery_status, error_message
-        FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
-          AND original_text IS NOT NULL
-          AND delivery_status = 'failed'
+        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
+               me.delivery_status, me.error_message,
+               COALESCE(u.target_language, 'Unknown') AS target_language
+        FROM message_events me
+        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+        LEFT JOIN users u ON cp.user_id = u.id
+        WHERE me.created_at >= now() - interval '24 hours'
+          AND me.original_text IS NOT NULL
+          AND me.delivery_status = 'failed'
         ORDER BY random()
         LIMIT 10
     """)
@@ -133,6 +145,8 @@ Scoring guide:
 - 2: Poor, significant errors
 - 1: Unusable or completely wrong
 
+Consider the target_language field when evaluating — check that the translation is actually in the expected language and natural for that language.
+
 Return ONLY the JSON array, no markdown fences."""
 
     for i in range(0, len(evaluable), BATCH_SIZE):
@@ -143,19 +157,19 @@ Return ONLY the JSON array, no markdown fences."""
                 "index": idx,
                 "original": s["original_text"][:500],  # truncate for token efficiency
                 "translated": s["translated_text"][:500],
+                "target_language": s.get("target_language", "Unknown"),
             })
 
         response = client.chat.completions.create(
             model=EVAL_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "developer", "content": system_prompt},
                 {"role": "user", "content": json.dumps(pairs, ensure_ascii=False)},
             ],
-            temperature=0.1,
-            max_tokens=2000,
+            max_completion_tokens=16000,
         )
 
-        content = response.choices[0].message.content.strip()
+        content = (response.choices[0].message.content or "").strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
@@ -170,6 +184,7 @@ Return ONLY the JSON array, no markdown fences."""
                 ev["message_event_id"] = batch[idx]["id"]
                 ev["original_text"] = batch[idx]["original_text"]
                 ev["translated_text"] = batch[idx]["translated_text"]
+                ev["target_language"] = batch[idx].get("target_language", "Unknown")
 
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
@@ -189,7 +204,6 @@ def generate_suggestions(evaluations: list[dict]) -> dict:
 
     # Aggregate issue types
     issue_counts: dict[str, int] = {}
-    issue_examples: dict[str, list[str]] = {}
     scores = {"quality": [], "accuracy": [], "naturalness": []}
 
     for ev in evaluations:
@@ -199,22 +213,34 @@ def generate_suggestions(evaluations: list[dict]) -> dict:
         for issue in ev.get("issues", []):
             itype = issue.get("type", "unknown")
             issue_counts[itype] = issue_counts.get(itype, 0) + 1
-            if itype not in issue_examples:
-                issue_examples[itype] = []
-            if len(issue_examples[itype]) < 3:
-                issue_examples[itype].append(issue.get("detail", ""))
 
     avg_scores = {k: round(sum(v) / len(v), 2) if v else 0 for k, v in scores.items()}
+
+    # Collect worst examples with real text pairs for actionable suggestions
+    worst_examples = []
+    for ev in sorted(evaluations, key=lambda e: e.get("quality_score", 5)):
+        if ev.get("quality_score", 5) > 3:
+            break
+        if len(worst_examples) >= 5:
+            break
+        issue_types = [iss.get("type", "unknown") for iss in ev.get("issues", [])]
+        worst_examples.append({
+            "original": (ev.get("original_text") or "")[:300],
+            "translated": (ev.get("translated_text") or "")[:300],
+            "target_language": ev.get("target_language", "Unknown"),
+            "quality_score": ev.get("quality_score"),
+            "issue_types": issue_types,
+        })
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     system_prompt = """You are an expert in translation prompt engineering.
-Given the current translation prompt and analysis of translation quality issues,
+Given the current translation prompt and real examples of poor translations,
 suggest specific improvements to the prompt.
 
 Return a JSON array of suggestions. Each suggestion must have:
 - suggestion: the specific change to make to the prompt (be concrete)
-- rationale: why this change would help, referencing the error patterns
+- rationale: why this change would help, referencing the actual translation examples
 
 Focus on the most impactful changes. Return 1-5 suggestions max.
 Return ONLY the JSON array, no markdown fences."""
@@ -230,17 +256,16 @@ Average scores (1-5):
 Issue patterns found across {len(evaluations)} samples:
 {json.dumps(issue_counts, indent=2)}
 
-Examples of issues:
-{json.dumps(issue_examples, indent=2, ensure_ascii=False)}"""
+Worst translation examples (original → translated):
+{json.dumps(worst_examples, indent=2, ensure_ascii=False)}"""
 
     response = client.chat.completions.create(
         model=EVAL_MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "developer", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.3,
-        max_tokens=1500,
+        max_completion_tokens=8000,
     )
 
     content = response.choices[0].message.content.strip()
@@ -256,6 +281,7 @@ Examples of issues:
         "tokens_used": tokens,
         "avg_scores": avg_scores,
         "issue_counts": issue_counts,
+        "worst_examples": worst_examples,
     }
 
 
@@ -289,6 +315,10 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
         (date.today(), json.dumps(summary), total_tokens, cost),
     )
     run_id = cur.fetchone()[0]
+
+    # Remove old data before inserting fresh (UPSERT only updates the run row)
+    cur.execute("DELETE FROM translation_evaluations WHERE run_id = %s", (run_id,))
+    cur.execute("DELETE FROM prompt_suggestions WHERE run_id = %s", (run_id,))
 
     # Store individual evaluations
     for ev in eval_result.get("evaluations", []):
@@ -342,6 +372,7 @@ def notify_quality_report(suggestion_result: dict) -> int:
     avg_scores = suggestion_result.get("avg_scores", {})
     issue_counts = suggestion_result.get("issue_counts", {})
     suggestions = suggestion_result.get("suggestions", [])
+    worst_examples = suggestion_result.get("worst_examples", [])
 
     if not suggestions and not issue_counts:
         logger.info("No suggestions or issues, skipping notification")
@@ -353,6 +384,9 @@ def notify_quality_report(suggestion_result: dict) -> int:
 
     def _esc(s: str) -> str:
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _trunc(s: str, limit: int = 120) -> str:
+        return s[:limit] + "…" if len(s) > limit else s
 
     lines = ["📊 <b>Translation Quality Report</b>\n"]
 
@@ -370,6 +404,19 @@ def notify_quality_report(suggestion_result: dict) -> int:
             lines.append(f"  {_esc(itype)}: {count}")
         lines.append("")
 
+    # Worst translation examples
+    if worst_examples:
+        lines.append(f"<b>Worst translations ({len(worst_examples[:3])}):</b>\n")
+        for ex in worst_examples[:3]:
+            orig = _trunc(_esc(ex.get("original", "")))
+            trans = _trunc(_esc(ex.get("translated", "")))
+            lang = _esc(ex.get("target_language", "?"))
+            score = ex.get("quality_score", "?")
+            issues = ", ".join(ex.get("issue_types", []))
+            lines.append(f"<code>{orig}</code>")
+            lines.append(f"→ <code>{trans}</code>")
+            lines.append(f"  [{lang}, score {score}] {_esc(issues)}\n")
+
     # Suggestions
     if suggestions:
         lines.append(f"<b>Prompt suggestions ({len(suggestions)}):</b>\n")
@@ -379,6 +426,9 @@ def notify_quality_report(suggestion_result: dict) -> int:
                 lines.append(f"   <i>{_esc(sug['rationale'])}</i>\n")
 
     text = "\n".join(lines)
+    # Telegram message limit — truncate if needed
+    if len(text) > 4096:
+        text = text[:4090] + "\n…"
     sent = 0
 
     for chat_id in ADMIN_TG_IDS:

@@ -1,6 +1,6 @@
 """Prefect flow: nightly problem detection via LLM analysis.
 
-Collects 24h stats from message_events, sends aggregates to GPT-4o-mini
+Collects 24h stats from message_events, sends aggregates to o3-mini
 for analysis, stores detected issues, and notifies admins on critical issues.
 
 Deploy:
@@ -24,7 +24,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
-ANALYSIS_MODEL = "gpt-4o-mini"
+ANALYSIS_MODEL = "o3-mini"
 
 
 @task(retries=2, name="collect-stats")
@@ -119,6 +119,16 @@ def analyze_with_llm(stats: dict) -> dict:
     system_prompt = """You are a DevOps/SRE analyst for a WhatsApp→Telegram message bridge.
 Analyze the provided 24h statistics and identify issues that need attention.
 
+IMPORTANT system context:
+- This bridge forwards messages from WhatsApp chats to Telegram chats via user-configured "chat pairs".
+- Messages from WA chats that have NO configured pair result in "no_chat_pair" / "no pair found" errors.
+  This is EXPECTED behavior — users only map specific chats, so unmapped chats are normal. Do NOT treat
+  these as delivery failures or critical issues.
+- When calculating failure rate, only consider messages from MAPPED pairs (those with a chat_pair_id).
+  Unmapped messages should be excluded from failure rate calculations entirely.
+- Real critical issues: Telegram API errors, service crashes, message loss from mapped pairs,
+  translation pipeline failures, prolonged outages.
+
 Return a JSON array of issues. Each issue must have:
 - severity: "critical" | "warning" | "info"
 - category: one of "delivery_failure", "performance", "volume_anomaly", "error_pattern", "other"
@@ -127,8 +137,8 @@ Return a JSON array of issues. Each issue must have:
 - suggested_fix: actionable suggestion to fix/investigate
 
 Rules:
-- critical: >10% failure rate, complete outage, data loss risk
-- warning: 3-10% failure rate, degraded performance (avg translation >2s), unusual patterns
+- critical: >10% failure rate (mapped pairs only), complete outage, data loss risk
+- warning: 3-10% failure rate (mapped pairs only), degraded performance (avg translation >2s), unusual patterns
 - info: minor anomalies, optimization opportunities
 - If no issues found, return an empty array []
 - Return ONLY the JSON array, no markdown fences or extra text."""
@@ -138,11 +148,10 @@ Rules:
     response = client.chat.completions.create(
         model=ANALYSIS_MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
+            {"role": "developer", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
-        max_tokens=2000,
+        max_completion_tokens=16000,
     )
 
     content = response.choices[0].message.content.strip()
@@ -165,8 +174,8 @@ def store_results(stats: dict, analysis: dict) -> int:
     cur = conn.cursor()
 
     tokens = analysis.get("tokens_used", 0)
-    # gpt-4o-mini: ~$0.15/1M input + $0.60/1M output, rough estimate
-    cost = tokens * 0.0003 / 1000
+    # o3-mini: ~$1.10/1M input + $4.40/1M output, rough estimate
+    cost = tokens * 0.003 / 1000
 
     cur.execute(
         """
@@ -181,6 +190,9 @@ def store_results(stats: dict, analysis: dict) -> int:
         (date.today(), json.dumps(stats["overview"], default=str), tokens, cost),
     )
     run_id = cur.fetchone()[0]
+
+    # Remove old issues before inserting fresh ones (UPSERT only updates the run row)
+    cur.execute("DELETE FROM detected_issues WHERE run_id = %s", (run_id,))
 
     issues = analysis.get("issues", [])
     for issue in issues:
@@ -208,33 +220,63 @@ def store_results(stats: dict, analysis: dict) -> int:
 
 
 @task(retries=1, name="notify-admin")
-def notify_admin(analysis: dict) -> int:
-    """Send Telegram notification if critical issues found."""
+def notify_admin(stats: dict, analysis: dict) -> int:
+    """Send full nightly problems report to admins."""
     logger = get_run_logger()
 
-    critical = [i for i in analysis.get("issues", []) if i["severity"] == "critical"]
-    if not critical:
-        logger.info("No critical issues, skipping notification")
-        return 0
+    issues = analysis.get("issues", [])
 
     if not TELEGRAM_BOT_TOKEN or not ADMIN_TG_IDS:
-        logger.warning("Telegram not configured, cannot notify about %d critical issues", len(critical))
+        logger.warning("Telegram not configured, cannot send nightly report")
         return 0
 
     def _esc(s: str) -> str:
         """Escape HTML special chars in LLM-generated text."""
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    lines = [f"🚨 <b>Nightly Analysis: {len(critical)} critical issue(s)</b>\n"]
-    for issue in critical:
-        lines.append(f"<b>{_esc(issue['title'])}</b>")
-        lines.append(f"Category: {_esc(issue['category'])}")
-        lines.append(f"{_esc(issue['description'])}")
-        lines.append(f"Fix: <i>{_esc(issue.get('suggested_fix', 'N/A'))}</i>\n")
+    today = date.today().isoformat()
+    lines = [f"🔍 <b>Nightly Problems Report</b> ({today})\n"]
+
+    # Stats overview
+    overview = stats.get("overview", {})
+    if overview:
+        total = overview.get("total_messages", 0)
+        delivered = overview.get("delivered", 0)
+        failed = overview.get("failed", 0)
+        avg_ms = overview.get("avg_translation_ms")
+        avg_str = f"{avg_ms:.0f}ms" if avg_ms else "—"
+        slow = overview.get("slow_translations", 0)
+        lines.append("<b>Stats (24h):</b>")
+        lines.append(f"  Total: {total}  Delivered: {delivered}  Failed: {failed}")
+        lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}\n")
+
+    # Issues by severity
+    critical = [i for i in issues if i["severity"] == "critical"]
+    warnings = [i for i in issues if i["severity"] == "warning"]
+    infos = [i for i in issues if i["severity"] == "info"]
+
+    if not issues:
+        lines.append("✅ No issues detected")
+    else:
+        lines.append(f"<b>Issues ({len(issues)}):</b> 🚨{len(critical)} ⚠️{len(warnings)} ℹ️{len(infos)}\n")
+
+        for severity_label, severity_issues, emoji in [
+            ("Critical", critical, "🚨"),
+            ("Warning", warnings, "⚠️"),
+            ("Info", infos, "ℹ️"),
+        ]:
+            for issue in severity_issues:
+                lines.append(f"{emoji} <b>{_esc(issue['title'])}</b>")
+                lines.append(f"  {_esc(issue.get('description', ''))}")
+                if issue.get("suggested_fix"):
+                    lines.append(f"  Fix: <i>{_esc(issue['suggested_fix'])}</i>")
+                lines.append("")
 
     text = "\n".join(lines)
-    sent = 0
+    if len(text) > 4096:
+        text = text[:4090] + "\n…"
 
+    sent = 0
     for chat_id in ADMIN_TG_IDS:
         try:
             resp = httpx.post(
@@ -251,7 +293,7 @@ def notify_admin(analysis: dict) -> int:
         except Exception as e:
             logger.error("Failed to notify admin %d: %s", chat_id, e)
 
-    logger.info("Notified %d/%d admins about %d critical issues", sent, len(ADMIN_TG_IDS), len(critical))
+    logger.info("Sent nightly report to %d/%d admins (%d issues)", sent, len(ADMIN_TG_IDS), len(issues))
     return sent
 
 
@@ -261,7 +303,7 @@ def nightly_problems():
     stats = collect_stats()
     analysis = analyze_with_llm(stats)
     run_id = store_results(stats, analysis)
-    notified = notify_admin(analysis)
+    notified = notify_admin(stats, analysis)
     return {
         "run_id": run_id,
         "issues_found": len(analysis.get("issues", [])),

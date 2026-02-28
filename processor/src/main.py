@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from .pipeline.events import emit, subscribe, unsubscribe
@@ -117,6 +117,73 @@ async def api_stats():
         order by delivered desc
     """)
     return [dict(r) for r in rows]
+
+
+@app.get("/api/reports")
+async def api_reports(date: str = Query(default="")):
+    """Analytics reports: nightly problems + translation quality by date."""
+    from datetime import date as date_type
+
+    from .db import get_pool
+
+    pool = await get_pool()
+    try:
+        report_date = date_type.fromisoformat(date) if date else date_type.today()
+    except ValueError:
+        report_date = date_type.today()
+
+    # Available dates (last 30 with data)
+    date_rows = await pool.fetch("""
+        SELECT DISTINCT run_date FROM nightly_analysis_runs
+        ORDER BY run_date DESC LIMIT 30
+    """)
+    dates = [str(r["run_date"]) for r in date_rows]
+
+    # Problems run
+    problems_run = await pool.fetchrow("""
+        SELECT id, summary FROM nightly_analysis_runs
+        WHERE run_date = $1 AND flow_type = 'problems'
+    """, report_date)
+
+    problems = {"summary": None, "issues": []}
+    if problems_run:
+        problems["summary"] = json.loads(problems_run["summary"]) if problems_run["summary"] else None
+        issue_rows = await pool.fetch("""
+            SELECT severity, category, title, description, suggested_fix, acknowledged
+            FROM detected_issues WHERE run_id = $1
+            ORDER BY
+                CASE severity WHEN 'critical' THEN 1 WHEN 'warning' THEN 2 ELSE 3 END,
+                id
+        """, problems_run["id"])
+        problems["issues"] = [dict(r) for r in issue_rows]
+
+    # Quality run
+    quality_run = await pool.fetchrow("""
+        SELECT id, summary FROM nightly_analysis_runs
+        WHERE run_date = $1 AND flow_type = 'translation_quality'
+    """, report_date)
+
+    quality = {"summary": None, "evaluations_count": 0, "suggestions": []}
+    if quality_run:
+        quality["summary"] = json.loads(quality_run["summary"]) if quality_run["summary"] else None
+        eval_count = await pool.fetchval("""
+            SELECT count(*) FROM translation_evaluations WHERE run_id = $1
+        """, quality_run["id"])
+        quality["evaluations_count"] = eval_count
+        sug_rows = await pool.fetch("""
+            SELECT suggestion, rationale, status
+            FROM prompt_suggestions WHERE run_id = $1
+            ORDER BY id
+        """, quality_run["id"])
+        quality["suggestions"] = [dict(r) for r in sug_rows]
+
+    return {
+        "date": report_date.isoformat(),
+        "dates": dates,
+        "problems": problems,
+        "quality": quality,
+    }
+
 
 # ── Redis consumer ────────────────────────────────────────
 
@@ -269,12 +336,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   pre { overflow:hidden; }
   .g { color:#060; } .r { color:#900; } .y { color:#860; }
   .c { color:#068; } .w { color:#000; } .d { color:#666; }
+  .reports { margin-top:20px; padding:20px; }
+  .reports pre { white-space:pre-wrap; }
+  .date-nav { cursor:pointer; user-select:none; }
+  .date-nav:hover { color:#068; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <pre id="left"></pre>
   <pre id="right"></pre>
+</div>
+<div class="reports">
+  <pre id="reports"></pre>
 </div>
 <script>
 const NN = ['validate','translate','format','deliver'];
@@ -514,13 +588,118 @@ function loadUsers() {
   fetch('/api/stats').then(r=>r.json()).then(d=>{users=d;render();}).catch(()=>{});
 }
 
+// ── Reports section ──────────────────────────────────────
+let reportData=null, reportDate='', reportDates=[];
+
+function loadReports(dt) {
+  const q=dt?'?date='+dt:'';
+  fetch('/api/reports'+q).then(r=>r.json()).then(d=>{
+    reportData=d; reportDate=d.date; reportDates=d.dates||[];
+    renderReports();
+  }).catch(()=>{});
+}
+
+function renderReports() {
+  if(!reportData){document.getElementById('reports').innerHTML=c('d','Loading reports...');return;}
+  let o='';
+  const W=120;
+  o+=c('d','='.repeat(W))+'\n';
+  o+=c('c','Analytics Reports')+'\n';
+  o+=c('d','='.repeat(W))+'\n\n';
+
+  // Date navigation
+  const idx=reportDates.indexOf(reportDate);
+  const prev=idx<reportDates.length-1?reportDates[idx+1]:'';
+  const next=idx>0?reportDates[idx-1]:'';
+  const prevBtn=prev?'<span class="date-nav" onclick="loadReports(\''+prev+'\')">\u25C0 '+prev+'</span>':'          ';
+  const nextBtn=next?'<span class="date-nav" onclick="loadReports(\''+next+'\')">'+next+' \u25B6</span>':'';
+  o+=' '+prevBtn+' | '+c('w',reportDate)+' | '+nextBtn+'\n\n';
+
+  // Nightly Problems
+  o+=c('c','\uD83D\uDD0D Nightly Problems')+'\n';
+  o+=c('d','-'.repeat(W))+'\n';
+  const p=reportData.problems;
+  if(p.summary){
+    const s=p.summary;
+    o+=' total: '+c('w',s.total_messages??'—');
+    o+='  delivered: '+c('g',s.delivered??'—');
+    o+='  failed: '+c('r',s.failed??'—');
+    o+='  pending: '+c('y',s.pending??'—');
+    const avg=s.avg_translation_ms;
+    o+='  avg_ms: '+c('c',avg?Math.round(avg):'—');
+    o+='  slow(>3s): '+c('y',s.slow_translations??'—')+'\n\n';
+  } else {
+    o+=' '+c('d','No problems data for this date')+'\n\n';
+  }
+
+  if(p.issues&&p.issues.length>0){
+    const crit=p.issues.filter(i=>i.severity==='critical');
+    const warn=p.issues.filter(i=>i.severity==='warning');
+    const info=p.issues.filter(i=>i.severity==='info');
+    function renderIssues(list,label,cl){
+      if(!list.length)return;
+      o+=' '+c(cl,label+' ('+list.length+')')+'\n';
+      list.forEach(i=>{
+        const ack=i.acknowledged?' [ack]':'';
+        o+='   '+c(cl,'\u2022')+' '+c('w',esc(i.title))+c('d',ack)+'\n';
+        if(i.description) o+='     '+c('d',esc(i.description).substring(0,W-6))+'\n';
+        if(i.suggested_fix) o+='     fix: '+c('c',esc(i.suggested_fix).substring(0,W-10))+'\n';
+      });
+      o+='\n';
+    }
+    renderIssues(crit,'CRITICAL','r');
+    renderIssues(warn,'WARNING','y');
+    renderIssues(info,'INFO','d');
+  } else if(p.summary) {
+    o+=' '+c('g','No issues detected')+'\n\n';
+  }
+
+  // Translation Quality
+  o+=c('c','\uD83D\uDCCA Translation Quality')+'\n';
+  o+=c('d','-'.repeat(W))+'\n';
+  const q=reportData.quality;
+  if(q.summary){
+    const qs=q.summary;
+    const avg=qs.avg_scores||{};
+    o+=' samples: '+c('w',qs.samples_evaluated??'—');
+    o+='  quality: '+c('c',avg.quality??'—');
+    o+='  accuracy: '+c('c',avg.accuracy??'—');
+    o+='  naturalness: '+c('c',avg.naturalness??'—')+'\n';
+
+    if(qs.issue_counts&&Object.keys(qs.issue_counts).length>0){
+      o+=' issues: ';
+      const entries=Object.entries(qs.issue_counts).sort((a,b)=>b[1]-a[1]);
+      o+=entries.map(([k,v])=>c('y',k)+':'+v).join('  ')+'\n';
+    }
+    o+='\n';
+  } else {
+    o+=' '+c('d','No quality data for this date')+'\n\n';
+  }
+
+  if(q.suggestions&&q.suggestions.length>0){
+    o+=' '+c('w','Prompt suggestions ('+q.suggestions.length+')')+'\n';
+    q.suggestions.forEach((s,i)=>{
+      const st=s.status||'pending';
+      const stc=st==='applied'?'g':st==='rejected'?'r':'y';
+      o+='   '+(i+1)+'. '+c('w',esc(s.suggestion).substring(0,W-8))+' '+c(stc,'['+st+']')+'\n';
+      if(s.rationale) o+='      '+c('d',esc(s.rationale).substring(0,W-8))+'\n';
+    });
+  }
+
+  document.getElementById('reports').innerHTML=o;
+}
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
 window.addEventListener('resize',()=>{measured=false;render();});
 // ensure DOM is ready before measuring
 requestAnimationFrame(()=>{
   measure();
   connect();
   loadUsers();
+  loadReports();
   setInterval(loadUsers,15000);
+  setInterval(()=>{if(reportDate===new Date().toISOString().slice(0,10))loadReports();},60000);
   render();
 });
 </script>
