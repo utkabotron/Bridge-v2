@@ -45,9 +45,14 @@ def collect_stats() -> dict:
             count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
             avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL) AS avg_translation_ms,
             max(translation_ms) AS max_translation_ms,
-            count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations
+            count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
+            count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
+            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
+            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed,
+            count(*) FILTER (WHERE chat_pair_id IS NULL) AS unmapped_total
         FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
+        WHERE created_at >= current_date - interval '1 day'
+          AND created_at < current_date
     """)
     stats["overview"] = dict(cur.fetchone())
 
@@ -57,7 +62,8 @@ def collect_stats() -> dict:
             error_message,
             count(*) AS count
         FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
+        WHERE created_at >= current_date - interval '1 day'
+          AND created_at < current_date
           AND delivery_status = 'failed'
           AND error_message IS NOT NULL
         GROUP BY error_message
@@ -73,7 +79,8 @@ def collect_stats() -> dict:
             count(*) AS total,
             count(*) FILTER (WHERE delivery_status = 'failed') AS failed
         FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
+        WHERE created_at >= current_date - interval '1 day'
+          AND created_at < current_date
         GROUP BY 1
         ORDER BY 1
     """)
@@ -87,7 +94,8 @@ def collect_stats() -> dict:
     cur.execute("""
         SELECT message_type, count(*) AS count
         FROM message_events
-        WHERE created_at >= now() - interval '24 hours'
+        WHERE created_at >= current_date - interval '1 day'
+          AND created_at < current_date
         GROUP BY message_type
         ORDER BY count DESC
     """)
@@ -119,15 +127,8 @@ def analyze_with_llm(stats: dict) -> dict:
     system_prompt = """You are a DevOps/SRE analyst for a WhatsApp→Telegram message bridge.
 Analyze the provided 24h statistics and identify issues that need attention.
 
-IMPORTANT system context:
-- This bridge forwards messages from WhatsApp chats to Telegram chats via user-configured "chat pairs".
-- Messages from WA chats that have NO configured pair result in "no_chat_pair" / "no pair found" errors.
-  This is EXPECTED behavior — users only map specific chats, so unmapped chats are normal. Do NOT treat
-  these as delivery failures or critical issues.
-- When calculating failure rate, only consider messages from MAPPED pairs (those with a chat_pair_id).
-  Unmapped messages should be excluded from failure rate calculations entirely.
-- Real critical issues: Telegram API errors, service crashes, message loss from mapped pairs,
-  translation pipeline failures, prolonged outages.
+Stats include mapped_total/mapped_delivered/mapped_failed — use these for failure rate.
+unmapped_total is normal (messages from WA chats without a configured pair).
 
 Return a JSON array of issues. Each issue must have:
 - severity: "critical" | "warning" | "info"
@@ -137,8 +138,8 @@ Return a JSON array of issues. Each issue must have:
 - suggested_fix: actionable suggestion to fix/investigate
 
 Rules:
-- critical: >10% failure rate (mapped pairs only), complete outage, data loss risk
-- warning: 3-10% failure rate (mapped pairs only), degraded performance (avg translation >2s), unusual patterns
+- critical: >10% mapped failure rate, complete outage, data loss risk
+- warning: 3-10% mapped failure rate, degraded performance (avg translation >2s), unusual patterns
 - info: minor anomalies, optimization opportunities
 - If no issues found, return an empty array []
 - Return ONLY the JSON array, no markdown fences or extra text."""
@@ -176,6 +177,7 @@ def store_results(stats: dict, analysis: dict) -> int:
     tokens = analysis.get("tokens_used", 0)
     # o3-mini: ~$1.10/1M input + $4.40/1M output, rough estimate
     cost = tokens * 0.003 / 1000
+    issues = analysis.get("issues", [])
 
     cur.execute(
         """
@@ -187,14 +189,30 @@ def store_results(stats: dict, analysis: dict) -> int:
                 estimated_cost = EXCLUDED.estimated_cost
         RETURNING id
         """,
-        (date.today(), json.dumps(stats["overview"], default=str), tokens, cost),
+        (
+            date.today(),
+            json.dumps(
+                {
+                    "stats": stats["overview"],
+                    "issues_total": len(issues),
+                    "issues_critical": len([i for i in issues if i.get("severity") == "critical"]),
+                    "issues_warning": len([i for i in issues if i.get("severity") == "warning"]),
+                    "issues_info": len([i for i in issues if i.get("severity") == "info"]),
+                    "mapped_failure_rate": round(
+                        stats["overview"]["mapped_failed"] / stats["overview"]["mapped_total"] * 100, 2
+                    ) if stats["overview"].get("mapped_total") else 0,
+                },
+                default=str,
+            ),
+            tokens,
+            cost,
+        ),
     )
     run_id = cur.fetchone()[0]
 
     # Remove old issues before inserting fresh ones (UPSERT only updates the run row)
     cur.execute("DELETE FROM detected_issues WHERE run_id = %s", (run_id,))
 
-    issues = analysis.get("issues", [])
     for issue in issues:
         cur.execute(
             """
@@ -246,8 +264,13 @@ def notify_admin(stats: dict, analysis: dict) -> int:
         avg_ms = overview.get("avg_translation_ms")
         avg_str = f"{avg_ms:.0f}ms" if avg_ms else "—"
         slow = overview.get("slow_translations", 0)
+        mapped_total = overview.get("mapped_total", 0)
+        mapped_failed = overview.get("mapped_failed", 0)
+        unmapped = overview.get("unmapped_total", 0)
+        fail_rate = round(mapped_failed / mapped_total * 100, 1) if mapped_total else 0
         lines.append("<b>Stats (24h):</b>")
         lines.append(f"  Total: {total}  Delivered: {delivered}  Failed: {failed}")
+        lines.append(f"  Mapped: {mapped_total} (failed: {mapped_failed}, rate: {fail_rate}%)  Unmapped: {unmapped}")
         lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}\n")
 
     # Issues by severity

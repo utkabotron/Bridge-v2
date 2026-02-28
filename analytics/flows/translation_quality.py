@@ -26,18 +26,32 @@ ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.st
 
 EVAL_MODEL = "o3-mini"
 
-# Current translation prompt (kept in sync manually with processor/src/pipeline/prompts.py)
-CURRENT_PROMPT_VERSION = "v1.0"
-CURRENT_PROMPT = """\
-You are a professional translator. Translate the following WhatsApp message into {target_language}.
+def _load_prompt_from_db() -> tuple[str, str]:
+    """Load current translation prompt from prompt_registry.
 
-Rules:
-- Output only the translated text, nothing else.
-- Preserve formatting: line breaks, bullet points, emojis.
-- Keep names, phone numbers, URLs, and code snippets unchanged.
-- If the text is already in {target_language}, return it as-is.
-- Tone: natural, conversational — match the original register.
-"""
+    Returns (version, content). Falls back to hardcoded default if DB has no entry.
+    """
+    fallback_version = "v1.0"
+    fallback_prompt = (
+        "You are a professional translator. Translate the following WhatsApp message "
+        "into {target_language}.\n\nRules:\n- Output only the translated text, nothing else.\n"
+        "- Preserve formatting: line breaks, bullet points, emojis.\n"
+        "- Keep names, phone numbers, URLs, and code snippets unchanged.\n"
+        "- If the text is already in {target_language}, return it as-is.\n"
+        "- Tone: natural, conversational — match the original register.\n"
+    )
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT version, content FROM prompt_registry WHERE key = 'translate'")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if row:
+            return row[0], row[1]
+    except Exception:
+        pass
+    return fallback_version, fallback_prompt
 
 SAMPLE_SIZE = 50
 BATCH_SIZE = 10
@@ -60,7 +74,8 @@ def sample_translations() -> list[dict]:
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= now() - interval '24 hours'
+        WHERE me.created_at >= current_date - interval '1 day'
+          AND me.created_at < current_date
           AND me.original_text IS NOT NULL
           AND me.translated_text IS NOT NULL
           AND length(me.original_text) < 100
@@ -78,7 +93,8 @@ def sample_translations() -> list[dict]:
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= now() - interval '24 hours'
+        WHERE me.created_at >= current_date - interval '1 day'
+          AND me.created_at < current_date
           AND me.original_text IS NOT NULL
           AND me.translated_text IS NOT NULL
           AND length(me.original_text) >= 100
@@ -96,8 +112,10 @@ def sample_translations() -> list[dict]:
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= now() - interval '24 hours'
+        WHERE me.created_at >= current_date - interval '1 day'
+          AND me.created_at < current_date
           AND me.original_text IS NOT NULL
+          AND me.translated_text IS NOT NULL
           AND me.delivery_status = 'failed'
         ORDER BY random()
         LIMIT 10
@@ -245,8 +263,11 @@ Return a JSON array of suggestions. Each suggestion must have:
 Focus on the most impactful changes. Return 1-5 suggestions max.
 Return ONLY the JSON array, no markdown fences."""
 
-    user_prompt = f"""Current prompt (version {CURRENT_PROMPT_VERSION}):
-{CURRENT_PROMPT}
+    prompt_version, prompt_content = _load_prompt_from_db()
+    logger.info("Loaded translation prompt %s from DB", prompt_version)
+
+    user_prompt = f"""Current prompt (version {prompt_version}):
+{prompt_content}
 
 Average scores (1-5):
 - Quality: {avg_scores['quality']}
@@ -374,6 +395,18 @@ def notify_quality_report(suggestion_result: dict) -> int:
     suggestions = suggestion_result.get("suggestions", [])
     worst_examples = suggestion_result.get("worst_examples", [])
 
+    # Count pending suggestions from all previous runs
+    pending_count = 0
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM prompt_suggestions WHERE status = 'pending'")
+        pending_count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
     if not suggestions and not issue_counts:
         logger.info("No suggestions or issues, skipping notification")
         return 0
@@ -424,6 +457,9 @@ def notify_quality_report(suggestion_result: dict) -> int:
             lines.append(f"{i}. {_esc(sug['suggestion'])}")
             if sug.get("rationale"):
                 lines.append(f"   <i>{_esc(sug['rationale'])}</i>\n")
+
+    if pending_count > 0:
+        lines.append(f"⏳ <b>Pending suggestions: {pending_count}</b> — review in DB\n")
 
     text = "\n".join(lines)
     # Telegram message limit — truncate if needed

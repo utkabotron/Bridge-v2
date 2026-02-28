@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .db import get_pool
+    from .pipeline.prompts import register_prompt
+    pool = await get_pool()
+    await register_prompt(pool)
+    logger.info("Translation prompt registered in DB")
     task = asyncio.create_task(consume_loop())
     logger.info("Processor started")
     yield
@@ -620,14 +625,19 @@ function renderReports() {
   o+=c('d','-'.repeat(W))+'\n';
   const p=reportData.problems;
   if(p.summary){
-    const s=p.summary;
+    const s=p.summary.stats||p.summary;
     o+=' total: '+c('w',s.total_messages??'—');
     o+='  delivered: '+c('g',s.delivered??'—');
     o+='  failed: '+c('r',s.failed??'—');
     o+='  pending: '+c('y',s.pending??'—');
     const avg=s.avg_translation_ms;
     o+='  avg_ms: '+c('c',avg?Math.round(avg):'—');
-    o+='  slow(>3s): '+c('y',s.slow_translations??'—')+'\n\n';
+    o+='  slow(>3s): '+c('y',s.slow_translations??'—');
+    if(s.mapped_total!=null) o+='  mapped: '+c('w',s.mapped_total)+' (fail:'+c('r',s.mapped_failed??0)+')';
+    if(p.summary.mapped_failure_rate!=null) o+='  fail%: '+c(p.summary.mapped_failure_rate>10?'r':'y',p.summary.mapped_failure_rate+'%');
+    o+='\n';
+    if(p.summary.issues_total!=null) o+=' issues: '+c('r',p.summary.issues_critical??0)+' crit  '+c('y',p.summary.issues_warning??0)+' warn  '+c('d',p.summary.issues_info??0)+' info\n';
+    o+='\n';
   } else {
     o+=' '+c('d','No problems data for this date')+'\n\n';
   }
