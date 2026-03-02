@@ -29,7 +29,7 @@ def get_llm() -> ChatOpenAI:
     global _llm
     if _llm is None:
         _llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
             temperature=0,
             tags=["bridge-v2", f"prompt-{PROMPT_VERSION}"],
         )

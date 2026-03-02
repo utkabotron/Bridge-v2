@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
 import uvicorn
@@ -230,6 +232,91 @@ async def api_backlog_update(issue_id: int = Path(...), body: BacklogUpdate = ..
     return dict(row)
 
 
+# ── Costs API (LangSmith) ────────────────────────────────
+
+# Fallback costs per token (USD) when LangSmith doesn't provide cost
+_FALLBACK_COSTS = {
+    "gpt-4.1-mini": {"input": 0.40 / 1_000_000, "output": 1.60 / 1_000_000},
+    "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
+}
+_DEFAULT_FALLBACK = {"input": 0.40 / 1_000_000, "output": 1.60 / 1_000_000}
+
+# In-memory cache: {days: (timestamp, data)}
+_costs_cache: dict[int, tuple[float, dict]] = {}
+_COSTS_CACHE_TTL = 900  # 15 min
+
+
+def _fetch_costs_sync(days: int) -> dict:
+    """Synchronous LangSmith query — runs in thread."""
+    from langsmith import Client
+
+    client = Client()
+    project = os.getenv("LANGCHAIN_PROJECT", "bridge-v2")
+    start = datetime.now(timezone.utc) - timedelta(days=days)
+
+    by_day: dict[str, dict] = defaultdict(lambda: {"cost": 0.0, "tokens": 0, "runs": 0})
+    total_cost = 0.0
+    total_tokens = 0
+    total_runs = 0
+
+    for run in client.list_runs(
+        project_name=project,
+        run_type="llm",
+        is_root=False,
+        start_time=start,
+    ):
+        day_key = run.start_time.strftime("%Y-%m-%d") if run.start_time else "unknown"
+        tokens = (run.total_tokens or 0)
+        cost = run.total_cost
+        if cost is None or cost == 0:
+            model = (run.extra or {}).get("metadata", {}).get("ls_model_name", "")
+            fb = _FALLBACK_COSTS.get(model, _DEFAULT_FALLBACK)
+            cost = (run.prompt_tokens or 0) * fb["input"] + (run.completion_tokens or 0) * fb["output"]
+        cost = float(cost)
+
+        total_cost += cost
+        total_tokens += tokens
+        total_runs += 1
+        by_day[day_key]["cost"] += cost
+        by_day[day_key]["tokens"] += tokens
+        by_day[day_key]["runs"] += 1
+
+    by_day_list = sorted(
+        [{"date": k, "cost": round(v["cost"], 4), "tokens": v["tokens"], "runs": v["runs"]} for k, v in by_day.items()],
+        key=lambda x: x["date"],
+        reverse=True,
+    )
+
+    return {
+        "period_days": days,
+        "total_cost": round(total_cost, 4),
+        "total_tokens": total_tokens,
+        "total_runs": total_runs,
+        "by_day": by_day_list,
+    }
+
+
+@app.get("/api/costs")
+async def api_costs(days: int = Query(default=7, ge=1, le=90)):
+    """LangSmith LLM cost data, cached for 15 min."""
+    now = time.monotonic()
+    if days in _costs_cache:
+        ts, data = _costs_cache[days]
+        if now - ts < _COSTS_CACHE_TTL:
+            return data
+
+    try:
+        data = await asyncio.to_thread(_fetch_costs_sync, days)
+        _costs_cache[days] = (now, data)
+        return data
+    except Exception as exc:
+        logger.error("LangSmith costs fetch error: %s", exc)
+        # Return stale cache if available
+        if days in _costs_cache:
+            return _costs_cache[days][1]
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+
 # ── Redis consumer ────────────────────────────────────────
 
 NODES = ["validate", "translate", "format", "deliver"]
@@ -405,7 +492,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 const NN = ['validate','translate','format','deliver'];
 const W = 10;
-let ns={}, stats={ok:0,fail:0,lat:[]}, conn=false, logs=[], msg=null, users=[];
+let ns={}, stats={ok:0,fail:0,lat:[]}, conn=false, logs=[], msg=null, users=[], costsData=null;
 
 function reset() { ns={}; NN.forEach(n=>ns[n]={s:'idle',d:'',info:[]}); msg=null; }
 reset();
@@ -531,8 +618,29 @@ function renderRight() {
   const totalFail=users.reduce((a,u)=>a+u.failed,0);
   o+=' total msgs:   '+c('g',totalOk)+' ok  '+c('r',totalFail)+' fail\n';
 
+  // ── Costs section ──
+  o+='\n'+c('d','='.repeat(RW))+'\n';
+  o+=c('c','Costs (7d)')+'\n';
+  o+=c('d',' '+'-'.repeat(RW-2))+'\n';
+  if(costsData){
+    const d=costsData;
+    o+=' total: '+c('w','$'+d.total_cost.toFixed(2))+'  ('+c('w',fmtK(d.total_tokens))+' tok, '+c('w',d.total_runs)+' calls)\n';
+    const today=new Date().toISOString().slice(0,10);
+    const yesterday=new Date(Date.now()-86400000).toISOString().slice(0,10);
+    const todayD=d.by_day.find(x=>x.date===today);
+    const yesterD=d.by_day.find(x=>x.date===yesterday);
+    o+=' today: '+c('w','$'+(todayD?todayD.cost.toFixed(2):'0.00'));
+    o+='  yesterday: '+c('w','$'+(yesterD?yesterD.cost.toFixed(2):'0.00'))+'\n';
+    const avg=d.period_days>0?(d.total_cost/d.period_days):0;
+    o+=' avg/day: '+c('w','$'+avg.toFixed(2))+'\n';
+  } else {
+    o+=' '+c('d','loading...')+'\n';
+  }
+
   document.getElementById('right').innerHTML=o;
 }
+
+function fmtK(n){return n>=1000?Math.round(n/1000)+'K':String(n);}
 
 function render() { measure(); renderLeft(); renderRight(); }
 
@@ -640,6 +748,10 @@ function loadUsers() {
   fetch('/api/stats').then(r=>r.json()).then(d=>{users=d;render();}).catch(()=>{});
 }
 
+function loadCosts() {
+  fetch('/api/costs?days=7').then(r=>r.json()).then(d=>{costsData=d;render();}).catch(()=>{});
+}
+
 // ── Reports section ──────────────────────────────────────
 let reportData=null, reportDate='', reportDates=[];
 
@@ -738,8 +850,8 @@ function renderReports() {
     q.suggestions.forEach((s,i)=>{
       const st=s.status||'pending';
       const stc=st==='applied'?'g':st==='rejected'?'r':'y';
-      o+='   '+(i+1)+'. '+c('w',esc(s.suggestion).substring(0,W-8))+' '+c(stc,'['+st+']')+'\n';
-      if(s.rationale) o+='      '+c('d',esc(s.rationale).substring(0,W-8))+'\n';
+      o+='   '+(i+1)+'. '+c('w',esc(s.suggestion))+' '+c(stc,'['+st+']')+'\n';
+      if(s.rationale) o+='      '+c('d',esc(s.rationale))+'\n';
     });
   }
 
@@ -792,9 +904,11 @@ requestAnimationFrame(()=>{
   measure();
   connect();
   loadUsers();
+  loadCosts();
   loadReports();
   loadBacklog();
   setInterval(loadUsers,15000);
+  setInterval(loadCosts,300000);
   setInterval(loadBacklog,30000);
   setInterval(()=>{if(reportDate===new Date().toISOString().slice(0,10))loadReports();},60000);
   render();
