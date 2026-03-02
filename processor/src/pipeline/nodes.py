@@ -72,7 +72,7 @@ async def validate_node(state: MessageState) -> MessageState:
 
         return {**state, "chat_pair_id": None, "tg_chat_id": None,
                 "target_language": state.get("target_language", "Russian"),
-                "delivery_status": "failed", "error": "no_chat_pair"}
+                "delivery_status": "skipped", "error": "no_chat_pair"}
 
     return {
         **state,
@@ -147,8 +147,8 @@ def format_node(state: MessageState) -> MessageState:
 
 async def deliver_node(state: MessageState) -> MessageState:
     """Send formatted message to Telegram and persist to DB."""
-    # Short-circuit if validation failed
-    if state.get("delivery_status") == "failed":
+    # Short-circuit if validation failed or skipped (no chat pair)
+    if state.get("delivery_status") in ("failed", "skipped"):
         await _persist_event(state)
         return state
 

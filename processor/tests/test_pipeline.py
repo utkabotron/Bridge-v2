@@ -36,13 +36,13 @@ def _base_state(**overrides):
 
 @pytest.mark.asyncio
 async def test_validate_node_no_pair():
-    """When no chat pair exists, delivery_status should be 'failed'."""
+    """When no chat pair exists, delivery_status should be 'skipped'."""
     from processor.src.pipeline.nodes import validate_node
 
     with patch("processor.src.pipeline.nodes._fetch_chat_pair", new=AsyncMock(return_value=None)):
         result = await validate_node(_base_state())
 
-    assert result["delivery_status"] == "failed"
+    assert result["delivery_status"] == "skipped"
     assert result["error"] == "no_chat_pair"
 
 
@@ -148,8 +148,9 @@ def test_format_node_with_media():
 def test_should_translate_routing():
     from processor.src.pipeline.graph import _should_translate
 
-    # Failed state → go to deliver
+    # Failed or skipped state → go to deliver
     assert _should_translate({"delivery_status": "failed", "original_text": "text"}) == "deliver"
+    assert _should_translate({"delivery_status": "skipped", "original_text": "text"}) == "deliver"
 
     # No text → skip translation
     assert _should_translate({"delivery_status": "pending", "original_text": ""}) == "format"

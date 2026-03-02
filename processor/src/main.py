@@ -61,10 +61,10 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     """Simple counters — replace with Prometheus if needed later."""
-    return {"processed": _counter["processed"], "failed": _counter["failed"]}
+    return {"processed": _counter["processed"], "failed": _counter["failed"], "skipped": _counter["skipped"]}
 
 
-_counter = {"processed": 0, "failed": 0}
+_counter = {"processed": 0, "failed": 0, "skipped": 0}
 
 # ── SSE stream ───────────────────────────────────────────
 
@@ -124,7 +124,34 @@ async def api_stats():
         where u.is_active = true
         order by delivered desc
     """)
-    return [dict(r) for r in rows]
+    totals = await pool.fetchrow("""
+        select
+            count(*) filter (where delivery_status = 'skipped') as total_skipped,
+            round(avg(translation_ms) filter (where translation_ms is not null)) as total_avg_ms
+        from message_events
+    """)
+    return {
+        "users": [dict(r) for r in rows],
+        "total_skipped": totals["total_skipped"],
+        "total_avg_ms": totals["total_avg_ms"],
+    }
+
+
+@app.get("/api/daily-stats")
+async def api_daily_stats():
+    """Today's message counts for the dashboard header."""
+    from .db import get_pool
+    pool = await get_pool()
+    row = await pool.fetchrow("""
+        select
+            count(*) filter (where delivery_status = 'delivered') as delivered,
+            count(*) filter (where delivery_status = 'failed') as failed,
+            count(*) filter (where delivery_status = 'skipped') as skipped,
+            round(avg(translation_ms) filter (where translation_ms is not null)) as avg_ms
+        from message_events
+        where created_at >= current_date
+    """)
+    return dict(row)
 
 
 @app.get("/api/reports")
@@ -430,6 +457,17 @@ async def consume_loop():
                         final_state.get("cache_hit"),
                         final_state.get("translation_ms"),
                     )
+                elif final_state and final_state.get("delivery_status") == "skipped":
+                    _counter["skipped"] += 1
+                    emit("message_skipped", {
+                        "msg_id": msg_id,
+                        "error": final_state.get("error", "no_chat_pair"),
+                    })
+                    logger.debug(
+                        "Skipped %s: %s",
+                        state["wa_message_id"],
+                        final_state.get("error"),
+                    )
                 else:
                     _counter["failed"] += 1
                     emit("message_failed", {
@@ -463,11 +501,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <style>
   body { background:#bbb; color:#111; font:18px/1.5 monospace; margin:0; padding:20px; }
   pre { margin:0; overflow:hidden; }
-  .wrap { display:flex; gap:0; height:calc(100vh - 40px); }
-  .left, .right { width:600px; min-width:600px; overflow:hidden; }
+  #top { border-bottom:2px solid #888; padding-bottom:12px; margin-bottom:12px; }
+  .wrap { display:flex; gap:0; }
+  .left, .right { flex:1; min-width:0; overflow:hidden; }
   .left { border-right:2px solid #888; padding-right:16px; }
   .right { padding-left:16px; }
-  pre { overflow:hidden; }
   .g { color:#060; } .r { color:#900; } .y { color:#860; }
   .c { color:#068; } .w { color:#000; } .d { color:#666; }
   .reports { margin-top:20px; padding:20px; }
@@ -479,9 +517,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<pre id="top"></pre>
 <div class="wrap">
-  <pre id="left"></pre>
-  <pre id="right"></pre>
+  <pre id="left" class="left"></pre>
+  <pre id="right" class="right"></pre>
 </div>
 <div class="reports">
   <pre id="reports"></pre>
@@ -492,7 +531,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 const NN = ['validate','translate','format','deliver'];
 const W = 10;
-let ns={}, stats={ok:0,fail:0,lat:[]}, conn=false, logs=[], msg=null, users=[], costsData=null;
+let ns={}, stats={ok:0,fail:0,skip:0,lat:[]}, conn=false, logs=[], msg=null, users=[], costsData=null, dailyStats=null;
 
 function reset() { ns={}; NN.forEach(n=>ns[n]={s:'idle',d:'',info:[]}); msg=null; }
 reset();
@@ -500,97 +539,137 @@ reset();
 function pad(s,w) { s=String(s); return s.length>=w ? s.substring(0,w) : s+' '.repeat(w-s.length); }
 function c(cl,t) { return '<span class="'+cl+'">'+t+'</span>'; }
 
-function colWidth(id) {
-  const el=document.getElementById(id);
-  if(!el) return 55;
-  // measure char width using body font
+function charWidth() {
   const m=document.createElement('pre');
   m.style.cssText='position:absolute;visibility:hidden;white-space:pre;font:inherit';
   m.textContent='X'.repeat(200);
   document.body.appendChild(m);
   const cw=m.offsetWidth/200;
   document.body.removeChild(m);
-  // use parent container width (the .left/.right div)
-  const pw = el.parentElement ? el.parentElement.clientWidth : el.clientWidth;
-  const padL = parseFloat(getComputedStyle(el.parentElement||el).paddingLeft)||0;
-  const padR = parseFloat(getComputedStyle(el.parentElement||el).paddingRight)||0;
-  return Math.floor((pw - padL - padR) / cw);
+  return cw;
 }
 
-let LW=0, RW=0, measured=false;
+function elCols(id) {
+  const el=document.getElementById(id);
+  if(!el) return 55;
+  const cw=charWidth();
+  const st=getComputedStyle(el);
+  const padL=parseFloat(st.paddingLeft)||0;
+  const padR=parseFloat(st.paddingRight)||0;
+  return Math.floor((el.clientWidth - padL - padR) / cw);
+}
+
+let TW=0, LW=0, RW=0, measured=false;
 function measure() {
   if(measured) return;
-  LW=colWidth('left'); RW=colWidth('right');
-  const mx=Math.max(LW,RW);
-  LW=mx; RW=mx;
-  if(mx>10) measured=true;
+  TW=elCols('top');
+  LW=elCols('left'); RW=elCols('right');
+  if(TW>10) measured=true;
 }
 
-function renderLeft() {
+function renderTop() {
   let o = '';
   o += c('c','Bridge v2 Pipeline') + '\n';
-  o += c('d','='.repeat(LW)) + '\n';
+  o += c('d','='.repeat(TW)) + '\n';
 
   const dot = conn ? c('g','[connected]') : c('r','[disconnected]');
-  const avg = stats.lat.length ? Math.round(stats.lat.reduce((a,b)=>a+b,0)/stats.lat.length)+'ms' : '--';
-  const total = stats.ok + stats.fail;
-  o += ' '+dot+'  ok:'+c('g',stats.ok)+'  fail:'+c('r',stats.fail)+'  avg:'+c('c',avg)+'\n';
-  if (total > 0) {
-    const barW = LW - 2;
-    const okW = Math.round(stats.ok / total * barW);
-    const failW = barW - okW;
-    o += ' ' + c('g','\u2588'.repeat(okW)) + c('r','\u2588'.repeat(failW)) + '\n';
+  const ds = dailyStats || {};
+  const dok = ds.delivered||0, dfail = ds.failed||0, dskip = ds.skipped||0;
+  const davg = ds.avg_ms ? Math.round(ds.avg_ms)+'ms' : '--';
+  o += ' '+dot+'  '+c('d','today: ')+c('g',dok)+' ok  '+c('r',dfail)+' fail  '+c('y',dskip)+' skip  avg:'+c('c',davg)+'\n';
+  const dtotal = dok + dfail + dskip;
+  if (dtotal > 0) {
+    const barW = TW - 2;
+    const okW = Math.round(dok / dtotal * barW);
+    const failW = Math.round(dfail / dtotal * barW);
+    const skipW = barW - okW - failW;
+    o += ' ' + c('g','\u2588'.repeat(okW)) + c('r','\u2588'.repeat(failW)) + c('y','\u2588'.repeat(skipW)) + '\n';
   }
-  o += c('d','-'.repeat(LW)) + '\n';
+  o += c('d','-'.repeat(TW)) + '\n';
 
   if (msg) {
-    o += ' msg: '+c('w',msg.sender)+' '+c('d','"'+msg.text+'"')+'\n';
+    o += ' '+c('y','processing message...')+'\n';
   } else {
     o += ' '+c('d','waiting for messages...')+'\n';
   }
   o += '\n';
 
-  // vertical pipeline with details
-  const BW = 14; // box inner width
-  NN.forEach((n,idx) => {
+  // horizontal pipeline: 4 boxes in a row
+  const BW = 18; // box inner width
+  const arrow = '  >>>  ';
+  const arrowLen = 7;
+
+  // static labels per node (always shown)
+  const labels = {
+    validate: ['time:','pair:','lang:','type:'],
+    translate:['time:','mode:'],
+    format:   ['time:','len: '],
+    deliver:  ['time:','status:','total:'],
+  };
+  const infoRows = 4; // max label rows
+
+  // build each box as arrays of lines
+  const boxes = NN.map(n => {
     const st=ns[n]; let cl='d',mk=' ';
     if(st.s==='active'){cl='y';mk='*';}
     if(st.s==='done'){cl='g';mk='+';}
     if(st.s==='failed'){cl='r';mk='x';}
     if(st.s==='skipped'){cl='d';mk='-';}
 
-    const bar = c(cl, ' +'+'-'.repeat(BW+2)+'+');
-    const nm  = c(cl, ' | '+mk+' '+pad(n,BW-2)+' |');
-    const dt  = c(cl, ' |   '+pad(st.d||'',BW-2)+' |');
-
-    // info lines next to box
-    const info = st.info || [];
-    const lines = [bar, nm, dt, bar];
-    for(let i=0;i<lines.length;i++){
-      const detail = info[i] ? '  '+info[i] : '';
-      o += lines[i] + detail + '\n';
-    }
-
-    // extra info lines beyond box height
-    for(let i=lines.length;i<info.length;i++){
-      o += ' '.repeat(BW+5) + '  ' + info[i] + '\n';
-    }
-
-    // arrow down
-    if(idx < NN.length-1){
-      const acl = st.s==='done'?'g':st.s==='failed'?'r':'d';
-      o += c(acl,'        v') + '\n';
-    }
+    const top = c(cl,'+'+'-'.repeat(BW)+'+');
+    const nm  = c(cl,'| '+mk+' '+pad(n,BW-4)+' |');
+    const bot = c(cl,'+'+'-'.repeat(BW)+'+');
+    return {lines:[top,nm,bot], cl:cl, info:st.info||[], labels:labels[n]};
   });
-  document.getElementById('left').innerHTML=o;
+
+  // render box lines horizontally
+  for(let row=0;row<3;row++){
+    let line='';
+    boxes.forEach((b,i)=>{
+      if(i>0){
+        if(row===1) line+=c(boxes[i-1].cl,arrow);
+        else line+=' '.repeat(arrowLen);
+      }
+      line+=b.lines[row];
+    });
+    o+=line+'\n';
+  }
+  // info lines under each box (always reserved)
+  for(let row=0;row<infoRows;row++){
+    let line='';
+    boxes.forEach((b,i)=>{
+      if(i>0) line+=' '.repeat(arrowLen);
+      const lbl=b.labels[row]||'';
+      const val=b.info[row]||'';
+      if(lbl){
+        const cell=c('d',lbl)+' '+val;
+        const plainLen=lbl.length+1+stripTags(val).length;
+        line+=' '+cell+' '.repeat(Math.max(0,BW+1-plainLen));
+      } else {
+        line+=' '.repeat(BW+2);
+      }
+    });
+    o+=line+'\n';
+  }
+  o+='\n';
+
+  // log entries
+  o += c('d','-'.repeat(TW)) + '\n';
+  const maxLogs = 8;
+  const start = Math.max(0, logs.length - maxLogs);
+  for(let i=start;i<logs.length;i++) o+=logs[i]+'\n';
+
+  document.getElementById('top').innerHTML=o;
 }
 
-function renderRight() {
+function stripTags(s){return s.replace(/<[^>]*>/g,'');}
+
+function renderLeft() {
   let o='';
   o+=c('c','Users')+'\n';
-  o+=c('d','='.repeat(RW))+'\n';
+  o+=c('d','='.repeat(LW))+'\n';
   o+=c('d',' '+pad('user',16)+pad('wa',5)+pad('lang',8)+pad('pairs',6)+pad('ok',6)+pad('fail',6)+'last')+'\n';
-  o+=c('d',' '+'-'.repeat(RW-2))+'\n';
+  o+=c('d',' '+'-'.repeat(LW-2))+'\n';
 
   if(users.length===0){
     o+=' '+c('d','loading...')+'\n';
@@ -607,8 +686,13 @@ function renderRight() {
     });
   }
 
-  o+='\n'+c('d','='.repeat(RW))+'\n';
+  document.getElementById('left').innerHTML=o;
+}
+
+function renderRight() {
+  let o='';
   o+=c('c','Chat Pairs')+'\n';
+  o+=c('d','='.repeat(RW))+'\n';
   o+=c('d',' '+'-'.repeat(RW-2))+'\n';
   let totalPairs=0, activePairs=0;
   users.forEach(u=>{totalPairs+=u.pairs; if(u.wa_connected)activePairs+=u.pairs;});
@@ -616,7 +700,8 @@ function renderRight() {
   o+=' active users: '+c('w',users.filter(u=>u.wa_connected).length)+'/'+users.length+'\n';
   const totalOk=users.reduce((a,u)=>a+u.delivered,0);
   const totalFail=users.reduce((a,u)=>a+u.failed,0);
-  o+=' total msgs:   '+c('g',totalOk)+' ok  '+c('r',totalFail)+' fail\n';
+  const avgStr=totalAvgMs?Math.round(totalAvgMs)+'ms':'--';
+  o+=' total msgs:   '+c('g',totalOk)+' ok  '+c('r',totalFail)+' fail  '+c('y',totalSkipped)+' skip  avg:'+c('c',avgStr)+'\n';
 
   // ── Costs section ──
   o+='\n'+c('d','='.repeat(RW))+'\n';
@@ -642,7 +727,7 @@ function renderRight() {
 
 function fmtK(n){return n>=1000?Math.round(n/1000)+'K':String(n);}
 
-function render() { measure(); renderLeft(); renderRight(); }
+function render() { measure(); renderTop(); renderLeft(); renderRight(); }
 
 function log(text) {
   const h=new Date().toLocaleTimeString('en-GB',{hour12:false});
@@ -654,9 +739,9 @@ function handle(e) {
   switch(e.type) {
     case 'message_received':
       reset();
-      msg={sender:e.sender, text:(e.text||'(media)').substring(0,30)};
+      msg={type:e.msg_type||'text'};
       ns.validate.s='active'; ns.validate.d='...';
-      log(c('c','[IN]')+' '+c('w',e.sender)+' "'+msg.text+'"');
+      log(c('c','[IN]')+' '+c('w',e.msg_type||'text'));
       break;
     case 'node_done': {
       const n=e.node;
@@ -664,44 +749,37 @@ function handle(e) {
       if(n==='translate'&&e.cache_hit)d='cached';
       else if(n==='translate'&&e.translation_ms)d=e.translation_ms+'ms';
       if(e.error)d=e.error.substring(0,12);
-      ns[n].s=e.error?'failed':'done'; ns[n].d=d;
+      ns[n].s=e.status==='skipped'?'skipped':e.error?'failed':'done'; ns[n].d=d;
 
-      // rich info per node
+      // info values per node (match labels order: time, then node-specific)
       if(n==='validate'){
         ns[n].info=[
-          c('d','pair: ')+c('w',e.chat_pair_id||'none'),
-          c('d','tg:   ')+c('w',e.tg_chat_id||'--'),
-          c('d','lang: ')+c('c',e.target_lang||'--'),
-          c('d','type: ')+c('w',e.msg_type||'text'),
+          c('w',d),
+          c('w',e.chat_pair_id||'none'),
+          c('c',e.target_lang||'--'),
+          c('w',e.msg_type||'text'),
         ];
       } else if(n==='translate'){
-        const src=(e.original||'').substring(0,LW-22);
-        const dst=(e.translated||'').substring(0,LW-22);
         ns[n].info=[
-          e.cache_hit?c('g','CACHE HIT'):c('y','LLM call ')+c('w',(e.translation_ms||0)+'ms'),
-          c('d','src: ')+c('w',src),
-          c('d','dst: ')+c('c',dst),
-          '',
+          c('w',d),
+          e.cache_hit?c('g','CACHE HIT'):c('y','LLM'),
         ];
       } else if(n==='format'){
         ns[n].info=[
-          c('d','len: ')+c('w',(e.text_len||0)+' chars'),
-          c('d','preview:'),
-          c('w',(e.preview||'').substring(0,LW-22)),
-          '',
+          c('w',d),
+          c('w',(e.text_len||0)+' chars'),
         ];
       } else if(n==='deliver'){
         const ok=e.delivery_status==='delivered';
         ns[n].info=[
-          c('d','tg:     ')+c('w',e.tg_chat_id||'--'),
-          c('d','status: ')+(ok?c('g','delivered'):c('r',e.delivery_status||'--')),
-          c('d','total:  ')+c('w',e.elapsed_ms+'ms'),
-          '',
+          c('w',d),
+          ok?c('g','delivered'):e.delivery_status==='skipped'?c('y','skipped'):c('r',e.delivery_status||'--'),
+          c('w',e.elapsed_ms+'ms'),
         ];
       }
 
       const idx=NN.indexOf(n);
-      if(e.status==='failed'&&n==='validate'){
+      if((e.status==='failed'||e.status==='skipped')&&n==='validate'){
         ns.translate.s='skipped';ns.translate.d='skip';
         ns.format.s='skipped';ns.format.d='skip';
         ns.deliver.s='active';ns.deliver.d='...';
@@ -718,12 +796,20 @@ function handle(e) {
       log(c('g','[OK]       ')+' '+e.total_ms+'ms'+(e.cache_hit?' (cached)':''));
       setTimeout(()=>{reset();render();},4000);
       loadUsers();
+      loadDailyStats();
+      break;
+    case 'message_skipped':
+      stats.skip++;
+      log(c('y','[SKIP]     ')+' '+(e.error||'no_chat_pair'));
+      setTimeout(()=>{reset();render();},4000);
+      loadDailyStats();
       break;
     case 'message_failed':
       stats.fail++;
       log(c('r','[FAIL]     ')+' '+(e.error||'unknown'));
       setTimeout(()=>{reset();render();},4000);
       loadUsers();
+      loadDailyStats();
       break;
   }
   render();
@@ -744,12 +830,17 @@ function timeAgo(iso) {
   return Math.floor(s/86400)+'d ago';
 }
 
+let totalSkipped=0, totalAvgMs=null;
 function loadUsers() {
-  fetch('/api/stats').then(r=>r.json()).then(d=>{users=d;render();}).catch(()=>{});
+  fetch('/api/stats').then(r=>r.json()).then(d=>{users=d.users;totalSkipped=d.total_skipped||0;totalAvgMs=d.total_avg_ms;render();}).catch(()=>{});
 }
 
 function loadCosts() {
   fetch('/api/costs?days=7').then(r=>r.json()).then(d=>{costsData=d;render();}).catch(()=>{});
+}
+
+function loadDailyStats() {
+  fetch('/api/daily-stats').then(r=>r.json()).then(d=>{dailyStats=d;render();}).catch(()=>{});
 }
 
 // ── Reports section ──────────────────────────────────────
@@ -788,6 +879,7 @@ function renderReports() {
     o+=' total: '+c('w',s.total_messages??'—');
     o+='  delivered: '+c('g',s.delivered??'—');
     o+='  failed: '+c('r',s.failed??'—');
+    o+='  skipped: '+c('y',s.skipped??'—');
     o+='  pending: '+c('y',s.pending??'—');
     const avg=s.avg_translation_ms;
     o+='  avg_ms: '+c('c',avg?Math.round(avg):'—');
@@ -905,10 +997,12 @@ requestAnimationFrame(()=>{
   connect();
   loadUsers();
   loadCosts();
+  loadDailyStats();
   loadReports();
   loadBacklog();
   setInterval(loadUsers,15000);
   setInterval(loadCosts,300000);
+  setInterval(loadDailyStats,15000);
   setInterval(loadBacklog,30000);
   setInterval(()=>{if(reportDate===new Date().toISOString().slice(0,10))loadReports();},60000);
   render();

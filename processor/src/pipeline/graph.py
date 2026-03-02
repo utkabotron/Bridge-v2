@@ -15,7 +15,7 @@ from .nodes import deliver_node, format_node, translate_node, validate_node
 
 def _should_translate(state: MessageState) -> str:
     """Route after validate: translate only when chat pair was resolved."""
-    if state.get("delivery_status") == "failed":
+    if state.get("delivery_status") in ("failed", "skipped"):
         return "deliver"
     if state.get("fallback_to_admins"):
         return "translate"
