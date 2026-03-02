@@ -24,7 +24,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
-EVAL_MODEL = "o3-mini"
+EVAL_MODEL = "gpt-4.1-mini"
 
 def _load_prompt_from_db() -> tuple[str, str]:
     """Load current translation prompt from prompt_registry.
@@ -181,10 +181,11 @@ Return ONLY the JSON array, no markdown fences."""
         response = client.chat.completions.create(
             model=EVAL_MODEL,
             messages=[
-                {"role": "developer", "content": system_prompt},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(pairs, ensure_ascii=False)},
             ],
-            max_completion_tokens=16000,
+            max_tokens=4000,
+            temperature=0,
         )
 
         content = (response.choices[0].message.content or "").strip()
@@ -283,10 +284,11 @@ Worst translation examples (original → translated):
     response = client.chat.completions.create(
         model=EVAL_MODEL,
         messages=[
-            {"role": "developer", "content": system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_completion_tokens=8000,
+        max_tokens=4000,
+        temperature=0,
     )
 
     content = response.choices[0].message.content.strip()
@@ -314,7 +316,8 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
     cur = conn.cursor()
 
     total_tokens = eval_result.get("tokens_used", 0) + suggestion_result.get("tokens_used", 0)
-    cost = total_tokens * 0.0003 / 1000
+    # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
+    cost = total_tokens * 0.001 / 1000
 
     summary = {
         "samples_evaluated": len(eval_result.get("evaluations", [])),

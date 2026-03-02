@@ -1,6 +1,6 @@
 """Prefect flow: nightly problem detection via LLM analysis.
 
-Collects 24h stats from message_events, sends aggregates to o3-mini
+Collects 24h stats from message_events, sends aggregates to gpt-4.1-mini
 for analysis, stores detected issues, and notifies admins on critical issues.
 
 Deploy:
@@ -24,7 +24,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
-ANALYSIS_MODEL = "o3-mini"
+ANALYSIS_MODEL = "gpt-4.1-mini"
 
 
 @task(retries=2, name="collect-stats")
@@ -128,7 +128,7 @@ def analyze_with_llm(stats: dict) -> dict:
 Analyze the provided 24h statistics and identify issues that need attention.
 
 Stats include mapped_total/mapped_delivered/mapped_failed — use these for failure rate.
-unmapped_total is normal (messages from WA chats without a configured pair).
+unmapped_total (messages from WA chats without a configured pair) is EXPECTED behavior — do NOT report issues about 'no_chat_pair' errors or high unmapped counts. Focus only on mapped message failures.
 
 Return a JSON array of issues. Each issue must have:
 - severity: "critical" | "warning" | "info"
@@ -149,10 +149,11 @@ Rules:
     response = client.chat.completions.create(
         model=ANALYSIS_MODEL,
         messages=[
-            {"role": "developer", "content": system_prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_completion_tokens=16000,
+        max_tokens=4000,
+        temperature=0,
     )
 
     content = response.choices[0].message.content.strip()
@@ -175,8 +176,8 @@ def store_results(stats: dict, analysis: dict) -> int:
     cur = conn.cursor()
 
     tokens = analysis.get("tokens_used", 0)
-    # o3-mini: ~$1.10/1M input + $4.40/1M output, rough estimate
-    cost = tokens * 0.003 / 1000
+    # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
+    cost = tokens * 0.001 / 1000
     issues = analysis.get("issues", [])
 
     cur.execute(
