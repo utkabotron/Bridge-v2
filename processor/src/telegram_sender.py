@@ -6,6 +6,7 @@ sendDocument/sendAudio are needed here.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional, Tuple
@@ -27,28 +28,46 @@ def get_client() -> httpx.AsyncClient:
     return _client
 
 
+def _parse_migrate(resp_text: str) -> Optional[int]:
+    """Extract migrate_to_chat_id from Telegram error response."""
+    try:
+        data = json.loads(resp_text)
+        return data.get("parameters", {}).get("migrate_to_chat_id")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
 async def send_message(
     chat_id: int,
     text: str,
     media_url: Optional[str] = None,
     message_type: str = "text",
     media_filename: Optional[str] = None,
-) -> Tuple[bool, Optional[str]]:
-    """Send a message to Telegram. Returns (success, error_message)."""
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Send a message to Telegram.
+
+    Returns (success, error_message, migrate_to_chat_id).
+    migrate_to_chat_id is set when group was upgraded to supergroup.
+    """
     try:
         if media_url and message_type in ("image", "photo"):
-            return await _send_photo(chat_id, text, media_url)
+            ok, err = await _send_photo(chat_id, text, media_url)
         elif media_url and message_type in ("video",):
-            return await _send_video(chat_id, text, media_url)
+            ok, err = await _send_video(chat_id, text, media_url)
         elif media_url and message_type in ("audio", "voice"):
-            return await _send_audio(chat_id, text, media_url)
+            ok, err = await _send_audio(chat_id, text, media_url)
         elif media_url and message_type == "document":
-            return await _send_document(chat_id, text, media_url, media_filename)
+            ok, err = await _send_document(chat_id, text, media_url, media_filename)
         else:
-            return await _send_text(chat_id, text)
+            ok, err = await _send_text(chat_id, text)
+
+        migrate_id = _parse_migrate(err) if err else None
+        if migrate_id:
+            logger.warning("Group %s migrated to supergroup %s", chat_id, migrate_id)
+        return ok, err, migrate_id
     except Exception as exc:
         logger.error("Telegram send error: %s", exc)
-        return False, str(exc)
+        return False, str(exc), None
 
 
 async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str]]:

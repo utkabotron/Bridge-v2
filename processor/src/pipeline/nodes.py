@@ -161,7 +161,7 @@ async def deliver_node(state: MessageState) -> MessageState:
         return {**state, "delivery_status": "failed", "error": "missing tg_chat_id"}
 
     from ..telegram_sender import send_message
-    ok, error = await send_message(
+    ok, error, migrate_id = await send_message(
         chat_id=tg_chat_id,
         text=state["formatted_text"],
         media_url=state.get("media_s3_url"),
@@ -169,8 +169,21 @@ async def deliver_node(state: MessageState) -> MessageState:
         media_filename=state.get("media_filename"),
     )
 
+    # Auto-migrate supergroup: update chat_pairs and retry
+    if not ok and migrate_id:
+        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        ok, error, _ = await send_message(
+            chat_id=migrate_id,
+            text=state["formatted_text"],
+            media_url=state.get("media_s3_url"),
+            message_type=state.get("message_type", "text"),
+            media_filename=state.get("media_filename"),
+        )
+        if ok:
+            tg_chat_id = migrate_id
+
     new_status = "delivered" if ok else "failed"
-    result = {**state, "delivery_status": new_status, "error": error}
+    result = {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status, "error": error}
 
     await _persist_event(result)
     return result
@@ -194,7 +207,7 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
 
     errors = []
     for admin_id in admin_ids:
-        ok, error = await send_message(
+        ok, error, _ = await send_message(
             chat_id=admin_id,
             text=text,
             media_url=state.get("media_s3_url"),
@@ -213,6 +226,22 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
 
     await _persist_event(result)
     return result
+
+
+async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> None:
+    """Update chat_pairs tg_chat_id when Telegram group migrates to supergroup."""
+    if not chat_pair_id:
+        return
+    try:
+        from ..db import get_pool
+        pool = await get_pool()
+        await pool.execute(
+            "UPDATE chat_pairs SET tg_chat_id = $1 WHERE id = $2",
+            str(new_tg_chat_id), chat_pair_id,
+        )
+        logger.info("Migrated chat_pair %s to new tg_chat_id %s", chat_pair_id, new_tg_chat_id)
+    except Exception as exc:
+        logger.error("Failed to migrate chat_pair %s: %s", chat_pair_id, exc)
 
 
 async def _persist_event(state: MessageState) -> None:
