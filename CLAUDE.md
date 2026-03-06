@@ -160,6 +160,18 @@ wa-service загружает медиа в S3/MinIO (`uploadMedia()`), клад
 
 Локально S3 заменён на **MinIO** (порт 9000, консоль 9001). Бакет `bridge-media` создаётся автоматически через `minio-init` сервис в docker-compose (`infra/minio-init.sh`).
 
+### Media Analyzer
+`processor/src/media_analyzer.py` — анализ медиа через OpenAI:
+- `analyze_image()` — GPT-4.1-mini vision для описания изображений
+- `analyze_audio()` — Whisper для транскрипции аудио
+- `analyze_document()` — PyPDF для извлечения текста из PDF
+
+Результат возвращается на `target_language` пользователя. Endpoint: `POST /analyze` (event_id, analysis_type, requested_by).
+
+### Bot — дополнительные хэндлеры
+- `handlers/translate.py` — прямой перевод текста в личке бота. Флоу: user sends text → reply(text + ⏳) → POST /translate → edit(перевод) → delete(user msg). При ошибке — оригинал НЕ удаляется.
+- `handlers/analyze.py` — callback handler для кнопки "Analyze" на медиа. Парсит `analyze:{event_id}`, вызывает `POST /analyze`.
+
 ### Processor — LangGraph pipeline
 Граф в `processor/src/pipeline/graph.py`. Узлы в `nodes.py`. Условная маршрутизация: нет пары → сразу deliver(failed), нет текста → skip translate. Промпт версионирован: `PROMPT_VERSION` в `prompts.py`. Fallback to admins при отсутствии пары работает только для admin users (ADMIN_TG_IDS).
 
@@ -171,6 +183,9 @@ Pipeline использует `astream(state, stream_mode="updates")` — каж
 - `GET /api/backlog` — открытые critical issues из persistent бэклога
 - `PATCH /api/backlog/{id}` — обновить статус (resolved/wontfix)
 - `GET /api/costs` — LangSmith cost data (кэш 15 мин), fallback pricing для gpt-4.1-mini
+- `GET /api/daily-stats` — дневная статистика
+- `POST /translate` — перевод текста (text, user_id) → original, translated, target_language, translation_ms
+- `POST /analyze` — анализ медиа (event_id, analysis_type, requested_by)
 
 ### Bot — смешанный sync/async
 python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдельный daemon thread. Коммуникация: `asyncio.run_coroutine_threadsafe(coro, bot_loop)`, где `bot_loop` захватывается в `main.py:post_init`.
@@ -180,15 +195,16 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 Хранятся в `onboarding_sessions`. Мигрированные из v1 получают `done`. Bot /start всегда показывает описание + кнопку Mini App (независимо от состояния). При добавлении бота как admin в TG группу — автосообщение с кнопкой /add.
 
 ### Analytics — Prefect flows
-5 flow с cron-расписанием в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
+6 flow в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Dual-mode: без `PREFECT_API_URL` — локальный server, с ним — Prefect Cloud worker. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
 
 | Flow | Cron | Модель | Назначение |
 |------|------|--------|------------|
 | `wa-health-check` | `*/15 * * * *` | — | Проверка wa-service |
-| `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных |
+| `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных (message_events > 30д, sessions > 7д) |
 | `nightly-problems` | `0 4 * * *` | gpt-4.1-mini | Анализ проблем за 24h |
 | `translation-quality` | `30 4 * * *` | gpt-4.1-mini | Оценка качества переводов |
 | `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
+| `export-to-bq` | ручной | — | Экспорт в BigQuery (требует GCP_SA_PATH) |
 
 ## База данных
 
@@ -215,6 +231,13 @@ PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и 
 **005_weekly_insights.sql**:
 - `weekly_insights` — persistent memory для weekly-report (week_start UNIQUE, executive_summary, deep_analysis JSONB, recommendations JSONB)
 - `analytics_changelog` — лог изменений аналитики
+
+**006_delivery_status_skipped.sql**:
+- Добавляет статус `skipped` в `delivery_status` enum. Сообщения без chat_pair теперь `skipped` (ранее `failed`). Разделяет реальные ошибки от ожидаемых skip'ов в метриках.
+
+**007_media_analysis.sql**:
+- `media_analysis` — результаты анализа медиа (image/audio/document), связь с message_events
+- Добавляет `tg_message_id` в `message_events`
 
 ## Production (VPS)
 
