@@ -40,5 +40,6 @@ class MessageState(TypedDict):
     fallback_to_admins: bool
 
     # Set by deliver node
+    tg_message_id: Optional[int]
     delivery_status: str       # pending | delivered | failed | skipped
     error: Optional[str]

@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 # Shared LLM instance — model pinned for reproducibility
 _llm: Any = None
 
+# Media types eligible for the Analyze button (no video in v1)
+_ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "document"}
+
 
 def get_llm() -> ChatOpenAI:
     global _llm
@@ -160,33 +163,101 @@ async def deliver_node(state: MessageState) -> MessageState:
     if not tg_chat_id:
         return {**state, "delivery_status": "failed", "error": "missing tg_chat_id"}
 
+    has_media = bool(state.get("media_s3_url"))
+    msg_type = state.get("message_type", "text")
+    is_analyzable = has_media and msg_type in _ANALYZABLE_TYPES
+
+    if is_analyzable:
+        return await _deliver_media_with_button(state, tg_chat_id)
+
+    return await _deliver_simple(state, tg_chat_id)
+
+
+async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
+    """Standard delivery without inline buttons."""
     from ..telegram_sender import send_message
-    ok, error, migrate_id = await send_message(
+    ok, error, migrate_id, tg_msg_id = await send_message(
         chat_id=tg_chat_id,
         text=state["formatted_text"],
         media_url=state.get("media_s3_url"),
         message_type=state.get("message_type", "text"),
         media_filename=state.get("media_filename"),
+        media_mime=state.get("media_mime"),
     )
 
     # Auto-migrate supergroup: update chat_pairs and retry
     if not ok and migrate_id:
         await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
-        ok, error, _ = await send_message(
+        ok, error, _, tg_msg_id = await send_message(
             chat_id=migrate_id,
             text=state["formatted_text"],
             media_url=state.get("media_s3_url"),
             message_type=state.get("message_type", "text"),
             media_filename=state.get("media_filename"),
+            media_mime=state.get("media_mime"),
         )
         if ok:
             tg_chat_id = migrate_id
 
     new_status = "delivered" if ok else "failed"
-    result = {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status, "error": error}
+    result = {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status,
+              "error": error, "tg_message_id": tg_msg_id}
 
     await _persist_event(result)
     return result
+
+
+async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> MessageState:
+    """Two-phase delivery: INSERT pending → send with Analyze button → UPDATE."""
+    from ..db import insert_message_event_returning_id, update_event_after_send
+    from ..telegram_sender import send_message
+
+    # Phase 1: INSERT message_event (pending) to get event_id for callback_data
+    pending_state = {**state, "delivery_status": "pending"}
+    event_id = await insert_message_event_returning_id(pending_state)
+    if not event_id:
+        logger.error("Failed to get event_id for two-phase delivery")
+        result = {**state, "delivery_status": "failed", "error": "db_insert_failed"}
+        await _persist_event(result)
+        return result
+
+    # Phase 2: Send with inline keyboard
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": "\U0001f50d Analyze", "callback_data": f"analyze:{event_id}"},
+        ]],
+    }
+    ok, error, migrate_id, tg_msg_id = await send_message(
+        chat_id=tg_chat_id,
+        text=state["formatted_text"],
+        media_url=state.get("media_s3_url"),
+        message_type=state.get("message_type", "text"),
+        media_filename=state.get("media_filename"),
+        media_mime=state.get("media_mime"),
+        reply_markup=reply_markup,
+    )
+
+    # Auto-migrate supergroup
+    if not ok and migrate_id:
+        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        ok, error, _, tg_msg_id = await send_message(
+            chat_id=migrate_id,
+            text=state["formatted_text"],
+            media_url=state.get("media_s3_url"),
+            message_type=state.get("message_type", "text"),
+            media_filename=state.get("media_filename"),
+            media_mime=state.get("media_mime"),
+            reply_markup=reply_markup,
+        )
+        if ok:
+            tg_chat_id = migrate_id
+
+    # Phase 3: UPDATE event with delivery status + tg_message_id
+    new_status = "delivered" if ok else "failed"
+    await update_event_after_send(event_id, new_status, error, tg_msg_id)
+
+    return {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status,
+            "error": error, "tg_message_id": tg_msg_id}
 
 
 async def _deliver_to_admins(state: MessageState) -> MessageState:
@@ -207,12 +278,13 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
 
     errors = []
     for admin_id in admin_ids:
-        ok, error, _ = await send_message(
+        ok, error, _, _ = await send_message(
             chat_id=admin_id,
             text=text,
             media_url=state.get("media_s3_url"),
             message_type=state.get("message_type", "text"),
             media_filename=state.get("media_filename"),
+            media_mime=state.get("media_mime"),
         )
         if not ok:
             errors.append(f"admin {admin_id}: {error}")

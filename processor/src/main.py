@@ -24,6 +24,8 @@ from pydantic import BaseModel
 
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
+from .media_analyzer import analyze_image, transcribe_audio, analyze_document
+from .db import get_pool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -344,6 +346,133 @@ async def api_costs(days: int = Query(default=7, ge=1, le=90)):
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
+# ── Translation API ───────────────────────────────────────
+
+class TranslateRequest(BaseModel):
+    text: str
+    target_language: str = ""
+    user_id: int = 0
+
+
+@app.post("/translate")
+async def translate_text(body: TranslateRequest):
+    """Translate text using the pipeline's LLM + cache."""
+    from .pipeline.nodes import get_llm
+    from .pipeline.cache import get_cached, set_cached
+    from .pipeline.prompts import get_translate_prompt
+
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
+
+    # Resolve target language from user profile if not provided
+    lang = body.target_language
+    if not lang and body.user_id:
+        from .db import get_pool
+        pool = await get_pool()
+        row = await pool.fetchrow(
+            "SELECT target_language FROM users WHERE tg_user_id = $1", body.user_id,
+        )
+        lang = row["target_language"] if row and row["target_language"] else ""
+    if not lang:
+        lang = os.getenv("TARGET_LANGUAGE", "Hebrew")
+
+    # Cache check
+    cached = await get_cached(text, lang)
+    if cached:
+        return {"original": text, "translated": cached, "target_language": lang, "cache_hit": True}
+
+    # LLM translation
+    from langchain_core.messages import HumanMessage, SystemMessage
+    t0 = time.monotonic()
+    messages = [
+        SystemMessage(content=get_translate_prompt(lang)),
+        HumanMessage(content=text),
+    ]
+    response = await get_llm().ainvoke(messages)
+    translation_ms = int((time.monotonic() - t0) * 1000)
+    translated = response.content.strip()
+
+    await set_cached(text, lang, translated)
+
+    return {
+        "original": text,
+        "translated": translated,
+        "target_language": lang,
+        "translation_ms": translation_ms,
+        "cache_hit": False,
+    }
+
+
+# ── Media Analysis API ────────────────────────────────────
+
+class AnalyzeRequest(BaseModel):
+    message_event_id: int
+    requested_by: int
+
+
+@app.post("/analyze")
+async def analyze_media(body: AnalyzeRequest):
+    """Analyze media content (image/audio/document) by message_event_id."""
+    from .db import get_event_for_analysis, get_existing_analysis, insert_media_analysis
+    from .telegram_sender import download_media
+
+    # Check for existing analysis
+    existing = await get_existing_analysis(body.message_event_id)
+    if existing:
+        return {"result_text": existing["result_text"], "analysis_type": existing["analysis_type"]}
+
+    # Fetch event
+    event = await get_event_for_analysis(body.message_event_id)
+    if not event:
+        return JSONResponse({"error": "event not found"}, status_code=404)
+
+    media_url = event["media_s3_key"]
+    if not media_url:
+        return JSONResponse({"error": "no media attached"}, status_code=400)
+
+    # Download media from MinIO
+    downloaded = await download_media(media_url)
+    if not downloaded:
+        return JSONResponse({"error": "failed to download media"}, status_code=502)
+
+    content_bytes, filename, content_type = downloaded
+    target_lang = event.get("target_language") or "Russian"
+    msg_type = event.get("message_type", "")
+
+    t0 = time.monotonic()
+    analysis_type = "unknown"
+    try:
+        if msg_type in ("image", "photo"):
+            analysis_type = "image"
+            result_text = await analyze_image(content_bytes, content_type, target_lang)
+        elif msg_type in ("audio", "voice"):
+            analysis_type = "audio"
+            result_text = await transcribe_audio(content_bytes, filename, target_lang)
+        elif msg_type == "document":
+            analysis_type = "document"
+            result_text = await analyze_document(content_bytes, filename, content_type, target_lang)
+        else:
+            return JSONResponse({"error": f"unsupported media type: {msg_type}"}, status_code=400)
+
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        await insert_media_analysis(
+            body.message_event_id, analysis_type, result_text,
+            "completed", processing_ms, body.requested_by,
+        )
+        return {"result_text": result_text, "analysis_type": analysis_type, "processing_ms": processing_ms}
+
+    except Exception as exc:
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        error_msg = str(exc)
+        logger.error("Media analysis failed for event %s: %s", body.message_event_id, error_msg)
+        await insert_media_analysis(
+            body.message_event_id, analysis_type, error_msg,
+            "failed", processing_ms, body.requested_by,
+        )
+        return JSONResponse({"error": error_msg}, status_code=500)
+
+
 # ── Redis consumer ────────────────────────────────────────
 
 NODES = ["validate", "translate", "format", "deliver"]
@@ -394,6 +523,19 @@ async def consume_loop():
                 "delivery_status": "pending",
                 "error": None,
             }
+
+            # ── DB dedup: skip if already delivered ──
+            wa_msg_id = state["wa_message_id"]
+            if wa_msg_id:
+                pool = await get_pool()
+                existing = await pool.fetchval(
+                    "SELECT delivery_status FROM message_events WHERE wa_message_id = $1",
+                    wa_msg_id,
+                )
+                if existing == "delivered":
+                    _counter["skipped"] += 1
+                    logger.info("Dedup skip: %s already delivered", wa_msg_id)
+                    continue
 
             msg_id = state["wa_message_id"][:12]
             sender = state["sender_name"] or "unknown"

@@ -43,6 +43,7 @@ def collect_stats() -> dict:
             count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
             count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
             count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
+            count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
             avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL) AS avg_translation_ms,
             max(translation_ms) AS max_translation_ms,
             count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,

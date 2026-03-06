@@ -22,6 +22,8 @@ from telegram.ext import (
 )
 
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
+from .handlers.analyze import cb_analyze_media, cb_noop
+from .handlers.translate import handle_direct_text
 from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
 from .handlers.groups import handle_my_chat_member
 from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
@@ -70,10 +72,17 @@ def main() -> None:
     # ── Group tracking (my_chat_member) ───────────────────
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
+    # ── Media analysis ─────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(cb_analyze_media, pattern=r"^analyze:\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
+
     # ── Admin ─────────────────────────────────────────────
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+
+    # ── Direct translation (private chat text) ─────────────
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_direct_text))
 
     logger.info("Bot starting (polling)")
     app.run_polling(

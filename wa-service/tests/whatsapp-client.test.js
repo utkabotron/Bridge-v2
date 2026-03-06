@@ -315,8 +315,8 @@ describe('QR timeout', () => {
 
     expect(clientData.qrTimer).not.toBeNull();
 
-    // Advance past QR_TIMEOUT_MS (10 minutes)
-    jest.advanceTimersByTime(10 * 60 * 1000);
+    // Advance past QR_TIMEOUT_MS (60 minutes)
+    jest.advanceTimersByTime(60 * 60 * 1000);
 
     expect(mockDestroy).toHaveBeenCalled();
     expect(clients.has(42)).toBe(false);

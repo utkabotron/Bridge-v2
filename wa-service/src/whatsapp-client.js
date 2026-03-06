@@ -16,12 +16,13 @@ const MAX_CONCURRENT_CLIENTS = parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 1
 const MAX_PARALLEL_INIT = parseInt(process.env.MAX_PARALLEL_INIT) || 3;
 
 // QR timeout — destroy client if user doesn't scan within this period
-const QR_TIMEOUT_MS = parseInt(process.env.QR_TIMEOUT_MS) || 10 * 60 * 1000;
+const QR_TIMEOUT_MS = parseInt(process.env.QR_TIMEOUT_MS) || 60 * 60 * 1000;
 
 // Reconnect settings
 const RECONNECT_DELAYS = [5000, 15000, 45000]; // 5s, 15s, 45s
-const HEALTH_CHECK_INTERVAL = 60000; // 60s
+const HEALTH_CHECK_INTERVAL = 30000; // 30s
 const HEALTH_CHECK_TIMEOUT = 10000; // 10s
+const MAX_MESSAGE_ERRORS = 5; // reconnect after N consecutive message handler errors
 
 function getClientId(userId) {
   return `user-${userId}`;
@@ -88,7 +89,16 @@ let healthCheckTimer = null;
 
 async function checkClientHealth() {
   for (const [userId, clientData] of clients) {
-    if (!clientData.isReady) continue;
+    // Non-ready (QR-waiting) clients: just destroy, no reconnect — they're useless
+    if (!clientData.isReady) {
+      // Only clean up if client has been sitting idle (not freshly created)
+      if (clientData.qrTimer === null && clientData.qr !== null) {
+        console.warn(`Health check: user ${userId} not ready and no QR timer — destroying idle client`);
+        try { await clientData.client.destroy(); } catch { /* ignore */ }
+        clients.delete(userId);
+      }
+      continue;
+    }
 
     try {
       const statePromise = clientData.client.getState();
@@ -145,7 +155,7 @@ async function createWhatsAppClient(userId) {
     throw new Error(`Max clients reached (${MAX_CONCURRENT_CLIENTS})`);
   }
 
-  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null };
+  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null, errorCount: 0 };
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
@@ -156,6 +166,7 @@ async function createWhatsAppClient(userId) {
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      protocolTimeout: 30000, // 30s instead of default 180s — fail fast on hung Chromium
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -210,6 +221,9 @@ async function createWhatsAppClient(userId) {
     clientData.qrTimer = null;
     clientData.isReady = true;
     clientData.qr = null;
+    clientData.errorCount = 0;
+    // Mark session as authenticated — used by restoreExistingSessions to skip dead sessions
+    writeAuthMarker(userId);
     await publishQrScanned(userId, 'ready').catch(console.error);
   });
 
@@ -219,6 +233,8 @@ async function createWhatsAppClient(userId) {
     clientData.qrTimer = null;
     clientData.isReady = true;
     clientData.qr = null;
+    clientData.errorCount = 0;
+    writeAuthMarker(userId);
     await publishQrScanned(userId, 'authenticated').catch(console.error);
   });
 
@@ -258,15 +274,39 @@ async function createWhatsAppClient(userId) {
   });
 
   client.on('message', async (message) => {
-    await handleIncomingMessage(userId, message, false).catch((err) =>
-      console.error(`Message handler error for user ${userId}:`, err.message)
-    );
+    try {
+      await handleIncomingMessage(userId, message, false);
+      clientData.errorCount = 0;
+    } catch (err) {
+      clientData.errorCount++;
+      console.error(`Message handler error for user ${userId} (${clientData.errorCount}/${MAX_MESSAGE_ERRORS}):`, err.message);
+      if (clientData.errorCount >= MAX_MESSAGE_ERRORS) {
+        console.error(`Too many message errors (${MAX_MESSAGE_ERRORS}), triggering reconnect for user ${userId}`);
+        clientData.isReady = false;
+        clientData.errorCount = 0;
+        try { await client.destroy(); } catch { /* ignore */ }
+        clients.delete(userId);
+        reconnectClient(userId, 'message_errors').catch(console.error);
+      }
+    }
   });
 
   client.on('message_edit', async (message) => {
-    await handleIncomingMessage(userId, message, true).catch((err) =>
-      console.error(`Edit handler error for user ${userId}:`, err.message)
-    );
+    try {
+      await handleIncomingMessage(userId, message, true);
+      clientData.errorCount = 0;
+    } catch (err) {
+      clientData.errorCount++;
+      console.error(`Edit handler error for user ${userId} (${clientData.errorCount}/${MAX_MESSAGE_ERRORS}):`, err.message);
+      if (clientData.errorCount >= MAX_MESSAGE_ERRORS) {
+        console.error(`Too many message errors (${MAX_MESSAGE_ERRORS}), triggering reconnect for user ${userId}`);
+        clientData.isReady = false;
+        clientData.errorCount = 0;
+        try { await client.destroy(); } catch { /* ignore */ }
+        clients.delete(userId);
+        reconnectClient(userId, 'message_errors').catch(console.error);
+      }
+    }
   });
 
   clientData.client = client;
@@ -360,6 +400,21 @@ async function handleIncomingMessage(userId, message, isEdited) {
   console.log(`Queued message ${message.id._serialized} from chat ${chat.name}`);
 }
 
+// ── Auth marker — only restore sessions that were actually authenticated ──
+
+function writeAuthMarker(userId) {
+  const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
+  const markerPath = path.join(sessionDir, '.authenticated');
+  try {
+    if (fs.existsSync(sessionDir) && !fs.existsSync(markerPath)) {
+      fs.writeFileSync(markerPath, new Date().toISOString());
+      console.log(`Auth marker written for user ${userId}`);
+    }
+  } catch (err) {
+    console.warn(`Failed to write auth marker for user ${userId}: ${err.message}`);
+  }
+}
+
 // ── Restore persisted sessions on startup ─────────────────
 
 async function restoreExistingSessions() {
@@ -381,10 +436,33 @@ async function restoreExistingSessions() {
     return;
   }
 
-  console.log(`Found ${sessions.length} session(s) — restoring up to ${MAX_PARALLEL_INIT} in parallel`);
+  // Filter: only restore sessions with .authenticated marker
+  const authenticatedSessions = [];
+  for (const dir of sessions) {
+    const markerPath = path.join(authDir, dir, '.authenticated');
+    if (fs.existsSync(markerPath)) {
+      authenticatedSessions.push(dir);
+    } else {
+      // Remove unauthenticated session dir — it was never successfully connected
+      const sessionPath = path.join(authDir, dir);
+      try {
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        console.log(`Removed unauthenticated session dir: ${sessionPath}`);
+      } catch (err) {
+        console.warn(`Failed to remove session dir ${sessionPath}: ${err.message}`);
+      }
+    }
+  }
 
-  for (let i = 0; i < sessions.length; i += MAX_PARALLEL_INIT) {
-    const batch = sessions.slice(i, i + MAX_PARALLEL_INIT);
+  if (authenticatedSessions.length === 0) {
+    console.log(`Found ${sessions.length} session(s) but none authenticated — skipping restore`);
+    return;
+  }
+
+  console.log(`Found ${sessions.length} session(s), ${authenticatedSessions.length} authenticated — restoring up to ${MAX_PARALLEL_INIT} in parallel`);
+
+  for (let i = 0; i < authenticatedSessions.length; i += MAX_PARALLEL_INIT) {
+    const batch = authenticatedSessions.slice(i, i + MAX_PARALLEL_INIT);
     await Promise.allSettled(
       batch.map(async (dir) => {
         const uid = parseInt(dir.replace('session-user-', '').replace('user-', ''));
@@ -397,7 +475,7 @@ async function restoreExistingSessions() {
         }
       })
     );
-    if (i + MAX_PARALLEL_INIT < sessions.length) {
+    if (i + MAX_PARALLEL_INIT < authenticatedSessions.length) {
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
