@@ -138,8 +138,13 @@ TEMPLATES = {
 }
 
 
-def render(key: str, **kwargs) -> str:
+def render(key: str, escape: bool = False, **kwargs) -> str:
     tmpl = TEMPLATES.get(key)
     if tmpl is None:
         raise KeyError(f"Template '{key}' not found")
-    return tmpl.format(**kwargs) if kwargs else tmpl
+    if kwargs:
+        if escape:
+            from ..utils.telegram_format import escape_md
+            kwargs = {k: escape_md(str(v)) for k, v in kwargs.items()}
+        return tmpl.format(**kwargs)
+    return tmpl

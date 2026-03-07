@@ -33,7 +33,7 @@ async def cmd_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     buttons = []
     for i, p in enumerate(pairs, 1):
         status = "active" if p["status"] == "active" else "paused"
-        lines.append(render("chat_item", idx=i, wa_name=p["wa_chat_name"], tg_title=p["tg_chat_title"], status=status))
+        lines.append(render("chat_item", escape=True, idx=i, wa_name=p["wa_chat_name"], tg_title=p["tg_chat_title"], status=status))
 
         action = "pause" if p["status"] == "active" else "resume"
         buttons.append([
@@ -95,7 +95,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ]
 
     await update.message.reply_text(
-        render("add_select_header", tg_group=chat.title or "this group"),
+        render("add_select_header", escape=True, tg_group=chat.title or "this group"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -127,7 +127,7 @@ async def cb_link_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await finish_onboarding(tg_id, wa_chat_id, wa_chat_name, tg_chat_id, tg_chat_title)
     await query.edit_message_text(
-        render("add_success", wa_name=wa_chat_name, tg_title=tg_chat_title),
+        render("add_success", escape=True, wa_name=wa_chat_name, tg_title=tg_chat_title),
         parse_mode="Markdown",
     )
 
@@ -180,6 +180,6 @@ async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ctx.user_data.pop("pending_wa_chat", None)
 
     await update.message.reply_text(
-        render("onboarding_done_success", wa_name=wa_chat_name, tg_title=chat.title or str(chat.id)),
+        render("onboarding_done_success", escape=True, wa_name=wa_chat_name, tg_title=chat.title or str(chat.id)),
         parse_mode="Markdown",
     )

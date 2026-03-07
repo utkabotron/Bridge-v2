@@ -159,10 +159,20 @@ async def send_message(
 async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:
     r = await get_client().post(
         f"{BASE_URL}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
     )
     if r.status_code == 200:
         return True, None, _parse_message_id(r.text)
+    # Fallback: retry without parse_mode on parse errors
+    if r.status_code == 400 and "can't parse entities" in r.text.lower():
+        logger.warning("HTML parse failed for chat %s, retrying without parse_mode", chat_id)
+        r2 = await get_client().post(
+            f"{BASE_URL}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+        )
+        if r2.status_code == 200:
+            return True, None, _parse_message_id(r2.text)
+        return False, r2.text, None
     return False, r.text, None
 
 
@@ -182,7 +192,7 @@ async def _send_media_multipart(
     2. If download fails → try sending URL directly (JSON)
     3. If URL also fails → text with link
     """
-    data_fields = {"chat_id": str(chat_id), "caption": caption, "parse_mode": "Markdown"}
+    data_fields = {"chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML"}
     if reply_markup:
         data_fields["reply_markup"] = json.dumps(reply_markup)
 
@@ -197,6 +207,17 @@ async def _send_media_multipart(
         if r.status_code == 200:
             logger.info("Sent %s via multipart upload to chat %s", endpoint, chat_id)
             return True, None, _parse_message_id(r.text)
+        # Fallback: retry without parse_mode on parse errors
+        if r.status_code == 400 and "can't parse entities" in r.text.lower():
+            logger.warning("HTML caption parse failed, retrying without parse_mode")
+            data_no_pm = {k: v for k, v in data_fields.items() if k != "parse_mode"}
+            r2 = await get_client().post(
+                f"{BASE_URL}/{endpoint}",
+                data=data_no_pm,
+                files={field_name: (filename, content_bytes, content_type)},
+            )
+            if r2.status_code == 200:
+                return True, None, _parse_message_id(r2.text)
         logger.warning("%s multipart failed (%s): %s", endpoint, r.status_code, r.text)
 
     # Fallback: try URL directly
@@ -204,7 +225,7 @@ async def _send_media_multipart(
         "chat_id": chat_id,
         field_name: url,
         "caption": caption,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup

@@ -8,6 +8,8 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from ..utils.telegram_format import esc
+
 logger = logging.getLogger(__name__)
 
 PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://processor:8000")
@@ -62,10 +64,10 @@ async def cb_analyze_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             # Format result
             type_emoji = {"image": "\U0001f5bc", "audio": "\U0001f3a4", "document": "\U0001f4c4"}.get(analysis_type, "\U0001f50d")
-            header = f"{type_emoji} *Analysis*"
+            header = f"{type_emoji} <b>Analysis</b>"
             if processing_ms:
                 header += f" ({processing_ms}ms)"
-            reply_text = f"{header}\n\n{result_text}"
+            reply_text = f"{header}\n\n{esc(result_text)}"
 
             # Send as reply to the original message
             msg = query.message
@@ -73,7 +75,7 @@ async def cb_analyze_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 chat_id=msg.chat_id,
                 text=reply_text,
                 reply_to_message_id=msg.message_id,
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
 
             # Update button to "Analyzed"

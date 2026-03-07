@@ -7,7 +7,7 @@ import os
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
-from telegram.constants import ChatAction
+from ..utils.telegram_format import esc, italic
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = msg.from_user.id if msg.from_user else 0
 
     # Phase 1: instant preview with hourglass
-    preview_msg = await msg.reply_text(f"{text}\n\n⏳", parse_mode="Markdown")
+    preview_msg = await msg.reply_text(f"{esc(text)}\n\n⏳", parse_mode="HTML")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -43,12 +43,12 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lang = data.get("target_language", "")
             ms = data.get("translation_ms")
 
-            reply = f"{original}\n\n{translated}"
+            reply = f"{esc(original)}\n\n{esc(translated)}"
             if ms:
-                reply += f"\n\n_({ms}ms, {lang})_"
+                reply += f"\n\n{italic(f'{ms}ms, {lang}')}"
 
             # Phase 2: edit preview with translation
-            await preview_msg.edit_text(reply, parse_mode="Markdown")
+            await preview_msg.edit_text(reply, parse_mode="HTML")
 
             # Phase 3: delete original user message for clean feed
             try:
@@ -58,14 +58,14 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             error = r.text
             logger.error("Processor /translate returned %s: %s", r.status_code, error)
-            await preview_msg.edit_text(f"{text}\n\n❌ Translation failed. Try again later.")
+            await preview_msg.edit_text(f"{esc(text)}\n\n❌ Translation failed. Try again later.")
 
     except httpx.TimeoutException:
         logger.error("Processor /translate timeout")
-        await preview_msg.edit_text(f"{text}\n\n❌ Translation timed out. Try again later.")
+        await preview_msg.edit_text(f"{esc(text)}\n\n❌ Translation timed out. Try again later.")
     except Exception as exc:
         logger.error("Translate handler error: %s", exc)
-        await preview_msg.edit_text(f"{text}\n\n❌ Something went wrong. Try again later.")
+        await preview_msg.edit_text(f"{esc(text)}\n\n❌ Something went wrong. Try again later.")
 
 
 async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -101,7 +101,7 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Phase 1: instant preview with hourglass
-    preview_msg = await msg.reply_text("⏳ Analyzing...", parse_mode="Markdown")
+    preview_msg = await msg.reply_text("⏳ Analyzing...")
 
     try:
         # Download file from Telegram
@@ -121,11 +121,11 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
             analysis_type = data.get("analysis_type", "")
             ms = data.get("processing_ms")
 
-            reply = result_text
+            reply = esc(result_text)
             if ms:
-                reply += f"\n\n_({ms}ms, {analysis_type})_"
+                reply += f"\n\n{italic(f'{ms}ms, {analysis_type}')}"
 
-            await preview_msg.edit_text(reply, parse_mode="Markdown")
+            await preview_msg.edit_text(reply, parse_mode="HTML")
         else:
             error = r.text
             logger.error("Processor /analyze-direct returned %s: %s", r.status_code, error)

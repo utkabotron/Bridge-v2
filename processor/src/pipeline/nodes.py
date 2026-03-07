@@ -16,6 +16,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ..models.message import MessageState
+from ..utils.telegram_format import bold, esc
 from .cache import get_cached, set_cached
 from .prompts import PROMPT_VERSION, get_translate_prompt
 
@@ -136,11 +137,11 @@ def format_node(state: MessageState) -> MessageState:
 
     parts = []
     if sender:
-        parts.append(f"*{sender}*")
+        parts.append(bold(sender))
         parts.append("")
-    parts.append(original)
+    parts.append(esc(original))
     parts.append("")
-    parts.append(translated)
+    parts.append(esc(translated))
 
     formatted = "\n".join(parts)
     return {**state, "formatted_text": formatted}

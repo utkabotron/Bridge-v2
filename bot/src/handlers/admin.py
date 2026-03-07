@@ -47,7 +47,7 @@ async def cmd_whitelist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if action == "add":
         await add_to_whitelist(tg_user_id, username)
         await update.message.reply_text(
-            render("admin_whitelist_added", username=username or str(tg_user_id)),
+            render("admin_whitelist_added", escape=True, username=username or str(tg_user_id)),
             parse_mode="Markdown",
         )
     else:
@@ -58,7 +58,7 @@ async def cmd_whitelist(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "update public.users set is_active = false where tg_user_id = $1", tg_user_id
         )
         await update.message.reply_text(
-            render("admin_whitelist_removed", username=username or str(tg_user_id)),
+            render("admin_whitelist_removed", escape=True, username=username or str(tg_user_id)),
             parse_mode="Markdown",
         )
 
@@ -78,6 +78,7 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(
             render(
                 "admin_user_item",
+                escape=True,
                 tg_user_id=u["tg_user_id"],
                 username=u.get("tg_username") or "—",
                 status=status,
