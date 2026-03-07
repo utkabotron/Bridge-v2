@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
 from .handlers.analyze import cb_analyze_media, cb_noop
-from .handlers.translate import handle_direct_text
+from .handlers.translate import handle_direct_media, handle_direct_text
 from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
 from .handlers.groups import handle_my_chat_member
 from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
@@ -83,6 +83,12 @@ def main() -> None:
 
     # ── Direct translation (private chat text) ─────────────
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_direct_text))
+
+    # ── Direct media analysis (private chat media) ────────
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE) & filters.ChatType.PRIVATE,
+        handle_direct_media,
+    ))
 
     logger.info("Bot starting (polling)")
     app.run_polling(

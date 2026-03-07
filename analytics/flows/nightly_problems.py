@@ -102,14 +102,28 @@ def collect_stats() -> dict:
     """)
     stats["message_types"] = [dict(r) for r in cur.fetchall()]
 
+    # Direct interactions (bot private chat)
+    cur.execute("""
+        SELECT
+            count(*) AS total,
+            count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
+            count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
+            count(*) FILTER (WHERE status = 'failed') AS failed
+        FROM direct_interactions
+        WHERE created_at >= current_date - interval '1 day'
+          AND created_at < current_date
+    """)
+    stats["direct_interactions"] = dict(cur.fetchone())
+
     cur.close()
     conn.close()
 
     logger.info(
-        "Collected stats: %d total, %d failed, %d slow",
+        "Collected stats: %d total, %d failed, %d slow, %d direct",
         stats["overview"]["total_messages"],
         stats["overview"]["failed"],
         stats["overview"]["slow_translations"],
+        stats["direct_interactions"]["total"],
     )
     return stats
 
@@ -130,6 +144,8 @@ Analyze the provided 24h statistics and identify issues that need attention.
 
 Stats include mapped_total/mapped_delivered/mapped_failed — use these for failure rate.
 unmapped_total (messages from WA chats without a configured pair) is EXPECTED behavior — do NOT report issues about 'no_chat_pair' errors or high unmapped counts. Focus only on mapped message failures.
+
+direct_interactions contains stats about direct translations and media analysis from the bot's private chat (not pipeline messages). Report issues if failure rate is high.
 
 Return a JSON array of issues. Each issue must have:
 - severity: "critical" | "warning" | "info"
@@ -293,7 +309,11 @@ def notify_admin(stats: dict, analysis: dict) -> int:
         lines.append("<b>Stats (24h):</b>")
         lines.append(f"  Total: {total}  Delivered: {delivered}  Failed: {failed}")
         lines.append(f"  Mapped: {mapped_total} (failed: {mapped_failed}, rate: {fail_rate}%)  Unmapped: {unmapped}")
-        lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}\n")
+        lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}")
+        di = stats.get("direct_interactions", {})
+        if di.get("total", 0) > 0:
+            lines.append(f"  Direct: {di['translations']} translations, {di['analyses']} analyses ({di['failed']} failed)")
+        lines.append("")
 
     # Issues by severity
     critical = [i for i in issues if i["severity"] == "critical"]

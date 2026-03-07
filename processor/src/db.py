@@ -205,3 +205,51 @@ async def insert_media_analysis(
         )
     except Exception as exc:
         logger.error("Failed to insert media_analysis: %s", exc)
+
+
+async def insert_direct_translation(
+    user_id: int, original_text: str, translated_text: str,
+    target_language: str, translation_ms: int, cache_hit: bool,
+) -> None:
+    """Record a direct translation from bot private chat."""
+    pool = await get_pool()
+    try:
+        await pool.execute(
+            """
+            insert into public.direct_interactions
+              (user_id, interaction_type, original_text, translated_text,
+               target_language, translation_ms, cache_hit)
+            values (
+              (select id from public.users where tg_user_id = $1),
+              'translation', $2, $3, $4, $5, $6
+            )
+            """,
+            user_id, original_text, translated_text, target_language, translation_ms, cache_hit,
+        )
+    except Exception as exc:
+        logger.error("Failed to insert direct_translation: %s", exc)
+
+
+async def insert_direct_media_analysis(
+    user_id: int, analysis_type: str, mime_type: str, filename: str,
+    result_text: str, processing_ms: int,
+    status: str = "completed", error_message: str | None = None,
+) -> None:
+    """Record a direct media analysis from bot private chat."""
+    pool = await get_pool()
+    try:
+        await pool.execute(
+            """
+            insert into public.direct_interactions
+              (user_id, interaction_type, analysis_type, media_mime_type, media_filename,
+               result_text, processing_ms, status, error_message)
+            values (
+              (select id from public.users where tg_user_id = $1),
+              'media_analysis', $2, $3, $4, $5, $6, $7, $8
+            )
+            """,
+            user_id, analysis_type, mime_type, filename,
+            result_text, processing_ms, status, error_message,
+        )
+    except Exception as exc:
+        logger.error("Failed to insert direct_media_analysis: %s", exc)

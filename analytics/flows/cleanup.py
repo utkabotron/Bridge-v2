@@ -72,13 +72,32 @@ def cleanup_old_analysis() -> int:
     return deleted
 
 
+@task(retries=2, name="cleanup-old-direct-interactions")
+def cleanup_old_direct_interactions() -> int:
+    """Delete direct_interactions older than 90 days."""
+    logger = get_run_logger()
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
+    cur.execute(
+        "delete from public.direct_interactions where created_at < now() - interval '%s days'",
+        (RETAIN_DAYS,),
+    )
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("Deleted %d old direct_interactions", deleted)
+    return deleted
+
+
 @flow(name="daily-cleanup", log_prints=True)
 def daily_cleanup():
-    """Daily cleanup: old messages + stale onboarding sessions + old analysis."""
+    """Daily cleanup: old messages + stale onboarding sessions + old analysis + old direct interactions."""
     msgs = cleanup_old_messages()
     sessions = cleanup_onboarding_sessions()
     analysis = cleanup_old_analysis()
-    return {"messages_deleted": msgs, "sessions_deleted": sessions, "analysis_deleted": analysis}
+    direct = cleanup_old_direct_interactions()
+    return {"messages_deleted": msgs, "sessions_deleted": sessions, "analysis_deleted": analysis, "direct_deleted": direct}
 
 
 if __name__ == "__main__":

@@ -25,31 +25,46 @@ def _headers() -> dict:
 # ── Image analysis (GPT-4.1-mini vision) ────────────────
 
 async def analyze_image(image_bytes: bytes, mime: str, target_lang: str) -> str:
-    """Describe image content and translate description to target_lang."""
+    """Translate text in image or describe if no text."""
     b64 = base64.b64encode(image_bytes).decode()
     data_url = f"data:{mime};base64,{b64}"
+
+    system_prompt = (
+        f"You are a professional translator. Translate ALL text visible in this image into {target_lang}.\n\n"
+        f"Rules:\n"
+        f"1. Chat screenshots: for EACH message use this exact format (name and translation on SEPARATE lines):\n"
+        f"**Sender name**\n"
+        f"translated text\n\n"
+        f"This separates RTL and LTR text to avoid broken layout. Translate EVERY message, do not skip any.\n"
+        f"2. Other images with text (articles, signs, menus, documents): translate all text, "
+        f"preserving the original structure (headings, paragraphs, labels, lists).\n"
+        f"3. Output ONLY the translated text — no comments, notes, or metadata.\n"
+        f"4. Preserve names, phone numbers, URLs, emojis, and numbers exactly as written.\n"
+        f"5. Maintain the natural, conversational tone and register; adapt formality to match {target_lang}.\n"
+        f"6. Translate the FULL content — no omissions. Double-check that every part is included.\n"
+        f"7. Preserve idiomatic nuance; the result must read naturally in {target_lang}.\n"
+        f"8. If the image has no text, provide a brief description in {target_lang} (1-2 sentences)."
+    )
+
+    user_text = (
+        f"This is an image. Translate all text to {target_lang}. "
+        f"If it's a chat screenshot, put each sender name on its own line (bold) "
+        f"and the translation on the next line. Never mix name and translation on the same line."
+    )
 
     payload = {
         "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    f"You are a helpful assistant. Describe the image content concisely. "
-                    f"First provide the description in the original language of any text visible, "
-                    f"then provide a translation/description in {target_lang}. "
-                    f"If no text is visible, just describe what you see in {target_lang}."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
                     {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": "Describe this image."},
+                    {"type": "text", "text": user_text},
                 ],
             },
         ],
-        "max_tokens": 1000,
+        "max_tokens": 2000,
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
@@ -121,14 +136,15 @@ async def analyze_document(
             {
                 "role": "system",
                 "content": (
-                    f"Summarize the following document content concisely. "
-                    f"Provide the summary in the document's original language, "
-                    f"then provide a translation/summary in {target_lang}."
+                    f"Translate the following document content to {target_lang}, "
+                    f"preserving the original structure and order. "
+                    f"After the translation, add a brief summary (2-3 sentences) in {target_lang}. "
+                    f"Do NOT include the original language text — only {target_lang}."
                 ),
             },
             {"role": "user", "content": text},
         ],
-        "max_tokens": 1500,
+        "max_tokens": 3000,
     }
 
     async with httpx.AsyncClient(timeout=60) as client:

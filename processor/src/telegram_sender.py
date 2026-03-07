@@ -6,6 +6,7 @@ sendDocument/sendAudio are needed here.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -38,6 +39,20 @@ def _parse_migrate(resp_text: str) -> Optional[int]:
         return data.get("parameters", {}).get("migrate_to_chat_id")
     except (json.JSONDecodeError, AttributeError):
         return None
+
+
+def _parse_retry_after(resp_text: str) -> Optional[int]:
+    """Extract retry_after seconds from Telegram 429 response."""
+    try:
+        data = json.loads(resp_text)
+        if data.get("error_code") == 429:
+            return data.get("parameters", {}).get("retry_after")
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    return None
+
+
+MAX_RETRY_AFTER = 60  # cap wait time to avoid blocking consumer too long
 
 
 def _parse_message_id(resp_text: str) -> Optional[int]:
@@ -105,26 +120,40 @@ async def send_message(
 
     Returns (success, error_message, migrate_to_chat_id, tg_message_id).
     migrate_to_chat_id is set when group was upgraded to supergroup.
+    Retries once on 429 Too Many Requests after waiting retry_after seconds.
     """
-    try:
-        if media_url and message_type in ("image", "photo"):
-            ok, err, msg_id = await _send_photo(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-        elif media_url and message_type in ("video",):
-            ok, err, msg_id = await _send_video(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-        elif media_url and message_type in ("audio", "voice"):
-            ok, err, msg_id = await _send_audio(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-        elif media_url and message_type == "document":
-            ok, err, msg_id = await _send_document(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-        else:
-            ok, err, msg_id = await _send_text(chat_id, text)
+    for attempt in range(2):  # max 1 retry for 429
+        try:
+            if media_url and message_type in ("image", "photo"):
+                ok, err, msg_id = await _send_photo(chat_id, text, media_url, media_filename, media_mime, reply_markup)
+            elif media_url and message_type in ("video",):
+                ok, err, msg_id = await _send_video(chat_id, text, media_url, media_filename, media_mime, reply_markup)
+            elif media_url and message_type in ("audio", "voice"):
+                ok, err, msg_id = await _send_audio(chat_id, text, media_url, media_filename, media_mime, reply_markup)
+            elif media_url and message_type == "document":
+                ok, err, msg_id = await _send_document(chat_id, text, media_url, media_filename, media_mime, reply_markup)
+            else:
+                ok, err, msg_id = await _send_text(chat_id, text)
 
-        migrate_id = _parse_migrate(err) if err else None
-        if migrate_id:
-            logger.warning("Group %s migrated to supergroup %s", chat_id, migrate_id)
-        return ok, err, migrate_id, msg_id
-    except Exception as exc:
-        logger.error("Telegram send error: %s", exc)
-        return False, str(exc), None, None
+            # Handle 429 Too Many Requests — wait and retry once
+            if not ok and err and attempt == 0:
+                retry_after = _parse_retry_after(err)
+                if retry_after:
+                    wait = min(retry_after, MAX_RETRY_AFTER)
+                    logger.warning("429 rate limited, waiting %ds before retry (chat %s)", wait, chat_id)
+                    await asyncio.sleep(wait)
+                    continue
+
+            migrate_id = _parse_migrate(err) if err else None
+            if migrate_id:
+                logger.warning("Group %s migrated to supergroup %s", chat_id, migrate_id)
+            return ok, err, migrate_id, msg_id
+        except Exception as exc:
+            logger.error("Telegram send error: %s", exc)
+            return False, str(exc), None, None
+
+    # Should not reach here, but just in case
+    return False, err, None, None
 
 
 async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:

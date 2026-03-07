@@ -18,14 +18,14 @@ from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
 import uvicorn
-from fastapi import FastAPI, Query, Path
+from fastapi import FastAPI, File, Form, Query, Path, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
-from .db import get_pool
+from .db import get_pool, insert_direct_translation, insert_direct_media_analysis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,7 +121,11 @@ async def api_stats():
              where cp2.user_id = u.id and me.translation_ms is not null) as avg_ms,
             (select max(me.created_at) from message_events me
              join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id) as last_msg
+             where cp2.user_id = u.id) as last_msg,
+            (select count(*) from direct_interactions di
+             where di.user_id = u.id and di.interaction_type = 'translation') as dir_tl,
+            (select count(*) from direct_interactions di
+             where di.user_id = u.id and di.interaction_type = 'media_analysis') as dir_ma
         from users u
         where u.is_active = true
         order by delivered desc
@@ -153,7 +157,16 @@ async def api_daily_stats():
         from message_events
         where created_at >= current_date
     """)
-    return dict(row)
+    result = dict(row)
+    direct = await pool.fetchrow("""
+        select
+            count(*) filter (where interaction_type = 'translation') as direct_translations,
+            count(*) filter (where interaction_type = 'media_analysis') as direct_analyses
+        from direct_interactions
+        where created_at >= current_date
+    """)
+    result.update(dict(direct))
+    return result
 
 
 @app.get("/api/reports")
@@ -380,6 +393,8 @@ async def translate_text(body: TranslateRequest):
     # Cache check
     cached = await get_cached(text, lang)
     if cached:
+        if body.user_id:
+            await insert_direct_translation(body.user_id, text, cached, lang, 0, True)
         return {"original": text, "translated": cached, "target_language": lang, "cache_hit": True}
 
     # LLM translation
@@ -394,6 +409,9 @@ async def translate_text(body: TranslateRequest):
     translated = response.content.strip()
 
     await set_cached(text, lang, translated)
+
+    if body.user_id:
+        await insert_direct_translation(body.user_id, text, translated, lang, translation_ms, False)
 
     return {
         "original": text,
@@ -469,6 +487,55 @@ async def analyze_media(body: AnalyzeRequest):
         await insert_media_analysis(
             body.message_event_id, analysis_type, error_msg,
             "failed", processing_ms, body.requested_by,
+        )
+        return JSONResponse({"error": error_msg}, status_code=500)
+
+
+# ── Direct media analysis (from bot private chat) ─────────
+
+@app.post("/analyze-direct")
+async def analyze_direct(
+    file: UploadFile = File(...),
+    user_id: int = Form(...),
+    mime_type: str = Form(...),
+    filename: str = Form("file"),
+):
+    """Analyze media directly from binary upload (bot private chat)."""
+    # Resolve target language
+    from .db import get_pool
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT target_language FROM users WHERE tg_user_id = $1", user_id,
+    )
+    target_lang = (row["target_language"] if row and row["target_language"] else "") or os.getenv("TARGET_LANGUAGE", "Hebrew")
+
+    content_bytes = await file.read()
+
+    t0 = time.monotonic()
+    try:
+        if mime_type.startswith("image/"):
+            analysis_type = "image"
+            result_text = await analyze_image(content_bytes, mime_type, target_lang)
+        elif mime_type.startswith("audio/") or mime_type == "application/ogg":
+            analysis_type = "audio"
+            result_text = await transcribe_audio(content_bytes, filename, target_lang)
+        else:
+            analysis_type = "document"
+            result_text = await analyze_document(content_bytes, filename, mime_type, target_lang)
+
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        await insert_direct_media_analysis(
+            user_id, analysis_type, mime_type, filename, result_text, processing_ms,
+        )
+        return {"result_text": result_text, "analysis_type": analysis_type, "processing_ms": processing_ms}
+
+    except Exception as exc:
+        processing_ms = int((time.monotonic() - t0) * 1000)
+        error_msg = str(exc)
+        logger.error("Direct media analysis failed: %s", error_msg)
+        await insert_direct_media_analysis(
+            user_id, analysis_type, mime_type, filename, error_msg, processing_ms,
+            status="failed", error_message=error_msg,
         )
         return JSONResponse({"error": error_msg}, status_code=500)
 
@@ -728,7 +795,8 @@ function renderTop() {
   const ds = dailyStats || {};
   const dok = ds.delivered||0, dfail = ds.failed||0, dskip = ds.skipped||0;
   const davg = ds.avg_ms ? Math.round(ds.avg_ms)+'ms' : '--';
-  o += ' '+dot+'  '+c('d','today: ')+c('g',dok)+' ok  '+c('r',dfail)+' fail  '+c('y',dskip)+' skip  avg:'+c('c',davg)+'\n';
+  const dtl = ds.direct_translations||0, dma = ds.direct_analyses||0;
+  o += ' '+dot+'  '+c('d','today: ')+c('g',dok)+' ok  '+c('r',dfail)+' fail  '+c('y',dskip)+' skip  avg:'+c('c',davg)+'  '+c('d','direct:')+' '+c('c',dtl)+' tl  '+c('c',dma)+' ma\n';
   const dtotal = dok + dfail + dskip;
   if (dtotal > 0) {
     const barW = TW - 2;
@@ -820,7 +888,7 @@ function renderLeft() {
   let o='';
   o+=c('c','Users')+'\n';
   o+=c('d','='.repeat(LW))+'\n';
-  o+=c('d',' '+pad('user',16)+pad('wa',5)+pad('lang',8)+pad('pairs',6)+pad('ok',6)+pad('fail',6)+'last')+'\n';
+  o+=c('d',' '+pad('user',16)+pad('wa',5)+pad('lang',8)+pad('pairs',6)+pad('ok',6)+pad('fail',6)+pad('drTL',6)+pad('drMA',6)+'last')+'\n';
   o+=c('d',' '+'-'.repeat(LW-2))+'\n';
 
   if(users.length===0){
@@ -833,8 +901,10 @@ function renderLeft() {
       const pairs=pad(String(u.pairs),6);
       const ok=u.delivered>0?c('g',pad(String(u.delivered),6)):pad('0',6);
       const fail=u.failed>0?c('r',pad(String(u.failed),6)):pad('0',6);
+      const dtl=u.dir_tl>0?c('c',pad(String(u.dir_tl),6)):pad('0',6);
+      const dma=u.dir_ma>0?c('c',pad(String(u.dir_ma),6)):pad('0',6);
       const last=u.last_msg?timeAgo(u.last_msg):c('d','never');
-      o+=' '+nm+wa+' '+lang+pairs+ok+fail+last+'\n';
+      o+=' '+nm+wa+' '+lang+pairs+ok+fail+dtl+dma+last+'\n';
     });
   }
 

@@ -169,7 +169,9 @@ wa-service загружает медиа в S3/MinIO (`uploadMedia()`), клад
 Результат возвращается на `target_language` пользователя. Endpoint: `POST /analyze` (event_id, analysis_type, requested_by).
 
 ### Bot — дополнительные хэндлеры
-- `handlers/translate.py` — прямой перевод текста в личке бота. Флоу: user sends text → reply(text + ⏳) → POST /translate → edit(перевод) → delete(user msg). При ошибке — оригинал НЕ удаляется.
+- `handlers/translate.py` — прямой перевод текста и анализ медиа в личке бота:
+  - `handle_direct_text()` — текст → reply(text + ⏳) → POST /translate → edit(перевод) → delete(user msg). При ошибке — оригинал НЕ удаляется.
+  - `handle_direct_media()` — фото/документ/аудио/голосовое/видео-кружок → reply(⏳) → download file → POST /analyze-direct (multipart) → edit(результат) → delete(user msg). При ошибке — НЕ удаляет.
 - `handlers/analyze.py` — callback handler для кнопки "Analyze" на медиа. Парсит `analyze:{event_id}`, вызывает `POST /analyze`.
 
 ### Processor — LangGraph pipeline
@@ -185,7 +187,8 @@ Pipeline использует `astream(state, stream_mode="updates")` — каж
 - `GET /api/costs` — LangSmith cost data (кэш 15 мин), fallback pricing для gpt-4.1-mini
 - `GET /api/daily-stats` — дневная статистика
 - `POST /translate` — перевод текста (text, user_id) → original, translated, target_language, translation_ms
-- `POST /analyze` — анализ медиа (event_id, analysis_type, requested_by)
+- `POST /analyze` — анализ медиа по event_id из pipeline (event_id, analysis_type, requested_by)
+- `POST /analyze-direct` — прямой анализ медиа из лички бота (multipart: file, user_id, mime_type, filename) → result_text, analysis_type, processing_ms
 
 ### Bot — смешанный sync/async
 python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдельный daemon thread. Коммуникация: `asyncio.run_coroutine_threadsafe(coro, bot_loop)`, где `bot_loop` захватывается в `main.py:post_init`.
@@ -200,7 +203,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 | Flow | Cron | Модель | Назначение |
 |------|------|--------|------------|
 | `wa-health-check` | `*/15 * * * *` | — | Проверка wa-service |
-| `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных (message_events > 30д, sessions > 7д) |
+| `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных (message_events > 90д, sessions > 7д, direct_interactions > 90д) |
 | `nightly-problems` | `0 4 * * *` | gpt-4.1-mini | Анализ проблем за 24h |
 | `translation-quality` | `30 4 * * *` | gpt-4.1-mini | Оценка качества переводов |
 | `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
@@ -238,6 +241,9 @@ PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и 
 **007_media_analysis.sql**:
 - `media_analysis` — результаты анализа медиа (image/audio/document), связь с message_events
 - Добавляет `tg_message_id` в `message_events`
+
+**008_direct_interactions.sql**:
+- `direct_interactions` — трекинг прямых переводов и анализа медиа из личного чата бота. interaction_type: translation/media_analysis, status: completed/failed. Записывается из `/translate` и `/analyze-direct` endpoints processor'а. Включён в nightly/weekly отчёты и дашборд.
 
 ## Production (VPS)
 

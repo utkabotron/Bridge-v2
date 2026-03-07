@@ -122,6 +122,23 @@ def sample_translations() -> list[dict]:
     """)
     samples.extend([dict(r) for r in cur.fetchall()])
 
+    # Direct translations (bot private chat)
+    cur.execute("""
+        SELECT di.id, di.original_text, di.translated_text, di.translation_ms,
+               'completed' AS delivery_status, NULL AS error_message,
+               COALESCE(di.target_language, 'Unknown') AS target_language,
+               'direct' AS source
+        FROM direct_interactions di
+        WHERE di.created_at >= current_date - interval '1 day'
+          AND di.created_at < current_date
+          AND di.interaction_type = 'translation'
+          AND di.translated_text IS NOT NULL
+          AND di.status = 'completed'
+        ORDER BY random()
+        LIMIT 10
+    """)
+    samples.extend([dict(r) for r in cur.fetchall()])
+
     cur.close()
     conn.close()
 

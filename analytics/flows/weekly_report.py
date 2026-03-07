@@ -110,6 +110,20 @@ def collect_weekly_data() -> dict:
         for r in cur.fetchall()
     ]
 
+    # --- Direct interactions (bot private chat) ---
+    cur.execute("""
+        SELECT
+            count(*) AS total,
+            count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
+            count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
+            count(*) FILTER (WHERE status = 'failed') AS failed,
+            round(avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL)::numeric, 0) AS avg_translation_ms,
+            round(avg(processing_ms) FILTER (WHERE processing_ms IS NOT NULL)::numeric, 0) AS avg_processing_ms
+        FROM direct_interactions
+        WHERE created_at >= %s AND created_at < %s
+    """, (week_ago, today))
+    data["direct_interactions"] = dict(cur.fetchone())
+
     # --- Current translation prompt ---
     cur.execute("SELECT key, version, content FROM prompt_registry WHERE key = 'translate'")
     row = cur.fetchone()
@@ -169,9 +183,10 @@ def collect_weekly_data() -> dict:
     conn.close()
 
     logger.info(
-        "Collected weekly data: %d messages, %d issues, %d quality days (4w), "
+        "Collected weekly data: %d messages, %d direct, %d issues, %d quality days (4w), "
         "%d pending suggestions, %d open backlog, %d changelog entries",
         data["messages"]["total_messages"],
+        data["direct_interactions"]["total"],
         len(data["issues"]),
         len(data["daily_scores_4w"]),
         len(data["pending_suggestions"]),
@@ -244,6 +259,7 @@ You perform deep weekly analysis with full historical context and memory of your
 
 You receive:
 - Current week's operational data (messages, failures, issues, quality scores)
+- Direct interactions stats (translations and media analysis from bot private chat)
 - 4 weeks of quality score trends
 - The current translation prompt
 - ALL pending prompt improvement suggestions from daily flows
@@ -474,6 +490,11 @@ def notify_weekly_report(data: dict, o3_result: dict) -> int:
     lines.append("<b>📊 Metrics:</b>")
     lines.append(f"  Messages: {total} (delivered: {delivered}, failed: {failed})")
     lines.append(f"  Failure rate: {fail_rate}% | Avg translation: {avg_str}")
+
+    # Direct interactions
+    di = data.get("direct_interactions", {})
+    if di.get("total", 0) > 0:
+        lines.append(f"  Direct: {di['translations']} translations, {di['analyses']} analyses ({di['failed']} failed)")
 
     # Quality trend
     tq = analysis.get("translation_quality", {})
