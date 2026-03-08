@@ -292,7 +292,13 @@ async def api_profiles():
         WHERE cp_tbl.status = 'active'
         ORDER BY prof.updated_at DESC
     """)
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("profile_data"), str):
+            d["profile_data"] = json.loads(d["profile_data"])
+        result.append(d)
+    return result
 
 
 # ── Costs API (LangSmith) ────────────────────────────────
