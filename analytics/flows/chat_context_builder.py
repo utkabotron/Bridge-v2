@@ -34,7 +34,7 @@ def collect_per_chat_data() -> list[dict]:
     """Collect messages grouped by chat_pair_id.
 
     For chats WITH existing profile: last 24h messages.
-    For chats WITHOUT profile: last 7 days (bootstrap).
+    For chats WITHOUT profile: last 90 days (bootstrap).
     """
     logger = get_run_logger()
     conn = psycopg2.connect(DB_URL)
