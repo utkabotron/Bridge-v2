@@ -205,7 +205,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 - Профили из `chat_profiles` инжектируются в translation prompt — не переводить, а транслитерировать термины из глоссария
 
 ### Analytics — Prefect flows
-6 flow в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Dual-mode: без `PREFECT_API_URL` — локальный server, с ним — Prefect Cloud worker. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
+7 flow в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Dual-mode: без `PREFECT_API_URL` — локальный server, с ним — Prefect Cloud worker. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
 
 | Flow | Cron | Модель | Назначение |
 |------|------|--------|------------|
@@ -215,6 +215,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 | `translation-quality` | `30 4 * * *` | gpt-4.1-mini | Оценка качества переводов |
 | `chat-context-builder` | `0 5 * * *` | gpt-4.1 (+ web_search) | Глоссарий, имена участников, тон чата → `chat_profiles` |
 | `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
+| `chat-context-builder` | `0 5 * * *` | gpt-4.1 | Построение per-chat профилей (глоссарии, участники, тон) |
 | `export-to-bq` | ручной | — | Экспорт в BigQuery (требует GCP_SA_PATH) |
 
 ## База данных

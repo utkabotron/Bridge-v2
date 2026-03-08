@@ -4,6 +4,7 @@ Uses asyncpg directly (no ORM) to keep the processor lightweight.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -76,7 +77,12 @@ async def fetch_chat_profile(chat_pair_id: int) -> Optional[dict]:
         "SELECT profile_data FROM chat_profiles WHERE chat_pair_id = $1",
         chat_pair_id,
     )
-    return dict(row["profile_data"]) if row else None
+    if not row:
+        return None
+    data = row["profile_data"]
+    if isinstance(data, str):
+        data = json.loads(data)
+    return data
 
 
 async def insert_message_event(state: dict[str, Any], return_id: bool = False) -> Optional[int]:
