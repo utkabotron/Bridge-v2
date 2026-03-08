@@ -170,7 +170,7 @@ wa-service загружает медиа в S3/MinIO (`uploadMedia()`), клад
 
 ### Bot — дополнительные хэндлеры
 - `handlers/translate.py` — прямой перевод текста и анализ медиа в личке бота:
-  - `handle_direct_text()` — текст → reply(text + ⏳) → POST /translate → edit(перевод) → delete(user msg). При ошибке — оригинал НЕ удаляется.
+  - `handle_direct_text()` — текст → reply(⏳) → POST /translate → edit(только перевод). Оригинал юзера остаётся в чате (не удаляется). Reply содержит только перевод + metadata, без оригинала — чтобы избежать `Message_too_long` при длинных текстах.
   - `handle_direct_media()` — фото/документ/аудио/голосовое/видео-кружок → reply(⏳) → download file → POST /analyze-direct (multipart) → edit(результат) → delete(user msg). При ошибке — НЕ удаляет.
 - `handlers/analyze.py` — callback handler для кнопки "Analyze" на медиа. Парсит `analyze:{event_id}`, вызывает `POST /analyze`.
 
