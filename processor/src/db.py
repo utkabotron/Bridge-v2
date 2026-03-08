@@ -69,6 +69,16 @@ async def fetch_active_chat_pair(user_id: int, wa_chat_id: str) -> Optional[dict
     return dict(row) if row else None
 
 
+async def fetch_chat_profile(chat_pair_id: int) -> Optional[dict]:
+    """Return chat profile data for a given chat pair, or None."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT profile_data FROM chat_profiles WHERE chat_pair_id = $1",
+        chat_pair_id,
+    )
+    return dict(row["profile_data"]) if row else None
+
+
 async def insert_message_event(state: dict[str, Any], return_id: bool = False) -> Optional[int]:
     """Persist a processed message_event row.
 

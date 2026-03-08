@@ -274,6 +274,27 @@ async def api_backlog_update(issue_id: int = Path(...), body: BacklogUpdate = ..
     return dict(row)
 
 
+# ── Chat Profiles API ────────────────────────────────────
+
+@app.get("/api/profiles")
+async def api_profiles():
+    """Chat profiles with glossaries and member names."""
+    from .db import get_pool
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT cp_tbl.id AS chat_pair_id,
+               cp_tbl.wa_chat_id,
+               prof.profile_data,
+               prof.version,
+               prof.updated_at
+        FROM chat_profiles prof
+        JOIN chat_pairs cp_tbl ON cp_tbl.id = prof.chat_pair_id
+        WHERE cp_tbl.status = 'active'
+        ORDER BY prof.updated_at DESC
+    """)
+    return [dict(r) for r in rows]
+
+
 # ── Costs API (LangSmith) ────────────────────────────────
 
 # Fallback costs per token (USD) when LangSmith doesn't provide cost

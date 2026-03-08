@@ -17,8 +17,8 @@ from langchain_openai import ChatOpenAI
 
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
-from .cache import get_cached, set_cached
-from .prompts import PROMPT_VERSION, get_translate_prompt
+from .cache import get_cached, set_cached, get_chat_profile, set_chat_profile
+from .prompts import PROMPT_VERSION, get_translate_prompt, format_chat_context
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +96,22 @@ async def translate_node(state: MessageState) -> MessageState:
         return {**state, "translated_text": text, "translation_ms": 0, "cache_hit": False}
 
     lang = state.get("target_language", "Russian")
+    chat_pair_id = state.get("chat_pair_id")
 
-    # Cache lookup
-    cached = await get_cached(text, lang)
+    # Load chat profile: Redis cache → PostgreSQL → None
+    chat_context = ""
+    if chat_pair_id:
+        profile = await get_chat_profile(chat_pair_id)
+        if profile is None:
+            from ..db import fetch_chat_profile
+            profile = await fetch_chat_profile(chat_pair_id)
+            if profile:
+                await set_chat_profile(chat_pair_id, profile)
+        if profile:
+            chat_context = format_chat_context(profile)
+
+    # Cache lookup (includes chat_pair_id for per-chat glossary differentiation)
+    cached = await get_cached(text, lang, chat_pair_id)
     if cached:
         logger.debug("Translation cache HIT")
         return {**state, "translated_text": cached, "translation_ms": 0, "cache_hit": True}
@@ -106,7 +119,7 @@ async def translate_node(state: MessageState) -> MessageState:
     # LLM call — traced by LangSmith automatically
     t0 = time.monotonic()
     messages = [
-        SystemMessage(content=get_translate_prompt(lang)),
+        SystemMessage(content=get_translate_prompt(lang, chat_context)),
         HumanMessage(content=text),
     ]
     response = await get_llm().ainvoke(messages)
@@ -115,7 +128,7 @@ async def translate_node(state: MessageState) -> MessageState:
     translated = response.content.strip()
 
     # Store in cache
-    await set_cached(text, lang, translated)
+    await set_cached(text, lang, translated, chat_pair_id)
 
     return {**state, "translated_text": translated, "translation_ms": translation_ms, "cache_hit": False}
 

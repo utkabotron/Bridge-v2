@@ -34,6 +34,9 @@
 <div class="reports">
   <pre id="backlog"></pre>
 </div>
+<div class="reports">
+  <pre id="profiles"></pre>
+</div>
 <script>
 const NN = ['validate','translate','format','deliver'];
 const W = 10;
@@ -508,6 +511,101 @@ function renderBacklog() {
   el.innerHTML=o;
 }
 
+// ── Chat Profiles section ────────────────────────────────
+let profilesData=[];
+
+function loadProfiles() {
+  fetch('/api/profiles').then(r=>r.json()).then(d=>{profilesData=d;renderProfiles();}).catch(()=>{});
+}
+
+function renderProfiles() {
+  const el=document.getElementById('profiles');
+  if(!el) return;
+  const W=120;
+  let o='';
+  o+=c('d','='.repeat(W))+'\n';
+  o+=c('c','\uD83D\uDCD6 Chat Profiles')+'\n';
+  o+=c('d','='.repeat(W))+'\n\n';
+
+  if(profilesData.length===0){
+    o+=' '+c('d','No chat profiles yet')+'\n';
+  } else {
+    profilesData.forEach(p=>{
+      const pd=p.profile_data||{};
+      const name=esc(pd.chat_description||pd.group_name||pd.chat_name||p.wa_chat_id||'unknown');
+      const type=pd.chat_type||'—';
+      const tone=pd.tone||'—';
+      o+=c('y','\u25B8')+' '+c('w',name)+'  '+c('d','(pair #'+p.chat_pair_id+', v'+p.version+')')+'\n';
+      o+='  type: '+c('c',esc(type))+'  tone: '+c('c',esc(typeof tone==='object'?JSON.stringify(tone):tone))+'\n';
+
+      // Glossary (object: {word: {translation, note}})
+      const glossary=pd.glossary||{};
+      const glossaryKeys=Object.keys(glossary);
+      if(glossaryKeys.length>0){
+        const show=glossaryKeys.slice(0,8);
+        o+='  '+c('c','Glossary')+' ('+glossaryKeys.length+'):\n';
+        show.forEach(word=>{
+          const info=glossary[word];
+          if(typeof info==='object'){
+            const tr=info.translation||'';
+            const note=info.note||'';
+            o+='    '+esc(word)+' \u2192 '+esc(tr);
+            if(note) o+=' '+c('d','('+esc(note)+')');
+          } else {
+            o+='    '+esc(word)+' \u2192 '+esc(String(info));
+          }
+          o+='\n';
+        });
+        if(glossaryKeys.length>8) o+='    '+c('d','...and '+(glossaryKeys.length-8)+' more')+'\n';
+      }
+
+      // Members (object: {hebrew_name: transliterated_name})
+      const members=pd.members||{};
+      const memberKeys=Object.keys(members);
+      if(memberKeys.length>0){
+        const show=memberKeys.slice(0,8);
+        o+='  '+c('c','Members')+' ('+memberKeys.length+'): ';
+        o+=show.map(k=>esc(k)+' \u2192 '+esc(String(members[k]))).join(', ');
+        if(memberKeys.length>8) o+=', '+c('d','+'+(memberKeys.length-8)+' more');
+        o+='\n';
+      }
+
+      // Mentioned people (object: {name: {transliteration, relation}})
+      const mentioned=pd.mentioned_people||{};
+      const mentionedKeys=Object.keys(mentioned);
+      if(mentionedKeys.length>0){
+        const show=mentionedKeys.slice(0,8);
+        o+='  '+c('c','Mentioned people')+' ('+mentionedKeys.length+'):\n';
+        show.forEach(name=>{
+          const info=mentioned[name];
+          if(typeof info==='object'){
+            const tr=info.transliteration||'';
+            const rel=info.relation||'';
+            o+='    '+esc(name)+' \u2192 '+esc(tr);
+            if(rel) o+=' '+c('d','('+esc(rel)+')');
+          } else {
+            o+='    '+esc(name)+' \u2192 '+esc(String(info));
+          }
+          o+='\n';
+        });
+        if(mentionedKeys.length>8) o+='    '+c('d','...and '+(mentionedKeys.length-8)+' more')+'\n';
+      }
+
+      // Recurring topics (array of strings)
+      const topics=pd.recurring_topics||[];
+      if(topics.length>0){
+        o+='  '+c('c','Topics')+' ('+topics.length+'): '+topics.map(t=>esc(t)).join(', ')+'\n';
+      }
+
+      // Stats
+      const msgs=pd.messages_analyzed||0;
+      const updated=p.updated_at?timeAgo(p.updated_at):'—';
+      o+='  analyzed: '+c('w',msgs)+' msgs  updated: '+c('d',updated)+'\n\n';
+    });
+  }
+  el.innerHTML=o;
+}
+
 window.addEventListener('resize',()=>{measured=false;render();});
 // ensure DOM is ready before measuring
 requestAnimationFrame(()=>{
@@ -518,10 +616,12 @@ requestAnimationFrame(()=>{
   loadDailyStats();
   loadReports();
   loadBacklog();
+  loadProfiles();
   setInterval(loadUsers,15000);
   setInterval(loadCosts,300000);
   setInterval(loadDailyStats,15000);
   setInterval(loadBacklog,30000);
+  setInterval(loadProfiles,60000);
   setInterval(()=>{if(reportDate===new Date().toISOString().slice(0,10))loadReports();},60000);
   render();
 });

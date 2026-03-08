@@ -27,6 +27,8 @@ services:
       POSTGRES_USER: bridge
       POSTGRES_PASSWORD: bridge
       POSTGRES_DB: bridge
+      TZ: Asia/Jerusalem
+      PGTZ: Asia/Jerusalem
     ports:
       - "5432:5432"
     volumes:
@@ -103,6 +105,7 @@ services:
       - S3_BUCKET=${S3_BUCKET:-bridge-media}
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - PORT=3000
+      - TZ=Asia/Jerusalem
     volumes:
       - wa_sessions:/app/.wwebjs_auth
     healthcheck:
@@ -138,6 +141,7 @@ services:
       - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Russian}
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
+      - TZ=Asia/Jerusalem
     depends_on:
       redis:
         condition: service_healthy
@@ -159,6 +163,7 @@ services:
       - WA_SERVICE_PUBLIC_URL=${WA_SERVICE_PUBLIC_URL:-http://localhost:3000}
       - PROCESSOR_URL=http://processor:8000
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
+      - TZ=Asia/Jerusalem
     depends_on:
       redis:
         condition: service_healthy
@@ -179,6 +184,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa.json
+      - TZ=Asia/Jerusalem
     volumes:
       # Mount only if file exists locally — skip for local dev without BigQuery
       - ${GCP_SA_PATH:-/dev/null}:/app/gcp-sa.json:ro

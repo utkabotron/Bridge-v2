@@ -19,8 +19,46 @@ Rules:
 8. ALWAYS translate file names, document titles, and image captions that contain meaningful text (e.g. 'חלוקה לקבוצות.pdf' → 'Distribution into groups.pdf'). Leaving them untranslated is not acceptable. Keep technical identifiers (IDs, hashes) unchanged.
 """
 
-def get_translate_prompt(target_language: str) -> str:
-    return SYSTEM_TRANSLATE.format(target_language=target_language)
+def format_chat_context(profile: dict) -> str:
+    """Format chat profile as context block for the translation prompt."""
+    parts = []
+
+    if profile.get("chat_description"):
+        parts.append(f"- Group: {profile['chat_description']}")
+    if profile.get("tone"):
+        parts.append(f"- Tone: {profile['tone']}")
+
+    glossary = profile.get("glossary", {})
+    if glossary:
+        items = []
+        for word, info in glossary.items():
+            if isinstance(info, dict):
+                trans = info.get("translation", "")
+                note = info.get("note", "")
+                entry = f"{word} → {trans}"
+                if note:
+                    entry += f" ({note})"
+            else:
+                entry = f"{word} → {info}"
+            items.append(entry)
+        parts.append("- Glossary (use these transliterations):\n  " + "\n  ".join(items))
+
+    members = profile.get("members", {})
+    if members:
+        items = [f"{k} → {v}" for k, v in members.items()]
+        parts.append("- Member names:\n  " + "\n  ".join(items))
+
+    if not parts:
+        return ""
+
+    return "\nChat context:\n" + "\n".join(parts)
+
+
+def get_translate_prompt(target_language: str, chat_context: str = "") -> str:
+    prompt = SYSTEM_TRANSLATE.format(target_language=target_language)
+    if chat_context:
+        prompt += chat_context + "\n"
+    return prompt
 
 
 async def register_prompt(pool) -> None:
