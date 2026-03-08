@@ -13,16 +13,15 @@ import json
 import os
 from datetime import date
 
-import httpx
 import psycopg2
 import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from .shared import esc, notify_telegram
+
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
 EVAL_MODEL = "gpt-4.1-mini"
 
@@ -217,7 +216,7 @@ Return ONLY the JSON array, no markdown fences."""
         for ev in batch_evals:
             idx = ev.get("sample_index", 0)
             if idx < len(batch):
-                ev["message_event_id"] = batch[idx]["id"]
+                ev["message_event_id"] = batch[idx]["id"] if batch[idx].get("source") != "direct" else None
                 ev["original_text"] = batch[idx]["original_text"]
                 ev["translated_text"] = batch[idx]["translated_text"]
                 ev["target_language"] = batch[idx].get("target_language", "Unknown")
@@ -431,13 +430,6 @@ def notify_quality_report(suggestion_result: dict) -> int:
         logger.info("No suggestions or issues, skipping notification")
         return 0
 
-    if not TELEGRAM_BOT_TOKEN or not ADMIN_TG_IDS:
-        logger.warning("Telegram not configured, cannot send quality report")
-        return 0
-
-    def _esc(s: str) -> str:
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
     def _trunc(s: str, limit: int = 120) -> str:
         return s[:limit] + "…" if len(s) > limit else s
 
@@ -454,52 +446,37 @@ def notify_quality_report(suggestion_result: dict) -> int:
     if issue_counts:
         lines.append("<b>Issues found:</b>")
         for itype, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"  {_esc(itype)}: {count}")
+            lines.append(f"  {esc(itype)}: {count}")
         lines.append("")
 
     # Worst translation examples
     if worst_examples:
         lines.append(f"<b>Worst translations ({len(worst_examples[:3])}):</b>\n")
         for ex in worst_examples[:3]:
-            orig = _trunc(_esc(ex.get("original", "")))
-            trans = _trunc(_esc(ex.get("translated", "")))
-            lang = _esc(ex.get("target_language", "?"))
+            orig = _trunc(esc(ex.get("original", "")))
+            trans = _trunc(esc(ex.get("translated", "")))
+            lang = esc(ex.get("target_language", "?"))
             score = ex.get("quality_score", "?")
             issues = ", ".join(ex.get("issue_types", []))
             lines.append(f"<code>{orig}</code>")
             lines.append(f"→ <code>{trans}</code>")
-            lines.append(f"  [{lang}, score {score}] {_esc(issues)}\n")
+            lines.append(f"  [{lang}, score {score}] {esc(issues)}\n")
 
     # Suggestions
     if suggestions:
         lines.append(f"<b>Prompt suggestions ({len(suggestions)}):</b>\n")
         for i, sug in enumerate(suggestions, 1):
-            lines.append(f"{i}. {_esc(sug['suggestion'])}")
+            lines.append(f"{i}. {esc(sug['suggestion'])}")
             if sug.get("rationale"):
-                lines.append(f"   <i>{_esc(sug['rationale'])}</i>\n")
+                lines.append(f"   <i>{esc(sug['rationale'])}</i>\n")
 
     if pending_count > 0:
         lines.append(f"⏳ <b>Pending suggestions: {pending_count}</b> — review in DB\n")
 
     text = "\n".join(lines)
-    # Telegram message limit — truncate if needed
-    if len(text) > 4096:
-        text = text[:4090] + "\n…"
-    sent = 0
+    sent = notify_telegram(text)
 
-    for chat_id in ADMIN_TG_IDS:
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            sent += 1
-        except Exception as e:
-            logger.error("Failed to notify admin %d: %s", chat_id, e)
-
-    logger.info("Sent quality report to %d/%d admins", sent, len(ADMIN_TG_IDS))
+    logger.info("Sent quality report to %d admins", sent)
     return sent
 
 

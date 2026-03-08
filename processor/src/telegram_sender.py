@@ -106,6 +106,16 @@ async def download_media(
 # Keep old name as alias for backward compatibility in tests
 _download_media = download_media
 
+# Media type → (Telegram API endpoint, multipart field name)
+_MEDIA_TYPE_MAP = {
+    "image": ("sendPhoto", "photo"),
+    "photo": ("sendPhoto", "photo"),
+    "video": ("sendVideo", "video"),
+    "audio": ("sendAudio", "audio"),
+    "voice": ("sendAudio", "audio"),
+    "document": ("sendDocument", "document"),
+}
+
 
 async def send_message(
     chat_id: int,
@@ -124,14 +134,12 @@ async def send_message(
     """
     for attempt in range(2):  # max 1 retry for 429
         try:
-            if media_url and message_type in ("image", "photo"):
-                ok, err, msg_id = await _send_photo(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-            elif media_url and message_type in ("video",):
-                ok, err, msg_id = await _send_video(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-            elif media_url and message_type in ("audio", "voice"):
-                ok, err, msg_id = await _send_audio(chat_id, text, media_url, media_filename, media_mime, reply_markup)
-            elif media_url and message_type == "document":
-                ok, err, msg_id = await _send_document(chat_id, text, media_url, media_filename, media_mime, reply_markup)
+            media_type = _MEDIA_TYPE_MAP.get(message_type) if media_url else None
+            if media_type:
+                endpoint, field = media_type
+                ok, err, msg_id = await _send_media_multipart(
+                    endpoint, field, chat_id, text, media_url, media_filename, media_mime, reply_markup,
+                )
             else:
                 ok, err, msg_id = await _send_text(chat_id, text)
 
@@ -239,41 +247,3 @@ async def _send_media_multipart(
     return await _send_text(chat_id, f"{caption}\n[Media: {url}]")
 
 
-async def _send_photo(
-    chat_id: int, caption: str, url: str,
-    media_filename: Optional[str] = None, media_mime: Optional[str] = None,
-    reply_markup: Optional[dict] = None,
-) -> Tuple[bool, Optional[str], Optional[int]]:
-    return await _send_media_multipart(
-        "sendPhoto", "photo", chat_id, caption, url, media_filename, media_mime, reply_markup,
-    )
-
-
-async def _send_video(
-    chat_id: int, caption: str, url: str,
-    media_filename: Optional[str] = None, media_mime: Optional[str] = None,
-    reply_markup: Optional[dict] = None,
-) -> Tuple[bool, Optional[str], Optional[int]]:
-    return await _send_media_multipart(
-        "sendVideo", "video", chat_id, caption, url, media_filename, media_mime, reply_markup,
-    )
-
-
-async def _send_audio(
-    chat_id: int, caption: str, url: str,
-    media_filename: Optional[str] = None, media_mime: Optional[str] = None,
-    reply_markup: Optional[dict] = None,
-) -> Tuple[bool, Optional[str], Optional[int]]:
-    return await _send_media_multipart(
-        "sendAudio", "audio", chat_id, caption, url, media_filename, media_mime, reply_markup,
-    )
-
-
-async def _send_document(
-    chat_id: int, caption: str, url: str,
-    media_filename: Optional[str] = None, media_mime: Optional[str] = None,
-    reply_markup: Optional[dict] = None,
-) -> Tuple[bool, Optional[str], Optional[int]]:
-    return await _send_media_multipart(
-        "sendDocument", "document", chat_id, caption, url, media_filename, media_mime, reply_markup,
-    )

@@ -210,12 +210,12 @@ async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
 
 async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> MessageState:
     """Two-phase delivery: INSERT pending → send with Analyze button → UPDATE."""
-    from ..db import insert_message_event_returning_id, update_event_after_send
+    from ..db import insert_message_event, update_event_after_send
     from ..telegram_sender import send_message
 
     # Phase 1: INSERT message_event (pending) to get event_id for callback_data
     pending_state = {**state, "delivery_status": "pending"}
-    event_id = await insert_message_event_returning_id(pending_state)
+    event_id = await insert_message_event(pending_state, return_id=True)
     if not event_id:
         logger.error("Failed to get event_id for two-phase delivery")
         result = {**state, "delivery_status": "failed", "error": "db_insert_failed"}

@@ -69,12 +69,15 @@ async def fetch_active_chat_pair(user_id: int, wa_chat_id: str) -> Optional[dict
     return dict(row) if row else None
 
 
-async def insert_message_event(state: dict[str, Any]) -> None:
-    """Persist a processed message_event row."""
+async def insert_message_event(state: dict[str, Any], return_id: bool = False) -> Optional[int]:
+    """Persist a processed message_event row.
+
+    If return_id=True, returns the row id (for two-phase media delivery).
+    """
     pool = await get_pool()
+    returning = "returning id" if return_id else ""
     try:
-        await pool.execute(
-            """
+        query = f"""
             insert into public.message_events
               (wa_message_id, chat_pair_id, sender_name, original_text, translated_text,
                message_type, media_s3_key, translation_ms, delivery_status, error_message,
@@ -86,7 +89,9 @@ async def insert_message_event(state: dict[str, Any]) -> None:
                   error_message   = excluded.error_message,
                   tg_message_id   = excluded.tg_message_id
               where message_events.delivery_status != 'delivered'
-            """,
+            {returning}
+            """
+        params = (
             state.get("wa_message_id"),
             state.get("chat_pair_id"),
             state.get("sender_name"),
@@ -99,41 +104,14 @@ async def insert_message_event(state: dict[str, Any]) -> None:
             state.get("error"),
             state.get("tg_message_id"),
         )
+        if return_id:
+            row = await pool.fetchrow(query, *params)
+            return row["id"] if row else None
+        else:
+            await pool.execute(query, *params)
+            return None
     except Exception as exc:
         logger.error("Failed to insert message_event: %s", exc)
-
-
-async def insert_message_event_returning_id(state: dict[str, Any]) -> Optional[int]:
-    """Insert message_event and return its id (for two-phase media delivery)."""
-    pool = await get_pool()
-    try:
-        row = await pool.fetchrow(
-            """
-            insert into public.message_events
-              (wa_message_id, chat_pair_id, sender_name, original_text, translated_text,
-               message_type, media_s3_key, translation_ms, delivery_status, error_message)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            on conflict (wa_message_id) do update
-              set delivery_status = excluded.delivery_status,
-                  translated_text = excluded.translated_text,
-                  error_message   = excluded.error_message
-              where message_events.delivery_status != 'delivered'
-            returning id
-            """,
-            state.get("wa_message_id"),
-            state.get("chat_pair_id"),
-            state.get("sender_name"),
-            state.get("original_text"),
-            state.get("translated_text"),
-            state.get("message_type", "text"),
-            state.get("media_s3_url"),
-            state.get("translation_ms"),
-            state.get("delivery_status", "pending"),
-            state.get("error"),
-        )
-        return row["id"] if row else None
-    except Exception as exc:
-        logger.error("Failed to insert message_event returning id: %s", exc)
         return None
 
 

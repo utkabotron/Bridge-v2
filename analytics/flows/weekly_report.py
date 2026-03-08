@@ -14,16 +14,15 @@ import json
 import os
 from datetime import date, timedelta
 
-import httpx
 import psycopg2
 import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from .shared import esc, notify_telegram
+
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
 ANALYSIS_MODEL = "o3"
 
@@ -458,13 +457,6 @@ def notify_weekly_report(data: dict, o3_result: dict) -> int:
     """Send executive summary + key metrics + recommendations via Telegram."""
     logger = get_run_logger()
 
-    if not TELEGRAM_BOT_TOKEN or not ADMIN_TG_IDS:
-        logger.warning("Telegram not configured, cannot send weekly report")
-        return 0
-
-    def _esc(s: str) -> str:
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
     analysis = o3_result["analysis"]
     msgs = data["messages"]
     total = msgs["total_messages"]
@@ -484,7 +476,7 @@ def notify_weekly_report(data: dict, o3_result: dict) -> int:
     # Executive summary
     summary = analysis.get("executive_summary", "")
     if summary:
-        lines.append(f"<b>TL;DR:</b> {_esc(summary)}\n")
+        lines.append(f"<b>TL;DR:</b> {esc(summary)}\n")
 
     # Key metrics
     lines.append("<b>📊 Metrics:</b>")
@@ -515,7 +507,7 @@ def notify_weekly_report(data: dict, o3_result: dict) -> int:
         lines.append(f"<b>🎯 Recommendations ({len(recommendations)}):</b>")
         for rec in recommendations[:3]:
             area = rec.get("area", "").upper()
-            action = _esc(rec.get("action", ""))
+            action = esc(rec.get("action", ""))
             lines.append(f"  {rec.get('priority', '•')}. [{area}] {action}")
         if len(recommendations) > 3:
             lines.append(f"  ... +{len(recommendations) - 3} more in DB")
@@ -546,23 +538,9 @@ def notify_weekly_report(data: dict, o3_result: dict) -> int:
     lines.append(f"\n💰 o3: {tokens:,} tokens (~${cost:.2f})")
 
     text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4090] + "\n…"
+    sent = notify_telegram(text, timeout=15)
 
-    sent = 0
-    for chat_id in ADMIN_TG_IDS:
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            sent += 1
-        except Exception as e:
-            logger.error("Failed to notify admin %d: %s", chat_id, e)
-
-    logger.info("Sent weekly intelligence report to %d/%d admins", sent, len(ADMIN_TG_IDS))
+    logger.info("Sent weekly intelligence report to %d admins", sent)
     return sent
 
 

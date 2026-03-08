@@ -17,87 +17,55 @@ from prefect import flow, get_run_logger, task
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 RETAIN_DAYS = int(os.getenv("RETAIN_MESSAGE_DAYS", "90"))
 
-
-@task(retries=2, name="cleanup-old-messages")
-def cleanup_old_messages() -> int:
-    logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute(
+# (label, SQL query, params)
+_CLEANUP_TASKS = [
+    (
+        "message_events",
         "delete from public.message_events where created_at < now() - interval '%s days'",
         (RETAIN_DAYS,),
-    )
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Deleted %d old message_events", deleted)
-    return deleted
-
-
-@task(retries=2, name="cleanup-onboarding-sessions")
-def cleanup_onboarding_sessions() -> int:
-    logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        delete from public.onboarding_sessions
-        where state = 'done' and done_at < now() - interval '7 days'
-        """
-    )
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Deleted %d stale onboarding sessions", deleted)
-    return deleted
-
-
-@task(retries=2, name="cleanup-old-analysis")
-def cleanup_old_analysis() -> int:
-    """Delete nightly analysis data older than 90 days (cascades to issues/evaluations/suggestions)."""
-    logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute(
+    ),
+    (
+        "onboarding_sessions",
+        "delete from public.onboarding_sessions where state = 'done' and done_at < now() - interval '7 days'",
+        None,
+    ),
+    (
+        "nightly_analysis_runs",
         "delete from public.nightly_analysis_runs where created_at < now() - interval '%s days'",
         (RETAIN_DAYS,),
-    )
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("Deleted %d old analysis runs (cascaded to issues/evaluations/suggestions)", deleted)
-    return deleted
+    ),
+    (
+        "direct_interactions",
+        "delete from public.direct_interactions where created_at < now() - interval '%s days'",
+        (RETAIN_DAYS,),
+    ),
+]
 
 
-@task(retries=2, name="cleanup-old-direct-interactions")
-def cleanup_old_direct_interactions() -> int:
-    """Delete direct_interactions older than 90 days."""
+@task(retries=2, name="cleanup-table")
+def cleanup_table(label: str, query: str, params: tuple | None) -> int:
     logger = get_run_logger()
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor()
-    cur.execute(
-        "delete from public.direct_interactions where created_at < now() - interval '%s days'",
-        (RETAIN_DAYS,),
-    )
+    if params:
+        cur.execute(query, params)
+    else:
+        cur.execute(query)
     deleted = cur.rowcount
     conn.commit()
     cur.close()
     conn.close()
-    logger.info("Deleted %d old direct_interactions", deleted)
+    logger.info("Deleted %d old %s", deleted, label)
     return deleted
 
 
 @flow(name="daily-cleanup", log_prints=True)
 def daily_cleanup():
     """Daily cleanup: old messages + stale onboarding sessions + old analysis + old direct interactions."""
-    msgs = cleanup_old_messages()
-    sessions = cleanup_onboarding_sessions()
-    analysis = cleanup_old_analysis()
-    direct = cleanup_old_direct_interactions()
-    return {"messages_deleted": msgs, "sessions_deleted": sessions, "analysis_deleted": analysis, "direct_deleted": direct}
+    results = {}
+    for label, query, params in _CLEANUP_TASKS:
+        results[f"{label}_deleted"] = cleanup_table(label, query, params)
+    return results
 
 
 if __name__ == "__main__":

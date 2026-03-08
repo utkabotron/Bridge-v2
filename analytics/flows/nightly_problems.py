@@ -13,16 +13,15 @@ import json
 import os
 from datetime import date
 
-import httpx
 import psycopg2
 import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from .shared import esc, notify_telegram
+
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
 
 ANALYSIS_MODEL = "gpt-4.1-mini"
 
@@ -282,14 +281,6 @@ def notify_admin(stats: dict, analysis: dict) -> int:
 
     issues = analysis.get("issues", [])
 
-    if not TELEGRAM_BOT_TOKEN or not ADMIN_TG_IDS:
-        logger.warning("Telegram not configured, cannot send nightly report")
-        return 0
-
-    def _esc(s: str) -> str:
-        """Escape HTML special chars in LLM-generated text."""
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
     today = date.today().isoformat()
     lines = [f"🔍 <b>Nightly Problems Report</b> ({today})\n"]
 
@@ -331,34 +322,16 @@ def notify_admin(stats: dict, analysis: dict) -> int:
             ("Info", infos, "ℹ️"),
         ]:
             for issue in severity_issues:
-                lines.append(f"{emoji} <b>{_esc(issue['title'])}</b>")
-                lines.append(f"  {_esc(issue.get('description', ''))}")
+                lines.append(f"{emoji} <b>{esc(issue['title'])}</b>")
+                lines.append(f"  {esc(issue.get('description', ''))}")
                 if issue.get("suggested_fix"):
-                    lines.append(f"  Fix: <i>{_esc(issue['suggested_fix'])}</i>")
+                    lines.append(f"  Fix: <i>{esc(issue['suggested_fix'])}</i>")
                 lines.append("")
 
     text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4090] + "\n…"
+    sent = notify_telegram(text)
 
-    sent = 0
-    for chat_id in ADMIN_TG_IDS:
-        try:
-            resp = httpx.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            sent += 1
-        except Exception as e:
-            logger.error("Failed to notify admin %d: %s", chat_id, e)
-
-    logger.info("Sent nightly report to %d/%d admins (%d issues)", sent, len(ADMIN_TG_IDS), len(issues))
+    logger.info("Sent nightly report to %d admins (%d issues)", sent, len(issues))
     return sent
 
 
