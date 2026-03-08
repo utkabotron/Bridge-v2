@@ -145,7 +145,7 @@ def format_node(state: MessageState) -> MessageState:
         translated text
     """
     original = state.get("original_text", "")
-    translated = state.get("translated_text") or original
+    translated = state.get("translated_text")
     sender = state.get("sender_name", "")
 
     parts = []
@@ -153,8 +153,10 @@ def format_node(state: MessageState) -> MessageState:
         parts.append(bold(sender))
         parts.append("")
     parts.append(esc(original))
-    parts.append("")
-    parts.append(esc(translated))
+    # Add translated only if it exists and differs from original
+    if translated and translated.strip() != original.strip():
+        parts.append("")
+        parts.append(esc(translated))
 
     formatted = "\n".join(parts)
     return {**state, "formatted_text": formatted}
