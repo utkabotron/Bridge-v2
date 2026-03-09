@@ -333,8 +333,16 @@ async function handleIncomingMessage(userId, message, isEdited) {
     return;
   }
 
-  const chat = await message.getChat();
-  const chatId = chat.id._serialized;
+  let chatId, chatName;
+  try {
+    const chat = await message.getChat();
+    chatId = chat.id._serialized;
+    chatName = chat.name;
+  } catch (err) {
+    console.warn(`getChat() failed for message ${message.id._serialized}: ${err.message} — using fallback`);
+    chatId = message.from;
+    chatName = message._data?.subject || message._data?.notifyName || '';
+  }
 
   // Try DB-backed chat pair lookup (with Redis cache)
   let chatPairs = await getChatPairsCache(userId, chatId);
@@ -352,7 +360,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
     senderName = contact.pushname || contact.name || contact.number || 'Unknown';
   } catch {
     const d = message._data || {};
-    senderName = d.notifyName || d.pushname || message.author?.split('@')[0] || chat.name || 'Unknown';
+    senderName = d.notifyName || d.pushname || message.author?.split('@')[0] || chatName || 'Unknown';
   }
 
   // Handle special types
@@ -383,7 +391,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
   const payload = {
     wa_message_id: message.id._serialized,
     wa_chat_id: chatId,
-    wa_chat_name: chat.name,
+    wa_chat_name: chatName,
     user_id: userId,
     sender_name: senderName,
     body: message.body || '',
@@ -397,7 +405,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
   };
 
   await publishMessage(payload);
-  console.log(`Queued message ${message.id._serialized} from chat ${chat.name}`);
+  console.log(`Queued message ${message.id._serialized} from chat ${chatName}`);
 }
 
 // ── Auth marker — only restore sessions that were actually authenticated ──
