@@ -262,11 +262,11 @@ PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и 
 
 - **Домен:** brdg.tools
 - **Сервер:** Ubuntu 24.04, 3.8GB RAM — `ssh bridge` (deploy@83.217.222.126)
-- **Деплой (на VPS нет git repo):**
+- **Деплой (на VPS нет git repo).** ВАЖНО: рабочий каталог `/home/deploy/bridge-v2/`, НЕ `~/bridge-v2/` (root home). `.env` лежит только там:
   ```bash
-  rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' ./ bridge:~/bridge-v2/
-  ssh bridge "cd ~/bridge-v2 && docker compose build <сервис> && docker compose up -d <сервис>"
-  ssh bridge "docker compose -f ~/bridge-v2/docker-compose.yml restart nginx"  # обязательно после up -d
+  rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' --exclude '.venv' ./ bridge:/home/deploy/bridge-v2/
+  ssh bridge "cd /home/deploy/bridge-v2 && docker compose build <сервис> && docker compose up -d <сервис>"
+  ssh bridge "cd /home/deploy/bridge-v2 && docker compose restart nginx"  # обязательно после up -d
   ssh bridge "curl -s http://localhost:3000/health"  # wa-service
   ssh bridge "curl -s http://localhost:8000/health"  # processor
   ```

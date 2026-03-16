@@ -17,7 +17,7 @@
   .right { padding-left:16px; }
   .g { color:#060; } .r { color:#900; } .y { color:#860; }
   .c { color:#068; } .w { color:#000; } .d { color:#666; }
-  .reports { margin-top:20px; padding:20px; }
+  .reports { margin-top:20px; padding:20px; font-size:16px; max-width:90ch; }
   .reports pre { white-space:pre-wrap; }
   .date-nav { cursor:pointer; user-select:none; }
   .date-nav:hover { color:#068; }
@@ -381,7 +381,7 @@ function loadReports(dt) {
 function renderReports() {
   if(!reportData){document.getElementById('reports').innerHTML=c('d','Loading reports...');return;}
   let o='';
-  const W=120;
+  const W=88;
   o+=c('d','='.repeat(W))+'\n';
   o+=c('c','Analytics Reports')+'\n';
   o+=c('d','='.repeat(W))+'\n\n';
@@ -491,7 +491,7 @@ function updateBacklog(id,status) {
 function renderBacklog() {
   const el=document.getElementById('backlog');
   if(!el) return;
-  const W=120;
+  const W=88;
   let o='';
   o+=c('d','='.repeat(W))+'\n';
   o+=c('r','\uD83D\uDEA8 Critical Backlog')+'\n';
@@ -524,7 +524,7 @@ function loadProfiles() {
 function renderProfiles() {
   const el=document.getElementById('profiles');
   if(!el) return;
-  const W=120;
+  const W=88;
   let o='';
   o+=c('d','='.repeat(W))+'\n';
   o+=c('c','\uD83D\uDCD6 Chat Profiles')+'\n';
