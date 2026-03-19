@@ -7,6 +7,7 @@ from flows.cleanup import daily_cleanup
 from flows.health_check import wa_health_check
 from flows.weekly_report import weekly_report
 from flows.chat_context_builder import chat_context_builder
+from flows.daily_chat_summary import daily_chat_summary
 if __name__ == "__main__":
     serve(
         nightly_problems.to_deployment(
@@ -32,5 +33,9 @@ if __name__ == "__main__":
         chat_context_builder.to_deployment(
             name="chat-context-builder",
             cron="0 5 * * *",
+        ),
+        daily_chat_summary.to_deployment(
+            name="daily-chat-summary",
+            cron="*/30 * * * *",
         ),
     )

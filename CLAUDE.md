@@ -216,6 +216,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 | `chat-context-builder` | `0 5 * * *` | gpt-4.1 (+ web_search) | Глоссарий, имена участников, тон чата → `chat_profiles` |
 | `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
 | `chat-context-builder` | `0 5 * * *` | gpt-4.1 | Построение per-chat профилей (глоссарии, участники, тон) |
+| `daily-chat-summary` | `*/30 * * * *` | gpt-4.1-mini | Ежедневные сводки по чатам в TG-группы (оптимальный час отправки per-chat) |
 | `export-to-bq` | ручной | — | Экспорт в BigQuery (требует GCP_SA_PATH) |
 
 ## База данных
@@ -257,6 +258,10 @@ PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и 
 **009_chat_profiles.sql** (только на VPS, отсутствует в локальном репо):
 - `chat_profiles` — per-chat профили: glossary, members, mentioned_people, recurring_topics, tone, chat_type. UNIQUE(chat_pair_id). Заполняется `chat-context-builder` flow, инжектируется в translation prompt.
 - `chat_profile_history` — история версий профилей (version, change_summary)
+
+**010_daily_chat_summaries.sql**:
+- `daily_chat_summaries` — ежедневные сводки по чатам (chat_pair_id + summary_date UNIQUE, summary_text, plans_extracted JSONB, sent, tg_message_id)
+- `chat_summary_schedule` — кэш оптимальных часов отправки (chat_pair_id PK, optimal_hour, mean_hour, std_hour, sample_size)
 
 ## Production (VPS)
 
