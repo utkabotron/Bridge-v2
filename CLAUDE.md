@@ -197,6 +197,13 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 `idle → qr_pending → wa_connected → linking → done`
 Хранятся в `onboarding_sessions`. Мигрированные из v1 получают `done`. Bot /start всегда показывает описание + кнопку Mini App (независимо от состояния). При добавлении бота как admin в TG группу — автосообщение с кнопкой /add.
 
+### Chat Context Builder
+`analytics/flows/chat_context_builder.py` (только на VPS) — ежедневно строит профили чатов для улучшения перевода:
+- **collect**: для чатов без профиля — берёт 90 дней, для остальных — 24ч (инкрементально)
+- **extract**: LLM (gpt-4.1 + web_search для верификации имён) извлекает delta: glossary (транслитерация Hebrew→target_lang), members (имена участников), mentioned_people (упоминаемые люди не из группы), recurring_topics, tone
+- **merge**: delta мержится в существующий профиль с сохранением истории в `chat_profile_history`
+- Профили из `chat_profiles` инжектируются в translation prompt — не переводить, а транслитерировать термины из глоссария
+
 ### Analytics — Prefect flows
 6 flow в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Dual-mode: без `PREFECT_API_URL` — локальный server, с ним — Prefect Cloud worker. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
 
@@ -206,6 +213,7 @@ python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдел
 | `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных (message_events > 90д, sessions > 7д, direct_interactions > 90д) |
 | `nightly-problems` | `0 4 * * *` | gpt-4.1-mini | Анализ проблем за 24h |
 | `translation-quality` | `30 4 * * *` | gpt-4.1-mini | Оценка качества переводов |
+| `chat-context-builder` | `0 5 * * *` | gpt-4.1 (+ web_search) | Глоссарий, имена участников, тон чата → `chat_profiles` |
 | `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
 | `export-to-bq` | ручной | — | Экспорт в BigQuery (требует GCP_SA_PATH) |
 
@@ -244,6 +252,10 @@ PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и 
 
 **008_direct_interactions.sql**:
 - `direct_interactions` — трекинг прямых переводов и анализа медиа из личного чата бота. interaction_type: translation/media_analysis, status: completed/failed. Записывается из `/translate` и `/analyze-direct` endpoints processor'а. Включён в nightly/weekly отчёты и дашборд.
+
+**009_chat_profiles.sql** (только на VPS, отсутствует в локальном репо):
+- `chat_profiles` — per-chat профили: glossary, members, mentioned_people, recurring_topics, tone, chat_type. UNIQUE(chat_pair_id). Заполняется `chat-context-builder` flow, инжектируется в translation prompt.
+- `chat_profile_history` — история версий профилей (version, change_summary)
 
 ## Production (VPS)
 
