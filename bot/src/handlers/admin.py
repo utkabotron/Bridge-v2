@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 def admin_only(handler):
     """Decorator: reject non-admins (checks is_admin flag in DB)."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        from ..db import get_user
         u = await get_user(update.effective_user.id)
         if not u or not u.get("is_admin"):
             await update.message.reply_text("Access denied.")
