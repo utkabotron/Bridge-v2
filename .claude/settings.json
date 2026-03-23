@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "input=$(cat); if echo \"$input\" | grep -qi \"CLAUDE\\.md\"; then skills=$(ls .claude/skills/ 2>/dev/null | tr \"\\n\" \",\" | sed \"s/,$//\"); printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"Доступные скиллы проекта: %s\"}}' \"$skills\"; fi"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
