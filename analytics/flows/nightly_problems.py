@@ -48,8 +48,7 @@ def collect_stats() -> dict:
             count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
             count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
             count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed,
-            count(*) FILTER (WHERE chat_pair_id IS NULL) AS unmapped_total
+            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
         FROM message_events
         WHERE created_at >= current_date - interval '1 day'
           AND created_at < current_date
@@ -127,8 +126,32 @@ def collect_stats() -> dict:
     return stats
 
 
+@task(retries=1, name="fetch-open-issues")
+def fetch_open_issues() -> list[dict]:
+    """Fetch open issues from issues_backlog (last 7 days) to avoid LLM duplicates."""
+    logger = get_run_logger()
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT title, description
+            FROM issues_backlog
+            WHERE status = 'open'
+              AND created_at >= now() - interval '7 days'
+            ORDER BY created_at DESC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        logger.info("Fetched %d open issues for dedup context", len(rows))
+        return rows
+    except Exception as exc:
+        logger.warning("Could not fetch open issues for dedup: %s", exc)
+        return []
+
+
 @task(retries=1, name="analyze-with-llm")
-def analyze_with_llm(stats: dict) -> dict:
+def analyze_with_llm(stats: dict, open_issues: list[dict] | None = None) -> dict:
     """Send aggregated stats to LLM for problem analysis."""
     logger = get_run_logger()
 
@@ -138,11 +161,16 @@ def analyze_with_llm(stats: dict) -> dict:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    system_prompt = """You are a DevOps/SRE analyst for a WhatsApp→Telegram message bridge.
+    existing_block = ""
+    if open_issues:
+        items = "\n".join(f"- {i['title']}: {i.get('description', '')[:120]}" for i in open_issues)
+        existing_block = f"\n\nAlready tracked open issues (do NOT generate duplicate issues for these — skip any issue substantively identical to one below):\n{items}"
+
+    system_prompt = f"""You are a DevOps/SRE analyst for a WhatsApp→Telegram message bridge.
 Analyze the provided 24h statistics and identify issues that need attention.
 
 Stats include mapped_total/mapped_delivered/mapped_failed — use these for failure rate.
-unmapped_total (messages from WA chats without a configured pair) is EXPECTED behavior — do NOT report issues about 'no_chat_pair' errors or high unmapped counts. Focus only on mapped message failures.
+Focus only on mapped message failures (chats with a configured pair).
 
 direct_interactions contains stats about direct translations and media analysis from the bot's private chat (not pipeline messages). Report issues if failure rate is high.
 
@@ -158,7 +186,7 @@ Rules:
 - warning: 3-10% mapped failure rate, degraded performance (avg translation >2s), unusual patterns
 - info: minor anomalies, optimization opportunities
 - If no issues found, return an empty array []
-- Return ONLY the JSON array, no markdown fences or extra text."""
+- Return ONLY the JSON array, no markdown fences or extra text.{existing_block}"""
 
     user_prompt = f"24h stats for {date.today().isoformat()}:\n\n{json.dumps(stats, indent=2, default=str)}"
 
@@ -295,11 +323,10 @@ def notify_admin(stats: dict, analysis: dict) -> int:
         slow = overview.get("slow_translations", 0)
         mapped_total = overview.get("mapped_total", 0)
         mapped_failed = overview.get("mapped_failed", 0)
-        unmapped = overview.get("unmapped_total", 0)
         fail_rate = round(mapped_failed / mapped_total * 100, 1) if mapped_total else 0
         lines.append("<b>Stats (24h):</b>")
         lines.append(f"  Total: {total}  Delivered: {delivered}  Failed: {failed}")
-        lines.append(f"  Mapped: {mapped_total} (failed: {mapped_failed}, rate: {fail_rate}%)  Unmapped: {unmapped}")
+        lines.append(f"  Mapped: {mapped_total} (failed: {mapped_failed}, rate: {fail_rate}%)")
         lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}")
         di = stats.get("direct_interactions", {})
         if di.get("total", 0) > 0:
@@ -339,7 +366,8 @@ def notify_admin(stats: dict, analysis: dict) -> int:
 def nightly_problems():
     """Nightly problem detection: collect stats → LLM analysis → store → notify."""
     stats = collect_stats()
-    analysis = analyze_with_llm(stats)
+    open_issues = fetch_open_issues()
+    analysis = analyze_with_llm(stats, open_issues)
     run_id = store_results(stats, analysis)
     notified = notify_admin(stats, analysis)
     return {

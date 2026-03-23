@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -34,6 +34,27 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _validate_bot_token() -> None:
+    """Check that the Telegram bot token is valid on startup."""
+    from .telegram_sender import BOT_TOKEN
+    if not BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN is not set")
+        return
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+        if r.status_code == 200:
+            data = r.json()
+            logger.info("Bot token valid: @%s (id=%s)", data["result"].get("username"), data["result"].get("id"))
+        elif r.status_code == 401:
+            logger.critical("TELEGRAM_BOT_TOKEN is invalid (401 Unauthorized) — deliveries will fail!")
+        else:
+            logger.warning("getMe returned unexpected status %s: %s", r.status_code, r.text)
+    except Exception as exc:
+        logger.warning("Could not validate bot token on startup: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from .db import get_pool
@@ -41,6 +62,7 @@ async def lifespan(app: FastAPI):
     pool = await get_pool()
     await register_prompt(pool)
     logger.info("Translation prompt registered in DB")
+    await _validate_bot_token()
     task = asyncio.create_task(consume_loop())
     logger.info("Processor started")
     yield
@@ -67,6 +89,56 @@ async def metrics():
 
 
 _counter = {"processed": 0, "failed": 0, "skipped": 0}
+
+# ── 401 alert ────────────────────────────────────────────
+_unauth_times: deque = deque()  # timestamps of recent 401 errors
+_UNAUTH_WINDOW = 900  # 15 minutes
+_UNAUTH_THRESHOLD = 3  # alert after this many in the window
+_unauth_alert_sent = False  # send once per window
+
+ADMIN_TG_IDS = [
+    int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()
+]
+
+
+async def _alert_admins_unauthorized() -> None:
+    """Send a Telegram alert to admins when repeated 401 errors are detected."""
+    import httpx as _httpx
+    from .telegram_sender import BOT_TOKEN
+    if not BOT_TOKEN or not ADMIN_TG_IDS:
+        return
+    text = (
+        "🚨 <b>401 Unauthorized spike detected</b>\n\n"
+        f"≥{_UNAUTH_THRESHOLD} Telegram API 401 errors in the last 15 min.\n"
+        "Possible causes: bot removed from chats, or token invalid.\n"
+        "Check logs: <code>docker compose logs processor | grep 401</code>"
+    )
+    async with _httpx.AsyncClient(timeout=10) as client:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
+                )
+            except Exception as exc:
+                logger.error("Failed to send 401 alert to admin %s: %s", admin_id, exc)
+
+
+def _track_unauth_error() -> None:
+    """Record a 401 error and trigger alert if threshold exceeded."""
+    global _unauth_alert_sent
+    now = time.monotonic()
+    _unauth_times.append(now)
+    # evict old entries outside window
+    while _unauth_times and _unauth_times[0] < now - _UNAUTH_WINDOW:
+        _unauth_times.popleft()
+    if len(_unauth_times) >= _UNAUTH_THRESHOLD and not _unauth_alert_sent:
+        _unauth_alert_sent = True
+        logger.critical("401 threshold reached (%d errors in 15 min) — alerting admins", len(_unauth_times))
+        asyncio.create_task(_alert_admins_unauthorized())
+    # reset flag after window expires (allow re-alerting next window)
+    if _unauth_alert_sent and len(_unauth_times) == 0:
+        _unauth_alert_sent = False
 
 # ── SSE stream ───────────────────────────────────────────
 
@@ -706,14 +778,17 @@ async def consume_loop():
                     )
                 else:
                     _counter["failed"] += 1
+                    err = final_state.get("error") if final_state else "no_output"
+                    if err == "401_UNAUTHORIZED":
+                        _track_unauth_error()
                     emit("message_failed", {
                         "msg_id": msg_id,
-                        "error": final_state.get("error") if final_state else "no_output",
+                        "error": err,
                     })
                     logger.warning(
                         "Failed %s: %s",
                         state["wa_message_id"],
-                        final_state.get("error") if final_state else "no_output",
+                        err,
                     )
             except Exception as exc:
                 _counter["failed"] += 1

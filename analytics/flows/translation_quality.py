@@ -228,8 +228,32 @@ Return ONLY the JSON array, no markdown fences."""
     return {"evaluations": all_evals, "tokens_used": total_tokens}
 
 
+@task(retries=1, name="fetch-pending-suggestions")
+def fetch_pending_suggestions() -> list[dict]:
+    """Fetch pending prompt suggestions to avoid LLM duplicates."""
+    logger = get_run_logger()
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT suggestion, rationale
+            FROM prompt_suggestions
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        logger.info("Fetched %d pending suggestions for dedup context", len(rows))
+        return rows
+    except Exception as exc:
+        logger.warning("Could not fetch pending suggestions for dedup: %s", exc)
+        return []
+
+
 @task(retries=1, name="generate-suggestions")
-def generate_suggestions(evaluations: list[dict]) -> dict:
+def generate_suggestions(evaluations: list[dict], pending_suggestions: list[dict] | None = None) -> dict:
     """Aggregate error patterns and suggest prompt improvements."""
     logger = get_run_logger()
 
@@ -269,7 +293,12 @@ def generate_suggestions(evaluations: list[dict]) -> dict:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    system_prompt = """You are an expert in translation prompt engineering.
+    existing_block = ""
+    if pending_suggestions:
+        items = "\n".join(f"- {s['suggestion'][:120]}" for s in pending_suggestions)
+        existing_block = f"\n\nAlready pending suggestions (do NOT suggest duplicates — skip anything substantively identical to the list below):\n{items}"
+
+    system_prompt = f"""You are an expert in translation prompt engineering.
 Given the current translation prompt and real examples of poor translations,
 suggest specific improvements to the prompt.
 
@@ -278,7 +307,7 @@ Return a JSON array of suggestions. Each suggestion must have:
 - rationale: why this change would help, referencing the actual translation examples
 
 Focus on the most impactful changes. Return 1-5 suggestions max.
-Return ONLY the JSON array, no markdown fences."""
+Return ONLY the JSON array, no markdown fences.{existing_block}"""
 
     prompt_version, prompt_content = _load_prompt_from_db()
     logger.info("Loaded translation prompt %s from DB", prompt_version)
@@ -485,7 +514,8 @@ def translation_quality():
     """Nightly translation quality: sample → evaluate → suggest → store → notify."""
     samples = sample_translations()
     eval_result = evaluate_translations(samples)
-    suggestion_result = generate_suggestions(eval_result.get("evaluations", []))
+    pending = fetch_pending_suggestions()
+    suggestion_result = generate_suggestions(eval_result.get("evaluations", []), pending)
     run_id = store_quality_results(eval_result, suggestion_result)
     notified = notify_quality_report(suggestion_result)
     return {

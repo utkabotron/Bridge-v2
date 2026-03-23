@@ -3,6 +3,9 @@
 Key: translation:{lang}:{chat_pair_id}:{sha256(text)}
 TTL: TRANSLATION_CACHE_TTL env var (default 86400s = 24h)
 
+Global key (no glossary): translation_global:{lang}:{sha256(text)}
+Used when chat has no profile — same text across multiple pairs hits cache.
+
 Chat profile cache:
 Key: chat_profile:{chat_pair_id}
 TTL: PROFILE_CACHE_TTL env var (default 3600s = 1h)
@@ -49,6 +52,27 @@ async def get_cached(text: str, language: str, chat_pair_id: int | None = None) 
 async def set_cached(text: str, language: str, translation: str, chat_pair_id: int | None = None) -> None:
     try:
         await get_redis().setex(_cache_key(text, language, chat_pair_id), CACHE_TTL, translation)
+    except Exception:
+        pass  # cache is best-effort
+
+
+def _global_cache_key(text: str, language: str) -> str:
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    return f"translation_global:{language}:{digest}"
+
+
+async def get_cached_global(text: str, language: str) -> Optional[str]:
+    """Get cached translation without pair context (for chats with no profile)."""
+    try:
+        return await get_redis().get(_global_cache_key(text, language))
+    except Exception:
+        return None
+
+
+async def set_cached_global(text: str, language: str, translation: str) -> None:
+    """Cache translation without pair context."""
+    try:
+        await get_redis().setex(_global_cache_key(text, language), CACHE_TTL, translation)
     except Exception:
         pass  # cache is best-effort
 

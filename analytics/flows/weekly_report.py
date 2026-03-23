@@ -53,8 +53,7 @@ def collect_weekly_data() -> dict:
             count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
             count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
             count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed,
-            count(*) FILTER (WHERE chat_pair_id IS NULL) AS unmapped_total
+            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
         FROM message_events
         WHERE created_at >= %s AND created_at < %s
     """, (week_ago, today))

@@ -52,6 +52,15 @@ def _parse_retry_after(resp_text: str) -> Optional[int]:
     return None
 
 
+def _is_unauthorized(resp_text: str) -> bool:
+    """Check if Telegram response is 401 Unauthorized."""
+    try:
+        data = json.loads(resp_text)
+        return data.get("error_code") == 401
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
 MAX_RETRY_AFTER = 60  # cap wait time to avoid blocking consumer too long
 
 
@@ -181,6 +190,9 @@ async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Opti
         if r2.status_code == 200:
             return True, None, _parse_message_id(r2.text)
         return False, r2.text, None
+    if r.status_code == 401 or _is_unauthorized(r.text):
+        logger.critical("401 Unauthorized for chat %s — bot removed from chat or token invalid", chat_id)
+        return False, "401_UNAUTHORIZED", None
     return False, r.text, None
 
 
@@ -226,6 +238,9 @@ async def _send_media_multipart(
             )
             if r2.status_code == 200:
                 return True, None, _parse_message_id(r2.text)
+        if r.status_code == 401 or _is_unauthorized(r.text):
+            logger.critical("401 Unauthorized on %s for chat %s — bot removed from chat or token invalid", endpoint, chat_id)
+            return False, "401_UNAUTHORIZED", None
         logger.warning("%s multipart failed (%s): %s", endpoint, r.status_code, r.text)
 
     # Fallback: try URL directly

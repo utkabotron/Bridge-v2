@@ -70,7 +70,9 @@ async def test_translate_node_cache_hit():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian")
 
-    with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value="Привет, как дела?")):
+    with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value="Привет, как дела?")), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)):
         result = await translate_node(state)
 
     assert result["translated_text"] == "Привет, как дела?"
@@ -89,7 +91,10 @@ async def test_translate_node_llm_call():
     mock_response.content = "Привет, как дела?"
 
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()), \
+         patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
          patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
 
         mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
