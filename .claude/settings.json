@@ -29,7 +29,7 @@
             "type": "command",
             "timeout": 120,
             "statusMessage": "Running tests before deploy...",
-            "command": "cmd=$(jq -r '.tool_input.command // \"\"' 2>/dev/null); if echo \"$cmd\" | grep -q 'rsync' && echo \"$cmd\" | grep -q 'bridge:'; then ROOT=/mnt/c/PK/Projects/Bridge/bridge-v2; fail=\"\"; (cd \"$ROOT/wa-service\" && npx jest --forceExit) 1>&2 || fail=\"$fail wa-service\"; (cd \"$ROOT/processor\" && python3 -m pytest tests/ -q) 1>&2 || fail=\"$fail processor\"; (cd \"$ROOT/bot\" && python3 -m pytest tests/ -q) 1>&2 || fail=\"$fail bot\"; if [ -n \"$fail\" ]; then printf '{\"continue\":false,\"stopReason\":\"Tests FAILED in:%s — fix before deploying.\"}' \"$fail\"; exit 2; fi; fi"
+            "command": "cmd=$(jq -r '.tool_input.command // \"\"' 2>/dev/null); if echo \"$cmd\" | grep -q 'rsync' && echo \"$cmd\" | grep -q 'bridge:'; then ROOT=/Users/pavelbrick/Projects/08_Bridge; fail=\"\"; (cd \"$ROOT/wa-service\" && npx jest --forceExit) 1>&2 || fail=\"$fail wa-service\"; (cd \"$ROOT/processor\" && python3 -m pytest tests/ -q) 1>&2 || fail=\"$fail processor\"; (cd \"$ROOT/bot\" && python3 -m pytest tests/ -q) 1>&2 || fail=\"$fail bot\"; if [ -n \"$fail\" ]; then printf '{\"continue\":false,\"stopReason\":\"Tests FAILED in:%s — fix before deploying.\"}' \"$fail\"; exit 2; fi; fi"
           }
         ]
       }

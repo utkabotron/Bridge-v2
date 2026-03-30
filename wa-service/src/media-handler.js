@@ -43,8 +43,13 @@ async function handleMedia(message, userId) {
   }
 
   if (!media) {
-    if (message.type === 'sticker') return null; // treat as text
+    if (message.type === 'sticker') return null; // sticker download failed — treat as text
     throw new Error(`downloadMedia returned null for type=${message.type}`);
+  }
+
+  // Stickers: force webp MIME if missing (whatsapp-web.js sometimes omits it)
+  if (message.type === 'sticker' && !media.mimetype) {
+    media.mimetype = 'image/webp';
   }
 
   const buffer = Buffer.from(media.data, 'base64');

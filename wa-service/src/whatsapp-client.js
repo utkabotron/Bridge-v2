@@ -376,7 +376,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
     try {
       mediaInfo = await handleMedia(message, userId);
       if (!mediaInfo && message.type === 'sticker') {
-        message.body = '[Sticker]';
+        message.body = '[Sticker]'; // fallback when sticker media download fails
       }
     } catch (err) {
       console.error(`Media error for user ${userId}:`, err.message);

@@ -228,6 +228,8 @@ def generate_summary_with_llm(chat_data: dict) -> dict | None:
     messages = chat_data["messages"]
     profile = chat_data.get("profile")
     chat_name = chat_data.get("wa_chat_name") or chat_data.get("tg_chat_title") or "Chat"
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
 
     # Format messages for LLM
     msg_lines = []
@@ -249,23 +251,33 @@ def generate_summary_with_llm(chat_data: dict) -> dict | None:
 
     system_prompt = f"""You summarize daily WhatsApp group chat conversations.
 The chat is "{chat_name}".
-Write the summary and all output in {target_lang}.
+Write ALL output in {target_lang}.
+
+Today is {today.isoformat()}, tomorrow is {tomorrow.isoformat()}.
 
 Analyze the messages and produce a JSON object with exactly these fields:
-- "summary": string — concise thematic summary of what was discussed today. Group by topics, not chronologically. Use 3-8 short paragraphs. Don't list every message, capture the essence.
-- "plans": list of objects — events, plans, deadlines, appointments, or action items extracted from the conversation.
-  Each plan: {{"text": "description", "date": "YYYY-MM-DD or null if unknown", "who": "person name or null"}}
+
+- "date_header": string — full summary header line in {target_lang}, native script. Format: "[Summary word] [preposition] DD month_name". Examples: "Сводка за 20 марта" (Russian), "סיכום ל-20 במרץ" (Hebrew), "Summary for March 20" (English). No year.
+- "summary": string — concise thematic summary. 2-4 short paragraphs, 1-2 sentences each, telegraphic style. Group by topics, not chronologically.
+- "plans_title": string — section header "Schedule and plans:" translated to {target_lang} in native script (e.g. "Расписание и планы:" for Russian, "לוח זמנים ותוכניות:" for Hebrew)
+- "plans": list of objects — events, plans, deadlines, appointments, action items extracted from the conversation. Sort by date: nearest first, no-date last.
+  Each plan: {{"text": "description", "date": "date label or null", "who": "person name or null"}}
+  Date format rules:
+  - If date = tomorrow ({tomorrow.isoformat()}), write the word for "tomorrow" in {target_lang} native script (e.g. "завтра", "מחר")
+  - Otherwise write DD.MM (e.g. "25.03"), no year
+  - If unknown, use null
   If no plans found, return empty list [].
-- "title": string — short title for the summary header (2-5 words), in {target_lang}.
+- "stats_line": string — "{chat_data['message_count']} [messages word] · {chat_data['unique_senders']} [participants word]" in {target_lang} with correct declension/grammar, native script (e.g. "15 сообщений · 4 участника", "15 הודעות · 4 משתתפים")
 
 Rules:
 - Write naturally and concisely in {target_lang}
-- Don't include greetings, emoji reactions, or trivial messages in the summary
+- No emoji anywhere in the output
+- Don't include greetings or trivial messages in the summary
 - Focus on substance: decisions, information shared, questions asked, plans made
-- Extract ALL plans, events, deadlines, and action items — even implicit ones
+- Extract ALL plans, events, deadlines, action items — even implicit ones
 - Return ONLY the JSON object, no markdown fences or extra text"""
 
-    user_prompt = f"Messages from today ({date.today().isoformat()}):\n\n{messages_text}{profile_context}"
+    user_prompt = f"Messages from today ({today.isoformat()}):\n\n{messages_text}{profile_context}"
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -302,8 +314,10 @@ Rules:
             "unique_senders": chat_data["unique_senders"],
             "optimal_send_hour": chat_data.get("optimal_hour"),
             "summary_text": result.get("summary", ""),
-            "title": result.get("title", ""),
+            "date_header": result.get("date_header", ""),
+            "plans_title": result.get("plans_title", ""),
             "plans": result.get("plans", []),
+            "stats_line": result.get("stats_line", ""),
             "tokens_used": tokens_used,
         }
 
@@ -318,17 +332,17 @@ def send_summary_to_chat(summary_data: dict) -> dict:
     logger = get_run_logger()
 
     tg_chat_id = summary_data["tg_chat_id"]
-    title = esc(summary_data.get("title", ""))
+    date_header = esc(summary_data.get("date_header", ""))
     summary = esc(summary_data.get("summary_text", ""))
     plans = summary_data.get("plans", [])
-    count = summary_data["message_count"]
-    senders = summary_data["unique_senders"]
+    plans_title = esc(summary_data.get("plans_title", ""))
+    stats_line = esc(summary_data.get("stats_line", ""))
 
     lines = []
 
-    # Header
-    header = title if title else summary_data.get("title", "")
-    lines.append(f"📋 <b>{header}</b>\n")
+    # Header — LLM-localized date
+    lines.append(f"<b>{date_header}</b>")
+    lines.append("")
 
     # Summary
     lines.append(summary)
@@ -336,21 +350,18 @@ def send_summary_to_chat(summary_data: dict) -> dict:
     # Plans
     if plans:
         lines.append("")
-        lines.append("📅 <b>Plans:</b>")
+        lines.append(f"<b>{plans_title}</b>")
         for p in plans:
             text = esc(p.get("text", ""))
             date_str = p.get("date") or ""
             who = p.get("who") or ""
-            parts = [f"• {text}"]
-            if date_str:
-                parts.append(f" ({date_str})")
-            if who:
-                parts.append(f" — {esc(who)}")
-            lines.append("".join(parts))
+            date_part = f"[{esc(date_str)}] " if date_str else ""
+            who_part = f" — {esc(who)}" if who else ""
+            lines.append(f"▸ {date_part}{text}{who_part}")
 
     # Footer
     lines.append("")
-    lines.append(f"💬 {count} messages, {senders} participants")
+    lines.append(f"<i>{stats_line}</i>")
 
     text = "\n".join(lines)
 
@@ -422,7 +433,7 @@ def store_summary(result: dict) -> None:
 
 @flow(name="daily-chat-summary", log_prints=True)
 def daily_chat_summary():
-    """Daily chat summary: schedule → find due chats → collect → generate → send → store."""
+    """Daily chat summary: schedule -> find due chats -> collect -> generate -> send -> store."""
     logger = get_run_logger()
 
     # Recompute schedules if needed

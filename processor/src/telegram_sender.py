@@ -119,6 +119,7 @@ _download_media = download_media
 _MEDIA_TYPE_MAP = {
     "image": ("sendPhoto", "photo"),
     "photo": ("sendPhoto", "photo"),
+    "sticker": ("sendPhoto", "photo"),  # WA stickers (webp) → Telegram photo with caption
     "video": ("sendVideo", "video"),
     "audio": ("sendAudio", "audio"),
     "voice": ("sendAudio", "audio"),
