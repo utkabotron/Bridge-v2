@@ -274,9 +274,16 @@ def store_results(stats: dict, analysis: dict) -> int:
             ),
         )
 
-    # Copy critical issues to persistent backlog
+    # Copy critical issues to persistent backlog (skip duplicates by title)
     for issue in issues:
         if issue["severity"] == "critical":
+            cur.execute(
+                "SELECT 1 FROM issues_backlog WHERE status = 'open' AND lower(title) = lower(%s) LIMIT 1",
+                (issue["title"],),
+            )
+            if cur.fetchone():
+                logger.info("Skipping duplicate backlog issue: %s", issue["title"])
+                continue
             cur.execute(
                 """
                 INSERT INTO issues_backlog

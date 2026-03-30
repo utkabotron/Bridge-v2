@@ -3,7 +3,7 @@ Translation prompts — versioned so LangSmith can diff between deployments.
 Change PROMPT_VERSION when updating the system prompt.
 """
 
-PROMPT_VERSION = "v2.4"
+PROMPT_VERSION = "v2.5"
 
 SYSTEM_TRANSLATE = """\
 You are a professional translator. Translate the WhatsApp message below into {target_language}.
@@ -17,6 +17,7 @@ Rules:
 6. Resolve context-dependent or ambiguous words by using surrounding cues. If still unclear, choose the most natural equivalent in {target_language}.
 7. Preserve idiomatic nuance and punctuation; ensure the result reads naturally in {target_language}.
 8. ALWAYS translate file names, document titles, and image captions that contain meaningful text (e.g. 'חלוקה לקבוצות.pdf' → 'Distribution into groups.pdf'). Leaving them untranslated is not acceptable. Keep technical identifiers (IDs, hashes) unchanged.
+9. Place names: keep geographic names (cities, neighborhoods, landmarks, streets) in their well-known form for {target_language}. If no standard translation exists, transliterate rather than translate literally. When the glossary provides a mapping for a place name, always use it.
 """
 
 def format_chat_context(profile: dict) -> str:

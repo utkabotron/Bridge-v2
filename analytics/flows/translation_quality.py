@@ -410,8 +410,14 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
             ),
         )
 
-    # Store prompt suggestions
+    # Store prompt suggestions (skip duplicates of pending suggestions)
     for sug in suggestion_result.get("suggestions", []):
+        cur.execute(
+            "SELECT 1 FROM prompt_suggestions WHERE status = 'pending' AND lower(suggestion) = lower(%s) LIMIT 1",
+            (sug["suggestion"],),
+        )
+        if cur.fetchone():
+            continue
         cur.execute(
             """
             INSERT INTO prompt_suggestions (run_id, suggestion, rationale)

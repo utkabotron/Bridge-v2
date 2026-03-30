@@ -96,3 +96,27 @@ async def set_chat_profile(chat_pair_id: int, profile: dict) -> None:
         )
     except Exception:
         pass  # cache is best-effort
+
+
+# ── Media analysis cache ─────────────────────────────────
+MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
+
+
+async def get_cached_media(file_hash: str, language: str) -> Optional[str]:
+    """Get cached media analysis result by file content hash."""
+    try:
+        return await get_redis().get(f"media_analysis:{language}:{file_hash}")
+    except Exception:
+        return None
+
+
+async def set_cached_media(file_hash: str, language: str, result: str) -> None:
+    """Cache media analysis result by file content hash."""
+    try:
+        await get_redis().setex(
+            f"media_analysis:{language}:{file_hash}",
+            MEDIA_CACHE_TTL,
+            result,
+        )
+    except Exception:
+        pass  # cache is best-effort

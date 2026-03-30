@@ -140,6 +140,61 @@ def _track_unauth_error() -> None:
     if _unauth_alert_sent and len(_unauth_times) == 0:
         _unauth_alert_sent = False
 
+# ── Failure rate alert ────────────────────────────────────
+_delivery_times: deque = deque()  # (monotonic_ts, is_failed) for mapped msgs
+_FAILURE_RATE_WINDOW = 900  # 15 minutes
+_FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", 0.05))
+_FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", 5))
+_failure_rate_alert_sent = False
+
+
+async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
+    """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
+    import httpx as _httpx
+    from .telegram_sender import BOT_TOKEN
+    if not BOT_TOKEN or not ADMIN_TG_IDS:
+        return
+    text = (
+        "\U0001F6A8 <b>High failure rate detected</b>\n\n"
+        f"Mapped failure rate: <b>{rate:.1%}</b> ({failed}/{total} messages)\n"
+        f"Threshold: {_FAILURE_RATE_THRESHOLD:.0%} over {_FAILURE_RATE_WINDOW // 60} min window.\n"
+        "Check logs: <code>docker compose logs processor --tail 100</code>"
+    )
+    async with _httpx.AsyncClient(timeout=10) as client:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
+                )
+            except Exception as exc:
+                logger.error("Failed to send failure rate alert to admin %s: %s", admin_id, exc)
+
+
+def _track_delivery(failed: bool) -> None:
+    """Record a mapped delivery result and alert if failure rate exceeds threshold."""
+    global _failure_rate_alert_sent
+    now = time.monotonic()
+    _delivery_times.append((now, failed))
+    # evict old entries outside window
+    while _delivery_times and _delivery_times[0][0] < now - _FAILURE_RATE_WINDOW:
+        _delivery_times.popleft()
+    total = len(_delivery_times)
+    if total < _FAILURE_RATE_MIN_MSGS:
+        return
+    failed_count = sum(1 for _, f in _delivery_times if f)
+    rate = failed_count / total
+    if rate >= _FAILURE_RATE_THRESHOLD and not _failure_rate_alert_sent:
+        _failure_rate_alert_sent = True
+        logger.critical(
+            "Failure rate %.1f%% (%d/%d) exceeds threshold — alerting admins",
+            rate * 100, failed_count, total,
+        )
+        asyncio.create_task(_alert_admins_failure_rate(rate, failed_count, total))
+    # reset flag when window clears (allow re-alerting next window)
+    if _failure_rate_alert_sent and failed_count == 0:
+        _failure_rate_alert_sent = False
+
 # ── SSE stream ───────────────────────────────────────────
 
 @app.get("/events")
@@ -610,6 +665,15 @@ async def analyze_direct(
 
     content_bytes = await file.read()
 
+    # Check media analysis cache by file content hash
+    import hashlib as _hashlib
+    from .pipeline.cache import get_cached_media, set_cached_media
+    file_hash = _hashlib.sha256(content_bytes).hexdigest()
+    cached = await get_cached_media(file_hash, target_lang)
+    if cached:
+        logger.info("Media analysis cache hit for %s (hash=%s…)", filename, file_hash[:12])
+        return {"result_text": cached, "analysis_type": "cached", "processing_ms": 0}
+
     t0 = time.monotonic()
     try:
         if mime_type.startswith("image/"):
@@ -623,6 +687,7 @@ async def analyze_direct(
             result_text = await analyze_document(content_bytes, filename, mime_type, target_lang)
 
         processing_ms = int((time.monotonic() - t0) * 1000)
+        await set_cached_media(file_hash, target_lang, result_text)
         await insert_direct_media_analysis(
             user_id, analysis_type, mime_type, filename, result_text, processing_ms,
         )
@@ -758,6 +823,7 @@ async def consume_loop():
                         "total_ms": total_ms,
                         "cache_hit": final_state.get("cache_hit"),
                     })
+                    _track_delivery(failed=False)
                     logger.info(
                         "Delivered %s (lang=%s, cache=%s, ms=%s)",
                         state["wa_message_id"],
@@ -779,6 +845,7 @@ async def consume_loop():
                 else:
                     _counter["failed"] += 1
                     err = final_state.get("error") if final_state else "no_output"
+                    _track_delivery(failed=True)
                     if err == "401_UNAUTHORIZED":
                         _track_unauth_error()
                     emit("message_failed", {
