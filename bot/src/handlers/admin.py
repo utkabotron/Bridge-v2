@@ -104,7 +104,8 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await ctx.bot.send_message(chat_id=u["tg_user_id"], text=text)
             sent += 1
-        except Exception:
+        except Exception as exc:
             failed += 1
+            logger.error("Broadcast to user %s failed: %s", u["tg_user_id"], exc)
 
     await update.message.reply_text(f"Broadcast done: {sent} sent, {failed} failed.")

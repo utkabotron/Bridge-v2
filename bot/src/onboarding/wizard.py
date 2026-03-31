@@ -13,7 +13,6 @@ import json
 import logging
 import os
 
-import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
 
@@ -39,17 +38,17 @@ MINIAPP_URL = os.getenv("WA_SERVICE_PUBLIC_URL", "http://localhost:3000") + "/mi
 
 
 async def _wa_connect(user_id: int) -> dict:
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(f"{WA_SERVICE_URL}/connect/{user_id}")
-        r.raise_for_status()
-        return r.json()
+    from ..utils.http_client import post
+    r = await post(f"{WA_SERVICE_URL}/connect/{user_id}", timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 
 async def _wa_status(user_id: int) -> dict:
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{WA_SERVICE_URL}/status/{user_id}")
-        r.raise_for_status()
-        return r.json()
+    from ..utils.http_client import get
+    r = await get(f"{WA_SERVICE_URL}/status/{user_id}", timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 
 # ── Step 1: /start ────────────────────────────────────────

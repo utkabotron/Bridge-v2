@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import os
 
-import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -66,9 +65,9 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Fetch WA status + groups
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{WA_SERVICE_URL}/status/{tg_id}")
-            data = r.json()
+        from ..utils.http_client import get as http_get
+        r = await http_get(f"{WA_SERVICE_URL}/status/{tg_id}", timeout=10)
+        data = r.json()
     except Exception as exc:
         logger.error("WA status error: %s", exc)
         await update.message.reply_text(render("error_wa_service"), parse_mode="Markdown")

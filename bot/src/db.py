@@ -19,6 +19,7 @@ async def get_pool() -> asyncpg.Pool:
             dsn=os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge"),
             min_size=2,
             max_size=10,
+            command_timeout=10,
         )
     return _pool
 

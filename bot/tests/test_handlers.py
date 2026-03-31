@@ -210,7 +210,7 @@ async def test_handle_direct_text_success():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("bot.src.handlers.translate.httpx.AsyncClient", return_value=mock_client):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp):
         await handle_direct_text(update, ctx)
 
     preview_msg.edit_text.assert_called_once()
@@ -231,12 +231,7 @@ async def test_handle_direct_text_processor_error():
     mock_resp.status_code = 500
     mock_resp.text = "Internal Server Error"
 
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=mock_resp)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-
-    with patch("bot.src.handlers.translate.httpx.AsyncClient", return_value=mock_client):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp):
         await handle_direct_text(update, ctx)
 
     text = preview_msg.edit_text.call_args[0][0]
@@ -253,12 +248,7 @@ async def test_handle_direct_text_timeout():
     update.message.reply_text = AsyncMock(return_value=preview_msg)
     ctx = MagicMock()
 
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(side_effect=httpx.TimeoutException("timeout"))
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-
-    with patch("bot.src.handlers.translate.httpx.AsyncClient", return_value=mock_client):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")):
         await handle_direct_text(update, ctx)
 
     text = preview_msg.edit_text.call_args[0][0]

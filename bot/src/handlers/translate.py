@@ -6,6 +6,7 @@ import os
 
 import httpx
 from telegram import Update
+from ..utils import http_client
 from telegram.ext import ContextTypes
 from ..utils.telegram_format import esc, italic
 
@@ -30,11 +31,11 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
     preview_msg = await msg.reply_text("⏳")
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                f"{PROCESSOR_URL}/translate",
-                json={"text": text, "user_id": user_id},
-            )
+        r = await http_client.post(
+            f"{PROCESSOR_URL}/translate",
+            json={"text": text, "user_id": user_id},
+            timeout=30,
+        )
 
         if r.status_code == 200:
             data = r.json()
@@ -101,12 +102,12 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_bytes = await tg_file.download_as_bytearray()
 
         # Send to processor
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{PROCESSOR_URL}/analyze-direct",
-                files={"file": (filename, bytes(file_bytes), mime_type)},
-                data={"user_id": str(user_id), "mime_type": mime_type, "filename": filename},
-            )
+        r = await http_client.post(
+            f"{PROCESSOR_URL}/analyze-direct",
+            files={"file": (filename, bytes(file_bytes), mime_type)},
+            data={"user_id": str(user_id), "mime_type": mime_type, "filename": filename},
+            timeout=120,
+        )
 
         if r.status_code == 200:
             data = r.json()

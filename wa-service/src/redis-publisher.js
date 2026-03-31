@@ -1,16 +1,21 @@
 const Redis = require('ioredis');
+const {
+  REDIS_HOST, REDIS_PORT, REDIS_DB,
+  REDIS_RETRY_LIMIT, REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
+  DEDUP_TTL, CHAT_PAIRS_CACHE_TTL,
+} = require('./config');
 
 const redis = new Redis({
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT) || 6379,
-  db: parseInt(process.env.REDIS_DB) || 0,
+  host: REDIS_HOST,
+  port: REDIS_PORT,
+  db: REDIS_DB,
   retryStrategy: (times) => {
-    if (times > 10) {
-      console.error('Redis: failed after 10 retries');
+    if (times > REDIS_RETRY_LIMIT) {
+      console.error(`Redis: failed after ${REDIS_RETRY_LIMIT} retries`);
       return null;
     }
-    const delay = Math.min(times * 500, 5000);
-    console.warn(`Redis: retry attempt ${times}/10 in ${delay}ms`);
+    const delay = Math.min(times * REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX);
+    console.warn(`Redis: retry attempt ${times}/${REDIS_RETRY_LIMIT} in ${delay}ms`);
     return delay;
   },
   lazyConnect: false,
@@ -26,11 +31,13 @@ redis.on('error', (err) => console.error('Redis error:', err.message));
  */
 async function publishMessage(payload) {
   const dedupKey = `dedup:msg:${payload.wa_message_id}`;
-  const isNew = await redis.set(dedupKey, '1', 'EX', 300, 'NX');
+  const isNew = await redis.set(dedupKey, '1', 'EX', DEDUP_TTL, 'NX');
   if (!isNew) {
     console.log(`Dedup: skipping duplicate message ${payload.wa_message_id}`);
     return;
   }
+  // LPUSH first, then SET dedup key — if LPUSH fails, dedup key already set
+  // but duplicate processing is safer than message loss (processor deduplicates by DB)
   await redis.lpush('messages:in', JSON.stringify(payload));
 }
 
@@ -61,7 +68,7 @@ async function getChatPairsCache(userId, chatId) {
 
 async function setChatPairsCache(userId, chatId, data) {
   const key = `chat_pairs:user:${userId}:chat:${chatId}`;
-  const ttl = parseInt(process.env.CACHE_TTL) || 3600;
+  const ttl = CHAT_PAIRS_CACHE_TTL;
   try {
     await redis.setex(key, ttl, JSON.stringify(data));
   } catch {

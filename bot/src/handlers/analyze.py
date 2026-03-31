@@ -6,6 +6,7 @@ import os
 
 import httpx
 from telegram import Update
+from ..utils import http_client
 from telegram.ext import ContextTypes
 
 from ..utils.telegram_format import esc
@@ -50,11 +51,11 @@ async def cb_analyze_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Call processor /analyze
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{PROCESSOR_URL}/analyze",
-                json={"message_event_id": event_id, "requested_by": requested_by},
-            )
+        r = await http_client.post(
+            f"{PROCESSOR_URL}/analyze",
+            json={"message_event_id": event_id, "requested_by": requested_by},
+            timeout=120,
+        )
 
         if r.status_code == 200:
             data = r.json()

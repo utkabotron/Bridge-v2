@@ -6,10 +6,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import Any, Optional
 
 import asyncpg
+
+from .config import DATABASE_URL, DB_POOL_MIN, DB_POOL_MAX, DB_COMMAND_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,10 @@ async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         _pool = await asyncpg.create_pool(
-            dsn=os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge"),
-            min_size=2,
-            max_size=10,
+            dsn=DATABASE_URL,
+            min_size=DB_POOL_MIN,
+            max_size=DB_POOL_MAX,
+            command_timeout=DB_COMMAND_TIMEOUT,
         )
     return _pool
 

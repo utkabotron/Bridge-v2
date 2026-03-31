@@ -15,12 +15,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_SEND_TIMEOUT, MAX_RETRY_AFTER, S3_ENDPOINT
+
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+BOT_TOKEN = TELEGRAM_BOT_TOKEN
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 
 _client: Optional[httpx.AsyncClient] = None
 
@@ -28,7 +28,7 @@ _client: Optional[httpx.AsyncClient] = None
 def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=30)
+        _client = httpx.AsyncClient(timeout=TELEGRAM_SEND_TIMEOUT)
     return _client
 
 
@@ -61,7 +61,6 @@ def _is_unauthorized(resp_text: str) -> bool:
         return False
 
 
-MAX_RETRY_AFTER = 60  # cap wait time to avoid blocking consumer too long
 
 
 def _parse_message_id(resp_text: str) -> Optional[int]:

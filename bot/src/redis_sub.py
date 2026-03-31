@@ -19,11 +19,18 @@ logger = logging.getLogger(__name__)
 # Module-level references injected by main.py at startup
 _bot_app = None
 _loop = None
+_pending_events: list[dict] = []
 
 
 def set_bot_app(app):
     global _bot_app
     _bot_app = app
+    # Drain buffered events that arrived before bot was ready
+    if _pending_events and _loop and _loop.is_running():
+        logger.info("Draining %d buffered QR events", len(_pending_events))
+        for evt in _pending_events:
+            asyncio.run_coroutine_threadsafe(handle_qr_event(evt), _loop)
+        _pending_events.clear()
 
 
 def set_event_loop(loop):
@@ -47,7 +54,12 @@ async def handle_qr_event(data: dict) -> None:
     user_id = data.get("userId")
     event = data.get("event", "")
 
-    if not user_id or not _bot_app:
+    if not user_id:
+        logger.warning("QR event missing userId, raw data: %s", data)
+        return
+    if not _bot_app:
+        logger.warning("QR event for user %s but _bot_app not ready, buffering", user_id)
+        _pending_events.append(data)
         return
 
     from .db import get_onboarding_state, set_onboarding_state, set_wa_connected
@@ -93,7 +105,8 @@ def redis_subscriber_loop():
             if _loop and _loop.is_running():
                 asyncio.run_coroutine_threadsafe(handle_qr_event(data), _loop)
             else:
-                logger.warning("No running event loop — skipping QR event")
+                logger.warning("No running event loop — buffering QR event for user %s", data.get("userId"))
+                _pending_events.append(data)
         except Exception as exc:
             logger.error("QR event handler error: %s", exc)
 

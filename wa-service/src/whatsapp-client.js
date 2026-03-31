@@ -8,21 +8,18 @@ const fs = require('fs');
 const path = require('path');
 const { publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
+const config = require('./config');
 
 // Map<userId:number, ClientData>
 const clients = new Map();
 
-const MAX_CONCURRENT_CLIENTS = parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 10;
-const MAX_PARALLEL_INIT = parseInt(process.env.MAX_PARALLEL_INIT) || 3;
-
-// QR timeout — destroy client if user doesn't scan within this period
-const QR_TIMEOUT_MS = parseInt(process.env.QR_TIMEOUT_MS) || 60 * 60 * 1000;
-
-// Reconnect settings
-const RECONNECT_DELAYS = [5000, 15000, 45000]; // 5s, 15s, 45s
-const HEALTH_CHECK_INTERVAL = 30000; // 30s
-const HEALTH_CHECK_TIMEOUT = 10000; // 10s
-const MAX_MESSAGE_ERRORS = 5; // reconnect after N consecutive message handler errors
+const MAX_CONCURRENT_CLIENTS = config.MAX_CONCURRENT_CLIENTS;
+const MAX_PARALLEL_INIT = config.MAX_PARALLEL_INIT;
+const QR_TIMEOUT_MS = config.QR_TIMEOUT_MS;
+const RECONNECT_DELAYS = config.RECONNECT_DELAYS;
+const HEALTH_CHECK_INTERVAL = config.HEALTH_CHECK_INTERVAL;
+const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
+const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 
 function getClientId(userId) {
   return `user-${userId}`;
@@ -404,8 +401,12 @@ async function handleIncomingMessage(userId, message, isEdited) {
     media_filename: mediaInfo?.filename || null,
   };
 
-  await publishMessage(payload);
-  console.log(`Queued message ${message.id._serialized} from chat ${chatName}`);
+  try {
+    await publishMessage(payload);
+    console.log(`Queued message ${message.id._serialized} from chat ${chatName}`);
+  } catch (err) {
+    console.error(`[DLQ] Failed to publish message: ${err.message}`, JSON.stringify(payload));
+  }
 }
 
 // ── Auth marker — only restore sessions that were actually authenticated ──

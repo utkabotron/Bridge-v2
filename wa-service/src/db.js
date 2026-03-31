@@ -1,8 +1,10 @@
 const { Pool } = require('pg');
+const { DATABASE_URL, DB_POOL_MAX, DB_STATEMENT_TIMEOUT } = require('./config');
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://bridge:bridge@localhost:5432/bridge',
-  max: 5,
+  connectionString: DATABASE_URL,
+  max: DB_POOL_MAX,
+  statement_timeout: DB_STATEMENT_TIMEOUT,
 });
 
 pool.on('error', (err) => {

@@ -125,7 +125,11 @@ router.get('/status/:userId', async (req, res) => {
   }
 
   try {
-    const chats = await clientData.client.getChats();
+    const chatsPromise = clientData.client.getChats();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('getChats timeout (15s)')), 15000)
+    );
+    const chats = await Promise.race([chatsPromise, timeoutPromise]);
     const groups = chats.filter((c) => c.isGroup).map((c) => ({
       id: c.id._serialized,
       name: c.name,

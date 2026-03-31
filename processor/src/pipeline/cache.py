@@ -14,23 +14,26 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from typing import Optional
 
 import redis.asyncio as aioredis
 
+from ..config import (
+    REDIS_HOST, REDIS_PORT, REDIS_DB,
+    TRANSLATION_CACHE_TTL, PROFILE_CACHE_TTL, MEDIA_CACHE_TTL,
+)
+
 _client: Optional[aioredis.Redis] = None
-CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
-PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
+CACHE_TTL = TRANSLATION_CACHE_TTL
 
 
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:
         _client = aioredis.Redis(
-            host=os.getenv("REDIS_HOST", "localhost"),
-            port=int(os.getenv("REDIS_PORT", 6379)),
-            db=int(os.getenv("REDIS_DB", 0)),
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
             decode_responses=True,
         )
     return _client
@@ -99,7 +102,6 @@ async def set_chat_profile(chat_pair_id: int, profile: dict) -> None:
 
 
 # ── Media analysis cache ─────────────────────────────────
-MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
 
 
 async def get_cached_media(file_hash: str, language: str) -> Optional[str]:

@@ -22,6 +22,14 @@ from fastapi import FastAPI, File, Form, Query, Path, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from .config import (
+    REDIS_HOST, REDIS_PORT, REDIS_DB, BRPOP_TIMEOUT,
+    ADMIN_TG_IDS as _CFG_ADMIN_TG_IDS,
+    UNAUTH_WINDOW, UNAUTH_THRESHOLD,
+    FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
+    FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
+    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE,
+)
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
@@ -77,6 +85,14 @@ app = FastAPI(title="Bridge v2 — Processor", version="2.0.0", lifespan=lifespa
 
 # ── Health ────────────────────────────────────────────────
 
+@app.get("/api/config")
+async def api_config():
+    """Current configuration (debug endpoint)."""
+    from . import config as _cfg
+    return {k: v for k, v in vars(_cfg).items()
+            if k.isupper() and not k.startswith("_") and "TOKEN" not in k and "SECRET" not in k}
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "processor"}
@@ -85,24 +101,25 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     """Simple counters — replace with Prometheus if needed later."""
-    return {"processed": _counter["processed"], "failed": _counter["failed"], "skipped": _counter["skipped"]}
+    return {"processed": _counter["processed"], "failed": _counter["failed"], "skipped": _counter["skipped"], "dlq": _counter["dlq"]}
 
 
-_counter = {"processed": 0, "failed": 0, "skipped": 0}
+_counter = {"processed": 0, "failed": 0, "skipped": 0, "dlq": 0}
 
 # ── 401 alert ────────────────────────────────────────────
 _unauth_times: deque = deque()  # timestamps of recent 401 errors
-_UNAUTH_WINDOW = 900  # 15 minutes
-_UNAUTH_THRESHOLD = 3  # alert after this many in the window
+_UNAUTH_WINDOW = UNAUTH_WINDOW
+_UNAUTH_THRESHOLD = UNAUTH_THRESHOLD
 _unauth_alert_sent = False  # send once per window
 
-ADMIN_TG_IDS = [
-    int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()
-]
+ADMIN_TG_IDS = _CFG_ADMIN_TG_IDS
 
 
 async def _alert_admins_unauthorized() -> None:
     """Send a Telegram alert to admins when repeated 401 errors are detected."""
+    from .feature_flags import is_enabled
+    if not await is_enabled("admin_alerts_enabled"):
+        return
     import httpx as _httpx
     from .telegram_sender import BOT_TOKEN
     if not BOT_TOKEN or not ADMIN_TG_IDS:
@@ -142,14 +159,17 @@ def _track_unauth_error() -> None:
 
 # ── Failure rate alert ────────────────────────────────────
 _delivery_times: deque = deque()  # (monotonic_ts, is_failed) for mapped msgs
-_FAILURE_RATE_WINDOW = 900  # 15 minutes
-_FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", 0.05))
-_FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", 5))
+_FAILURE_RATE_WINDOW = FAILURE_RATE_WINDOW
+_FAILURE_RATE_THRESHOLD = _CFG_FAILURE_RATE_THRESHOLD
+_FAILURE_RATE_MIN_MSGS = _CFG_FAILURE_RATE_MIN_MSGS
 _failure_rate_alert_sent = False
 
 
 async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
     """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
+    from .feature_flags import is_enabled
+    if not await is_enabled("admin_alerts_enabled"):
+        return
     import httpx as _httpx
     from .telegram_sender import BOT_TOKEN
     if not BOT_TOKEN or not ADMIN_TG_IDS:
@@ -401,6 +421,71 @@ async def api_backlog_update(issue_id: int = Path(...), body: BacklogUpdate = ..
     return dict(row)
 
 
+# ── Dead-Letter Queue API ────────────────────────────────
+
+@app.get("/api/dlq")
+async def api_dlq():
+    """List messages in the dead-letter queue."""
+    r = aioredis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+    )
+    try:
+        items = await r.lrange("messages:dlq", 0, 99)
+        return [json.loads(item) for item in items]
+    finally:
+        await r.aclose()
+
+
+@app.post("/api/dlq/retry")
+async def api_dlq_retry():
+    """Move all DLQ messages back to messages:in for reprocessing."""
+    r = aioredis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        decode_responses=True,
+    )
+    try:
+        count = 0
+        while True:
+            item = await r.rpop("messages:dlq")
+            if item is None:
+                break
+            entry = json.loads(item)
+            payload = entry.get("payload", entry)
+            await r.lpush("messages:in", json.dumps(payload, default=str))
+            count += 1
+        return {"retried": count}
+    finally:
+        await r.aclose()
+
+
+# ── Feature Flags API ────────────────────────────────────
+
+@app.get("/api/flags")
+async def api_flags():
+    """List all feature flags."""
+    from .feature_flags import get_all_flags
+    return await get_all_flags()
+
+
+class FlagUpdate(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/flags/{flag_name}")
+async def api_flag_update(flag_name: str = Path(...), body: FlagUpdate = ...):
+    """Toggle a feature flag."""
+    from .feature_flags import set_flag
+    updated = await set_flag(flag_name, body.enabled)
+    if not updated:
+        return JSONResponse({"error": "flag not found"}, status_code=404)
+    return {"name": flag_name, "enabled": body.enabled}
+
+
 # ── Chat Profiles API ────────────────────────────────────
 
 @app.get("/api/profiles")
@@ -439,7 +524,7 @@ _DEFAULT_FALLBACK = {"input": 0.40 / 1_000_000, "output": 1.60 / 1_000_000}
 
 # In-memory cache: {days: (timestamp, data)}
 _costs_cache: dict[int, tuple[float, dict]] = {}
-_COSTS_CACHE_TTL = 900  # 15 min
+_COSTS_CACHE_TTL = COSTS_CACHE_TTL
 
 
 def _fetch_costs_sync(days: int) -> dict:
@@ -447,7 +532,7 @@ def _fetch_costs_sync(days: int) -> dict:
     from langsmith import Client
 
     client = Client()
-    project = os.getenv("LANGCHAIN_PROJECT", "bridge-v2")
+    project = LANGCHAIN_PROJECT
     start = datetime.now(timezone.utc) - timedelta(days=days)
 
     by_day: dict[str, dict] = defaultdict(lambda: {"cost": 0.0, "tokens": 0, "runs": 0})
@@ -524,6 +609,9 @@ class TranslateRequest(BaseModel):
 @app.post("/translate")
 async def translate_text(body: TranslateRequest):
     """Translate text using the pipeline's LLM + cache."""
+    from .feature_flags import is_enabled
+    if not await is_enabled("translation_enabled"):
+        return JSONResponse({"error": "Translation is temporarily disabled"}, status_code=503)
     from .pipeline.nodes import get_llm
     from .pipeline.cache import get_cached, set_cached
     from .pipeline.prompts import get_translate_prompt
@@ -542,7 +630,7 @@ async def translate_text(body: TranslateRequest):
         )
         lang = row["target_language"] if row and row["target_language"] else ""
     if not lang:
-        lang = os.getenv("TARGET_LANGUAGE", "Hebrew")
+        lang = TARGET_LANGUAGE
 
     # Cache check
     cached = await get_cached(text, lang)
@@ -586,6 +674,9 @@ class AnalyzeRequest(BaseModel):
 @app.post("/analyze")
 async def analyze_media(body: AnalyzeRequest):
     """Analyze media content (image/audio/document) by message_event_id."""
+    from .feature_flags import is_enabled
+    if not await is_enabled("media_analysis_enabled"):
+        return JSONResponse({"error": "Media analysis is temporarily disabled"}, status_code=503)
     from .db import get_event_for_analysis, get_existing_analysis, insert_media_analysis
     from .telegram_sender import download_media
 
@@ -655,13 +746,16 @@ async def analyze_direct(
     filename: str = Form("file"),
 ):
     """Analyze media directly from binary upload (bot private chat)."""
+    from .feature_flags import is_enabled
+    if not await is_enabled("media_analysis_enabled"):
+        return JSONResponse({"error": "Media analysis is temporarily disabled"}, status_code=503)
     # Resolve target language
     from .db import get_pool
     pool = await get_pool()
     row = await pool.fetchrow(
         "SELECT target_language FROM users WHERE tg_user_id = $1", user_id,
     )
-    target_lang = (row["target_language"] if row and row["target_language"] else "") or os.getenv("TARGET_LANGUAGE", "Hebrew")
+    target_lang = (row["target_language"] if row and row["target_language"] else "") or TARGET_LANGUAGE
 
     content_bytes = await file.read()
 
@@ -711,9 +805,9 @@ NODES = ["validate", "translate", "format", "deliver"]
 
 async def consume_loop():
     r = aioredis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        db=int(os.getenv("REDIS_DB", 0)),
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
         decode_responses=True,
     )
 
@@ -721,7 +815,7 @@ async def consume_loop():
 
     while True:
         try:
-            result = await r.brpop("messages:in", timeout=5)
+            result = await r.brpop("messages:in", timeout=BRPOP_TIMEOUT)
             if result is None:
                 continue  # timeout — loop again
 
@@ -746,7 +840,7 @@ async def consume_loop():
                 # Will be resolved by validate node
                 "chat_pair_id": None,
                 "tg_chat_id": None,
-                "target_language": os.getenv("TARGET_LANGUAGE", "Hebrew"),
+                "target_language": TARGET_LANGUAGE,
                 "translated_text": None,
                 "translation_ms": None,
                 "cache_hit": False,
@@ -859,8 +953,17 @@ async def consume_loop():
                     )
             except Exception as exc:
                 _counter["failed"] += 1
+                _counter["dlq"] += 1
                 emit("message_failed", {"msg_id": msg_id, "error": str(exc)})
                 logger.error("Pipeline error for %s: %s", state.get("wa_message_id"), exc)
+                try:
+                    dlq_entry = json.dumps({
+                        "payload": payload, "error": str(exc),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }, default=str)
+                    await r.lpush("messages:dlq", dlq_entry)
+                except Exception as dlq_exc:
+                    logger.error("Failed to push to DLQ: %s", dlq_exc)
 
         except json.JSONDecodeError as exc:
             logger.error("Invalid JSON in messages:in: %s", exc)
