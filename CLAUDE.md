@@ -2,334 +2,244 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Рабочие правила
+## RULES
 
-### Перед изменениями — исследуй
-Перед тем как менять код, используй task agent для исследования всех затронутых файлов. Составь карту функций и вызовов, потом предложи план. Не пиши код вслепую.
+- ИССЛЕДУЙ перед изменениями: agent для чтения затронутых файлов → карта функций → план. Не пиши код вслепую.
+- РЕСТАРТУЙ сервис после бэкенд-изменений. Старый процесс НЕ подхватит.
+- РЕСТАРТУЙ nginx после `docker compose up -d` — контейнер получает новый IP, nginx кэширует старый → 502.
+- UI: подтверди у пользователя ЧТО/КАК/ГДЕ меняется, жди OK. НЕ добавляй "на проекты в сайдбаре" если сказано "на продукты в гриде".
+- CSS: проблема = специфичность, не логика. Проверяй конфликты.
+- Дебаг 404/500: (1) сервер запущен? (2) миграции применены? (3) пути к статике? — только потом теории.
+- Дебаг multi-service: трейс `wa-service → Redis → processor → Telegram API`, `bot → PostgreSQL`. Правишь конфиг в одном сервисе — проверь все остальные.
+- `>5` правок в файле → `Write` целиком, не `Edit` по одной.
+- `/test` перед каждым коммитом. Исключение: только docs/CLAUDE.md.
+- "деплой"/"задеплой" → `/deploy` немедленно, без plan mode.
+- Новые константы → в `config.py`/`config.js`, НЕ хардкодить.
+- HTTP в bot handlers → `bot/src/utils/http_client.py`, НЕ создавать `httpx.AsyncClient` напрямую.
 
-### После бэкенд-изменений — рестарт
-После изменений серверных файлов всегда рестартуй сервис. Не предполагай, что старый процесс подхватит изменения.
+## SKILLS
 
-### После рестарта processor/bot — рестартуй nginx
-При `docker compose up -d` контейнер получает новый IP. Nginx кеширует старый upstream IP → 502. Всегда `docker compose restart nginx` после пересоздания processor/bot.
+| Команда | Действие |
+|---------|----------|
+| `/test` | Jest (wa-service) + pytest (processor + bot) |
+| `/deploy [сервис...]` | test → rsync → migrate → build → up -d → restart nginx → health |
+| `/commit [msg]` | add -A → commit → push (msg генерируется если не передан) |
+| `/weekly-improve` | weekly_insights из БД → classify → plan → code → test → deploy → broadcast |
 
-### CSS — проверяй специфичность
-При CSS-изменениях всегда проверяй конфликты специфичности с существующими стилями. Если CSS-фикс не работает — скорее всего проблема в специфичности, а не в логике.
+## PROJECT
 
-### UI — подтверждай перед кодом
-Перед любыми UI-изменениями сначала подтверди у пользователя:
-1. Какой именно элемент/компонент будет изменён
-2. Какое будет поведение
-3. Как это будет выглядеть
-Жди OK перед написанием кода. НЕ добавляй на проекты в сайдбаре, если сказано "на продукты в гриде".
+Bridge v2 — WhatsApp→Telegram мост с AI-переводом. Монорепо, 4 сервиса, Docker Compose. JS (wa-service), Python (bot, processor, analytics). НЕ TypeScript. Default lang: Hebrew.
 
-### Дебаг 404/500
-1. Проверь что сервер запущен и был рестартнут после изменений
-2. Проверь что миграции БД применены
-3. Проверь пути к статическим файлам
-НЕ гоняй теории про URL resolution пока не проверил эти базовые вещи.
+| Сервис | Стек | Порт | Примечание |
+|--------|------|------|------------|
+| wa-service | Node 20, whatsapp-web.js, Express, ioredis, pg | 3000 | expose-only, не published |
+| processor | Python 3.12, FastAPI, LangGraph, asyncpg | 8000 | published |
+| bot | Python 3.12, python-telegram-bot, asyncpg | 8001 | polling, нет health endpoint |
+| analytics | Python 3.12, Prefect, OpenAI | 4200 | — |
 
-### Массовые правки — Write вместо Edit
-Если нужно больше 5 правок в одном файле — используй Write для перезаписи целиком вместо последовательных Edit вызовов. Это быстрее и избегает промежуточных сломанных состояний.
-
-### Дебаг многосервисной архитектуры — трейс data flow
-Перед любым фиксом бага, который может затрагивать несколько сервисов, сначала нарисуй путь данных:
-`wa-service → Redis → processor → Telegram API` и `bot → PostgreSQL`.
-Если правишь конфиг или токен в одном сервисе — проверь все остальные, которые используют тот же ресурс. Поверхностный фикс одного слоя при пропущенном другом = несколько раундов deploy-debug.
-
-### Тесты перед коммитом
-Перед каждым коммитом прогони тесты через `/test`. Исключение: только если меняешь исключительно документацию/CLAUDE.md. Хук перед деплоем (`rsync`) уже автоматически блокирует деплой при упавших тестах, но коммит с фейлящимися тестами тоже недопустим.
-
-### "Деплой" = деплоить сразу
-Когда пользователь говорит "задеплой" или "деплой" — вызывай `/deploy` немедленно, без планирования и уточнений (если не сказано иное). Не входи в plan mode.
-
-## Скиллы (slash-команды)
-
-Проект использует Claude Code Skills в `.claude/skills/`:
-
-| Скилл | Что делает |
-|-------|-----------|
-| `/test` | Jest + pytest по всем 3 сервисам, показывает провалы |
-| `/deploy [сервис...]` | Тесты → rsync на VPS → docker build+up → restart nginx → health check |
-| `/commit [сообщение]` | git status → add -A → commit → push (сообщение генерируется если не передано) |
-| `/weekly-improve` | Читает `weekly_insights` из БД → classify → plan → code → test → deploy → broadcast |
-
-## Обзор проекта
-
-Bridge v2 — WhatsApp→Telegram мост с AI-переводом. Монорепозиторий из 4 сервисов, оркестрированных через Docker Compose. Стек: JavaScript (wa-service), Python (bot, processor, analytics). TypeScript НЕ используется. Дефолтный язык перевода — Hebrew.
-
-| Сервис | Стек | Порт |
-|--------|------|------|
-| `wa-service` | Node.js 20, whatsapp-web.js, Express, ioredis, pg | 3000 (только внутри docker network) |
-| `processor` | Python 3.12, FastAPI, LangGraph, asyncpg | 8000 |
-| `bot` | Python 3.12, python-telegram-bot, asyncpg | 8001 |
-| `analytics` | Python 3.12, Prefect, OpenAI | 4200 |
-
-## Команды
+## COMMANDS
 
 ```bash
-# Локальная разработка
-make up            # docker compose up -d (все 4 сервиса + redis + postgres + minio)
-make down          # остановка
-make restart       # docker compose restart (все сервисы)
-make logs          # логи всех сервисов
-make logs-bot      # логи конкретного сервиса (logs-wa, logs-processor, logs-bot, logs-analytics)
-make health        # curl /health всех сервисов
-
-# Тесты и линтинг
-make test          # Jest (wa-service) + pytest (processor + bot, asyncio_mode=auto)
-make lint          # ruff check processor/src/ bot/src/ analytics/flows/
+make up / down / restart / logs / logs-bot / health
+make test          # Jest + pytest (asyncio_mode=auto)
+make lint          # ruff check
 make format        # ruff format
+make db-shell      # psql -U bridge -d bridge
 
-# Запуск одного теста
-cd wa-service && npm test                                              # все Jest-тесты
+# Один тест
+cd wa-service && npm test
 cd processor && python -m pytest tests/test_pipeline.py::test_validate_node -v
 cd bot && python -m pytest tests/test_onboarding.py -v
 
-# wa-service разработка
-cd wa-service && npm run dev   # node --watch src/index.js (hot reload)
-
-# База данных
-make db-shell      # psql -U bridge -d bridge
-make migrate       # применить migrations (обычно не нужно — initdb.d автоматически)
+cd wa-service && npm run dev   # node --watch (hot reload)
 ```
 
-## Архитектура
-
-### Поток сообщений
+## DATA FLOW
 
 ```
-WhatsApp (wa-service)
-  └─ handleIncomingMessage()
-       ├─ dedup: Redis SET NX "dedup:msg:{wa_message_id}" EX 300
-       ├─ uploadMedia() → S3/MinIO
-       └─ redis.LPUSH("messages:in", payload)
-                 ↓
-Processor consumer loop (BRPOP "messages:in")
-  └─ LangGraph StateGraph:
-       validate → [conditional] → translate → format → deliver
-                                                          └─ httpx → Telegram API
-                                                          └─ asyncpg → message_events
-       validate (no pair) → deliver (skipped, записать в БД)
-       validate (no text) → format → deliver (skip translation)
-       exception → LPUSH "messages:dlq" (payload + error + timestamp)
+WhatsApp msg → wa-service handleIncomingMessage()
+  ├─ dedup: SET NX "dedup:msg:{id}" EX 300
+  ├─ uploadMedia() → S3/MinIO
+  └─ LPUSH "messages:in"
+       ↓
+processor consume_loop (BRPOP)
+  └─ LangGraph: validate → translate → format → deliver
+       ├─ deliver OK → message_events (delivered)
+       ├─ no pair → message_events (skipped)
+       ├─ no text → skip translate → format → deliver
+       └─ exception → LPUSH "messages:dlq"
 ```
 
-### Mini App — хаб управления
-
 ```
-/start → кнопка "Open Mini App" (всегда одинаково)
-  ↓
-Mini App GET /chat-pairs/:userId
-  ├─ wa_connected=false → QR-экран → после подключения → Home
-  ├─ Нет пар → QR → WA группы → Add bot → TG группа → sendData → Home
-  └─ Есть пары → Home:
-      ├─ Карточки пар (pause/resume/delete)
-      ├─ "Add new pair" → WA группы → Add bot → TG группа
-      └─ Инструкция-подсказка
+wa-service → Redis LPUSH "messages:in"               → processor (BRPOP)
+wa-service → Redis PUBLISH "onboarding:qr_scanned:*" → bot (PSUBSCRIBE, daemon thread)
+bot        → HTTP wa-service /connect/, /status/        (via http_client.py with retry)
+processor  → HTTP Telegram API send*                    (напрямую, без bot)
+analytics  → HTTP wa-service /health                    (мониторинг)
 ```
 
-wa-service endpoints для Mini App:
-- `GET /chat-pairs/:userId` — список пар + wa_connected
-- `PATCH /chat-pairs/:pairId` — pause/resume
-- `DELETE /chat-pairs/:pairId` — удаление
-- `GET /tg-groups/:userId` — TG группы из Redis (polling)
-- `POST /connect/:userId`, `GET /status/:userId` — WA подключение
-- `POST /disconnect/:userId` — уничтожить WA-клиент
-- `POST /reconnect/:userId` — пересоздать WA-клиент (полезно при зависших сессиях)
-- `GET /qr/image/:userId` — PNG QR-код (202 если клиент ещё стартует)
+processor и bot НЕ общаются — оба независимо → PostgreSQL + Telegram API.
 
-Mini App: `wa-service/public/miniapp.html` (Vanilla JS, Telegram WebApp SDK, требует HTTPS).
-wa-service DB: `wa-service/src/db.js` (pg Pool → Postgres, chat-pairs CRUD).
+## KEY FILES
 
-### Межсервисное взаимодействие
+### Config (все константы здесь, не хардкодить)
+- `processor/src/config.py` — env vars processor (timeouts, TTLs, Redis, DB, Telegram, alerting)
+- `wa-service/src/config.js` — env vars wa-service (Redis, DB, WA client, media, cache)
 
-```
-wa-service → Redis LPUSH "messages:in"                → processor (BRPOP)
-wa-service → Redis PUBLISH "onboarding:qr_scanned:*"  → bot (PSUBSCRIBE, daemon thread)
-bot        → HTTP GET/POST wa-service /connect/, /status/  (onboarding)
-processor  → HTTP POST Telegram API send*                (доставка, напрямую без bot)
-analytics  → HTTP GET wa-service /health               (мониторинг)
-analytics  → Telegram API sendMessage                  (алерты админам)
-```
+### Pipeline
+- `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
+- `processor/src/pipeline/graph.py` — LangGraph StateGraph
+- `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
+- `processor/src/pipeline/prompts.py` — prompt + PROMPT_VERSION + register_prompt()
+- `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
+- `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
+- `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
+- `processor/src/media_analyzer.py` — OpenAI GPT-4.1-mini vision + Whisper + PyPDF
+- `processor/src/feature_flags.py` — DB → Redis cache 60s → env fallback
+- `processor/src/db.py` — asyncpg pool (command_timeout=10)
 
-Processor и bot НЕ общаются напрямую — оба независимо ходят в PostgreSQL и Telegram API.
+### wa-service
+- `wa-service/src/whatsapp-client.js` — WA client manager (connect/disconnect/reconnect/health)
+- `wa-service/src/redis-publisher.js` — LPUSH messages:in + dedup + pub/sub
+- `wa-service/src/media-handler.js` — S3 upload
+- `wa-service/src/routes/index.js` — Express routes (Mini App API)
+- `wa-service/src/db.js` — pg Pool (statement_timeout=10000)
+- `wa-service/public/miniapp.html` — Vanilla JS Mini App (Telegram WebApp SDK, HTTPS)
 
-Bot использует shared HTTP-клиент (`bot/src/utils/http_client.py`) с connection pooling и retry (1 повтор через 2s на ConnectError/Timeout) для всех запросов к wa-service и processor. Не создавать `httpx.AsyncClient` напрямую в хэндлерах.
+### Bot
+- `bot/src/main.py` — python-telegram-bot setup + post_init
+- `bot/src/redis_sub.py` — daemon thread pub/sub (buffers events until bot ready)
+- `bot/src/utils/http_client.py` — shared httpx.AsyncClient + retry (1x, 2s delay)
+- `bot/src/onboarding/wizard.py` — /start + 5-step onboarding
+- `bot/src/handlers/translate.py` — direct text translation + media analysis in DM
+- `bot/src/handlers/analyze.py` — "Analyze" button callback
+- `bot/src/handlers/chats.py` — /chats, /add, /pause, /resume, /done
+- `bot/src/handlers/admin.py` — /users, /broadcast, /whitelist
+- `bot/src/db.py` — asyncpg pool (command_timeout=10)
 
-### Ключевые Redis-ключи
+### Analytics
+- `analytics/flows/` — 8 Prefect flows (local server mode, no Cloud)
+- `analytics/flows/chat_context_builder.py` — daily glossary/members/tone → chat_profiles (VPS only)
 
-| Ключ | Тип | TTL | Назначение |
-|------|-----|-----|------------|
-| `messages:in` | List | — | Очередь сообщений wa→processor |
-| `messages:dlq` | List | — | Dead-letter queue (failed pipeline messages) |
-| `dedup:msg:{wa_message_id}` | String | 5m | Дедупликация (SET NX) |
-| `onboarding:qr_scanned:{userId}` | Pub/Sub | — | WA подключён |
-| `chat_pairs:user:{uid}:chat:{chatId}` | String | 1h | Кэш пар чатов |
-| `translation:{lang}:{chat_pair_id}:{sha256(text)}` | String | 24h | Кэш переводов (пара-специфичный) |
-| `translation_global:{lang}:{sha256(text)}` | String | 24h | Глобальный кэш переводов (чаты без профиля) |
-| `chat_profile:{chat_pair_id}` | String | 1h | Кэш chat profile (glossary, members, tone) |
-| `bot:user_groups:{userId}` | Hash | 1h | TG группы пользователя (для Mini App polling) |
-| `ff:{flag_name}` | String | 60s | Feature flag cache (from `feature_flags` table) |
+## REDIS KEYS
 
-## Критические особенности
+| Key | Type | TTL | Use |
+|-----|------|-----|-----|
+| `messages:in` | List | — | WA→processor queue |
+| `messages:dlq` | List | — | Dead-letter queue |
+| `dedup:msg:{wa_message_id}` | String | 5m | Message dedup (SET NX) |
+| `onboarding:qr_scanned:{userId}` | Pub/Sub | — | WA connected event |
+| `chat_pairs:user:{uid}:chat:{chatId}` | String | 1h | Chat pairs cache |
+| `translation:{lang}:{pair_id}:{sha256}` | String | 24h | Translation cache (per-pair) |
+| `translation_global:{lang}:{sha256}` | String | 24h | Translation cache (no profile) |
+| `chat_profile:{pair_id}` | String | 1h | Chat profile cache |
+| `bot:user_groups:{userId}` | Hash | 1h | TG groups for Mini App |
+| `ff:{flag_name}` | String | 60s | Feature flag cache |
 
-### wa-service — только 1 инстанс
-whatsapp-web.js не поддерживает кластеризацию. Всегда `replicas: 1`. WA-сессии хранятся в `.wwebjs_auth/` (Docker volume `wa_sessions`). Chromium берётся системный (`/usr/bin/chromium`), не из npm. При пересоздании контейнера может остаться `SingletonLock` — удалить через volume:
-```bash
-docker compose stop wa-service
-docker run --rm -v bridge-v2_wa_sessions:/data alpine find /data -name SingletonLock -delete
-docker compose start wa-service
-```
+## PROCESSOR API
 
-wa-service порт 3000 **не опубликован наружу** — только `expose` внутри docker network. Доступ снаружи через nginx.
+| Method | Path | Feature flag | Purpose |
+|--------|------|-------------|---------|
+| GET | /health | — | Health check |
+| GET | /metrics | — | Counters: processed/failed/skipped/dlq |
+| GET | /events | — | SSE stream (pipeline events) |
+| GET | /dashboard | — | HTML dashboard |
+| GET | /api/config | — | Current config (no secrets) |
+| GET | /api/stats | — | User stats |
+| GET | /api/daily-stats | — | Today's counts |
+| GET | /api/reports?date= | — | Nightly problems + quality |
+| GET | /api/backlog | — | Open critical issues |
+| PATCH | /api/backlog/{id} | — | Resolve/wontfix issue |
+| GET | /api/dlq | — | DLQ messages (max 100) |
+| POST | /api/dlq/retry | — | Retry all DLQ → messages:in |
+| GET | /api/flags | — | Feature flags list |
+| PATCH | /api/flags/{name} | — | Toggle flag `{"enabled": bool}` |
+| GET | /api/costs?days= | — | LangSmith costs (15m cache) |
+| GET | /api/profiles | — | Chat profiles with glossaries |
+| POST | /translate | translation_enabled | Text translation |
+| POST | /analyze | media_analysis_enabled | Media analysis by event_id |
+| POST | /analyze-direct | media_analysis_enabled | Media analysis (file upload) |
 
-### Медиа-пайплайн
-wa-service загружает медиа в S3/MinIO (`uploadMedia()`), кладёт `media_s3_url`, `media_mime`, `media_filename` в payload. При ошибке загрузки — сообщение всё равно отправляется (без медиа, с текстом). Processor передаёт медиа-поля в state (`MessageState` в `models/message.py`). `telegram_sender.py` отправляет медиа нативно через Telegram API (sendPhoto/sendVideo/sendAudio/sendDocument) с fallback на текстовую ссылку. Медиа-ссылка **не** включается в `formatted_text` — формат текста всегда `*Sender*\n\noriginal\n\ntranslated`.
+## WA-SERVICE API
 
-Локально S3 заменён на **MinIO** (порт 9000, консоль 9001). Бакет `bridge-media` создаётся автоматически через `minio-init` сервис в docker-compose (`infra/minio-init.sh`).
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | /health | Health + activeClients + redis status |
+| GET | /chat-pairs/:userId | Pairs list + wa_connected |
+| PATCH | /chat-pairs/:pairId | Pause/resume |
+| DELETE | /chat-pairs/:pairId | Delete pair |
+| GET | /tg-groups/:userId | TG groups from Redis |
+| POST | /connect/:userId | Start WA client |
+| GET | /status/:userId | WA status + groups (15s timeout) |
+| POST | /disconnect/:userId | Destroy WA client |
+| POST | /reconnect/:userId | Recreate WA client |
+| GET | /qr/image/:userId | PNG QR (202 if starting) |
 
-### Media Analyzer
-`processor/src/media_analyzer.py` — анализ медиа через OpenAI:
-- `analyze_image()` — GPT-4.1-mini vision для описания изображений
-- `analyze_audio()` — Whisper для транскрипции аудио
-- `analyze_document()` — PyPDF для извлечения текста из PDF
+## FEATURE FLAGS
 
-Результат возвращается на `target_language` пользователя. Endpoint: `POST /analyze` (event_id, analysis_type, requested_by).
+DB table `feature_flags` → Redis cache `ff:{name}` (60s) → env var fallback.
+Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 
-### Bot — дополнительные хэндлеры
-- `handlers/translate.py` — прямой перевод текста и анализ медиа в личке бота:
-  - `handle_direct_text()` — текст → reply(⏳) → POST /translate → edit(только перевод). Оригинал юзера остаётся в чате (не удаляется). Reply содержит только перевод + metadata, без оригинала — чтобы избежать `Message_too_long` при длинных текстах.
-  - `handle_direct_media()` — фото/документ/аудио/голосовое/видео-кружок → reply(⏳) → download file → POST /analyze-direct (multipart) → edit(результат) → delete(user msg). При ошибке — НЕ удаляет.
-- `handlers/analyze.py` — callback handler для кнопки "Analyze" на медиа. Парсит `analyze:{event_id}`, вызывает `POST /analyze`.
+| Flag | Controls |
+|------|----------|
+| translation_enabled | POST /translate |
+| media_analysis_enabled | POST /analyze, /analyze-direct |
+| direct_chat_enabled | (reserved) |
+| admin_alerts_enabled | 401 + failure rate alerts to admins |
 
-### Processor — LangGraph pipeline
-Граф в `processor/src/pipeline/graph.py`. Узлы в `nodes.py`. Условная маршрутизация: нет пары → сразу deliver(failed), нет текста → skip translate. Промпт версионирован: `PROMPT_VERSION` в `prompts.py`. Fallback to admins при отсутствии пары работает только для admin users (ADMIN_TG_IDS).
+## DATABASE
 
-Pipeline использует `astream(state, stream_mode="updates")` — каждый узел эмитит события через `pipeline/events.py` (in-memory event bus с asyncio.Queue, deque history 50 events). SSE endpoint `/events` и ASCII-дашборд `/dashboard`.
+PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 
-Дашборд processor'а (`/dashboard`): realtime pipeline + users + analytics reports + critical backlog. API:
-- `GET /api/config` — текущая конфигурация (debug, без секретов)
-- `GET /api/stats` — статистика по пользователям (delivered/failed/avg_ms)
-- `GET /api/reports?date=YYYY-MM-DD` — nightly problems + translation quality из БД (default: today)
-- `GET /api/backlog` — открытые critical issues из persistent бэклога
-- `PATCH /api/backlog/{id}` — обновить статус (resolved/wontfix)
-- `GET /api/dlq` — список сообщений в dead-letter queue (до 100)
-- `POST /api/dlq/retry` — переместить все DLQ-сообщения обратно в `messages:in`
-- `GET /api/flags` — список feature flags
-- `PATCH /api/flags/{name}` — включить/выключить feature flag (`{"enabled": true/false}`)
-- `GET /api/costs` — LangSmith cost data (кэш 15 мин), fallback pricing для gpt-4.1-mini
-- `GET /api/daily-stats` — дневная статистика
-- `POST /translate` — перевод текста (text, user_id) → original, translated, target_language, translation_ms. Feature flag: `translation_enabled`
-- `POST /analyze` — анализ медиа по event_id из pipeline (event_id, analysis_type, requested_by). Feature flag: `media_analysis_enabled`
-- `POST /analyze-direct` — прямой анализ медиа из лички бота (multipart: file, user_id, mime_type, filename) → result_text, analysis_type, processing_ms. Feature flag: `media_analysis_enabled`
+| Migration | Tables |
+|-----------|--------|
+| 001 | users, chat_pairs, message_events, onboarding_sessions |
+| 002 | nightly_analysis_runs, detected_issues, translation_evaluations, prompt_suggestions |
+| 003 | prompt_registry |
+| 004 | issues_backlog |
+| 005 | weekly_insights, analytics_changelog |
+| 006 | delivery_status += 'skipped' |
+| 007 | media_analysis, message_events += tg_message_id |
+| 008 | direct_interactions |
+| 009 | chat_profiles, chat_profile_history (VPS only) |
+| 010 | daily_chat_summaries, chat_summary_schedule |
+| 011 | feature_flags |
 
-### Централизованная конфигурация
-Все константы (таймауты, TTL, лимиты) собраны в одном месте:
-- `processor/src/config.py` — все env vars с типизированными дефолтами для processor
-- `wa-service/src/config.js` — аналог для Node-сервиса
+## ANALYTICS FLOWS
 
-При добавлении нового хардкода — добавлять в config, не в код. Все потребители импортируют из config.
+| Flow | Cron | Model |
+|------|------|-------|
+| wa-health-check | */15 * * * * | — |
+| daily-cleanup | 0 3 * * * | — |
+| nightly-problems | 0 4 * * * | gpt-4.1-mini |
+| translation-quality | 30 4 * * * | gpt-4.1-mini |
+| chat-context-builder | 0 5 * * * | gpt-4.1 + web_search |
+| weekly-report | 0 5 * * 1 | o3 |
+| daily-chat-summary | */30 * * * * | gpt-4.1-mini |
 
-### Feature Flags
-`processor/src/feature_flags.py` — runtime-переключатели без деплоя. DB (`feature_flags` table) → Redis cache (60s) → env var fallback.
-Флаги: `translation_enabled`, `media_analysis_enabled`, `direct_chat_enabled`, `admin_alerts_enabled`.
-Управление: `PATCH /api/flags/{name}` с телом `{"enabled": false}`.
+## ONBOARDING FSM
 
-### Dead-Letter Queue
-При pipeline exception сообщение сохраняется в `messages:dlq` (Redis list) с payload + error + timestamp. Счётчик `dlq` в `/metrics`. API: `GET /api/dlq` (просмотр), `POST /api/dlq/retry` (повторная обработка всех).
-
-### Bot — смешанный sync/async
-python-telegram-bot в asyncio. Redis subscriber (`redis_sub.py`) — отдельный daemon thread. Коммуникация: `asyncio.run_coroutine_threadsafe(coro, bot_loop)`, где `bot_loop` захватывается в `main.py:post_init`.
-
-### Онбординг-состояния
 `idle → qr_pending → wa_connected → linking → done`
-Хранятся в `onboarding_sessions`. Мигрированные из v1 получают `done`. Bot /start всегда показывает описание + кнопку Mini App (независимо от состояния). При добавлении бота как admin в TG группу — автосообщение с кнопкой /add.
+Table: onboarding_sessions. /start always shows Mini App button.
 
-### Chat Context Builder
-`analytics/flows/chat_context_builder.py` (только на VPS) — ежедневно строит профили чатов для улучшения перевода:
-- **collect**: для чатов без профиля — берёт 90 дней, для остальных — 24ч (инкрементально)
-- **extract**: LLM (gpt-4.1 + web_search для верификации имён) извлекает delta: glossary (транслитерация Hebrew→target_lang), members (имена участников), mentioned_people (упоминаемые люди не из группы), recurring_topics, tone
-- **merge**: delta мержится в существующий профиль с сохранением истории в `chat_profile_history`
-- Профили из `chat_profiles` инжектируются в translation prompt — не переводить, а транслитерировать термины из глоссария
+## CONSTRAINTS
 
-### Analytics — Prefect flows
-7 flow в `analytics/flows/`. Запускается в **локальном режиме** (без Prefect Cloud) — `entrypoint.sh` стартует локальный Prefect Server на 4200, затем `serve_flows.py`. Dual-mode: без `PREFECT_API_URL` — локальный server, с ним — Prefect Cloud worker. Оба store_results делают UPSERT для `nightly_analysis_runs`, но дочерние таблицы (`detected_issues`, `translation_evaluations`, `prompt_suggestions`) — DELETE + INSERT при повторном запуске за тот же день. `nightly-problems` дополнительно копирует critical issues в `issues_backlog` (persistent, не перезаписывается).
+- wa-service: 1 replica only (whatsapp-web.js). Sessions in `.wwebjs_auth/` volume. System Chromium `/usr/bin/chromium`. SingletonLock cleanup needed on container recreate.
+- wa-service port 3000: expose-only, NOT published. Access via nginx.
+- Media format: `*Sender*\n\noriginal\n\ntranslated`. Media sent natively (sendPhoto/etc), NOT in formatted_text.
+- MinIO locally (9000/9001), bucket `bridge-media` auto-created via `infra/minio-init.sh`.
+- Bot: polling-based, NO health endpoint. Mixed sync/async — Redis sub in daemon thread, `asyncio.run_coroutine_threadsafe` for cross-thread.
+- QR events buffered in `redis_sub.py._pending_events` until bot ready, drained on `set_bot_app()`.
 
-| Flow | Cron | Модель | Назначение |
-|------|------|--------|------------|
-| `wa-health-check` | `*/15 * * * *` | — | Проверка wa-service |
-| `daily-cleanup` | `0 3 * * *` | — | Очистка старых данных (message_events > 90д, sessions > 7д, direct_interactions > 90д) |
-| `nightly-problems` | `0 4 * * *` | gpt-4.1-mini | Анализ проблем за 24h |
-| `translation-quality` | `30 4 * * *` | gpt-4.1-mini | Оценка качества переводов |
-| `chat-context-builder` | `0 5 * * *` | gpt-4.1 (+ web_search) | Глоссарий, имена участников, тон чата → `chat_profiles` |
-| `weekly-report` | `0 5 * * 1` | o3 | Еженедельный отчёт (с persistent memory в `weekly_insights`) |
-| `daily-chat-summary` | `*/30 * * * *` | gpt-4.1-mini | Ежедневные сводки по чатам в TG-группы (оптимальный час отправки per-chat) |
-| `export-to-bq` | ручной | — | Экспорт в BigQuery (требует GCP_SA_PATH) |
+## PRODUCTION
 
-## База данных
-
-PostgreSQL 16. Все операции через `asyncpg` (processor, bot) и `psycopg2` (analytics) без ORM.
-
-**001_initial_schema.sql** (4 таблицы):
-- `users` — tg_user_id unique, wa_connected, target_language, is_admin, is_active
-- `chat_pairs` — unique(user_id, wa_chat_id, tg_chat_id), status: active/paused
-- `message_events` — wa_message_id unique, ON CONFLICT DO UPDATE, delivery_status
-- `onboarding_sessions` — user_id PK, state FSM
-
-**002_llm_analysis.sql** (4 таблицы для analytics):
-- `nightly_analysis_runs` — unique(run_date, flow_type), jsonb summary
-- `detected_issues` — severity: critical/warning/info, acknowledged flag
-- `translation_evaluations` — quality/accuracy/naturalness scores 1-5
-- `prompt_suggestions` — status: pending/applied/rejected
-
-**003_prompt_registry.sql**:
-- `prompt_registry` — key PK, version, content. Processor регистрирует текущий промпт при старте (`register_prompt()` в `pipeline/prompts.py`)
-
-**004_issues_backlog.sql**:
-- `issues_backlog` — persistent бэклог critical issues. status: open/resolved/wontfix. Не перезаписывается при повторных nightly runs
-
-**005_weekly_insights.sql**:
-- `weekly_insights` — persistent memory для weekly-report (week_start UNIQUE, executive_summary, deep_analysis JSONB, recommendations JSONB)
-- `analytics_changelog` — лог изменений аналитики
-
-**006_delivery_status_skipped.sql**:
-- Добавляет статус `skipped` в `delivery_status` enum. Сообщения без chat_pair теперь `skipped` (ранее `failed`). Разделяет реальные ошибки от ожидаемых skip'ов в метриках.
-
-**007_media_analysis.sql**:
-- `media_analysis` — результаты анализа медиа (image/audio/document), связь с message_events
-- Добавляет `tg_message_id` в `message_events`
-
-**008_direct_interactions.sql**:
-- `direct_interactions` — трекинг прямых переводов и анализа медиа из личного чата бота. interaction_type: translation/media_analysis, status: completed/failed. Записывается из `/translate` и `/analyze-direct` endpoints processor'а. Включён в nightly/weekly отчёты и дашборд.
-
-**009_chat_profiles.sql** (только на VPS, отсутствует в локальном репо):
-- `chat_profiles` — per-chat профили: glossary, members, mentioned_people, recurring_topics, tone, chat_type. UNIQUE(chat_pair_id). Заполняется `chat-context-builder` flow, инжектируется в translation prompt.
-- `chat_profile_history` — история версий профилей (version, change_summary)
-
-**010_daily_chat_summaries.sql**:
-- `daily_chat_summaries` — ежедневные сводки по чатам (chat_pair_id + summary_date UNIQUE, summary_text, plans_extracted JSONB, sent, tg_message_id)
-- `chat_summary_schedule` — кэш оптимальных часов отправки (chat_pair_id PK, optimal_hour, mean_hour, std_hour, sample_size)
-
-**011_feature_flags.sql**:
-- `feature_flags` — runtime feature toggles (name PK, enabled BOOLEAN, updated_at). Seed: `media_analysis_enabled`, `translation_enabled`, `direct_chat_enabled`, `admin_alerts_enabled`
-
-## Production (VPS)
-
-- **Домен:** brdg.tools
-- **Сервер:** Ubuntu 24.04, 3.8GB RAM — `ssh bridge` (deploy@83.217.222.126)
-- **Деплой (на VPS нет git repo).** ВАЖНО: рабочий каталог `/home/deploy/bridge-v2/`, НЕ `~/bridge-v2/` (root home). `.env` лежит только там:
-  ```bash
-  rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' --exclude '.venv' ./ bridge:/home/deploy/bridge-v2/
-  ssh bridge "cd /home/deploy/bridge-v2 && docker compose build <сервис> && docker compose up -d <сервис>"
-  ssh bridge "cd /home/deploy/bridge-v2 && docker compose restart nginx"  # обязательно после up -d
-  ssh bridge "curl -s http://localhost:8000/health"  # processor (published port)
-  ssh bridge "docker exec bridge-v2-wa-service-1 node -e \"fetch('http://localhost:3000/health').then(r=>r.text()).then(console.log)\""  # wa-service (expose-only, проверять изнутри контейнера)
-  # bot не имеет health endpoint (polling-based), проверять через docker compose logs bot --tail 5
-  ```
-- **CI/CD:** GitHub Actions — `ci.yml` (lint/test/build на push/PR). `deploy.yml` устарел (AWS снесён 2026-02-27).
-- **Безопасность:** SSH по ключу, UFW (22/80/443), fail2ban
-- **LangSmith:** `LANGCHAIN_TRACING_V2=true`, проект `bridge-v2-prod`
-- **Формат Telegram-сообщений:** `*Sender*\n\noriginal\n\ntranslated` (медиа отправляется нативно как caption)
-- **Nginx:** reverse proxy в docker-compose. Basic auth (`.htpasswd`) для `/dashboard`, `/api/*`, `/events`. SSE `/events` настроен с `proxy_buffering off` и `proxy_read_timeout 86400s`. SSL через certbot (auto-renewal cron `0 3 * * *`).
-- **Логи:** json-file driver с ротацией `max-size: 10m, max-file: 3` на всех сервисах.
+- Domain: brdg.tools
+- Server: Ubuntu 24.04, 3.8GB RAM, `ssh bridge` (deploy@83.217.222.126)
+- Deploy dir: `/home/deploy/bridge-v2/` (NOT ~/bridge-v2/). `.env` only there.
+- Deploy: rsync → migrate SQL → docker compose build+up → restart nginx → health check
+- Health checks: processor `curl localhost:8000/health`, wa-service from inside container, bot via logs
+- CI: GitHub Actions `ci.yml` (lint/test/build)
+- Nginx: reverse proxy, basic auth for /dashboard /api/* /events, SSE proxy_buffering off
+- SSL: certbot, auto-renewal cron 0 3 * * *
+- Logs: json-file, max-size 10m, max-file 3
+- LangSmith: LANGCHAIN_TRACING_V2=true, project bridge-v2-prod
