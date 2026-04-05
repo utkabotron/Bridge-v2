@@ -331,14 +331,20 @@ async function handleIncomingMessage(userId, message, isEdited) {
   }
 
   let chatId, chatName;
-  try {
-    const chat = await message.getChat();
-    chatId = chat.id._serialized;
-    chatName = chat.name;
-  } catch (err) {
-    console.warn(`getChat() failed for message ${message.id._serialized}: ${err.message} — using fallback`);
+  if (message.from?.includes('@newsletter')) {
+    // Newsletter chats break getChat() in whatsapp-web.js — skip the call
     chatId = message.from;
     chatName = message._data?.subject || message._data?.notifyName || '';
+  } else {
+    try {
+      const chat = await message.getChat();
+      chatId = chat.id._serialized;
+      chatName = chat.name;
+    } catch (err) {
+      console.warn(`getChat() failed for message ${message.id._serialized}: ${err.message} — using fallback`);
+      chatId = message.from;
+      chatName = message._data?.subject || message._data?.notifyName || '';
+    }
   }
 
   // Try DB-backed chat pair lookup (with Redis cache)
