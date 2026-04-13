@@ -703,6 +703,19 @@ async def analyze_media(body: AnalyzeRequest):
     target_lang = event.get("target_language") or "Russian"
     msg_type = event.get("message_type", "")
 
+    # Check media analysis cache by file content hash
+    import hashlib as _hashlib
+    from .pipeline.cache import get_cached_media, set_cached_media
+    file_hash = _hashlib.sha256(content_bytes).hexdigest()
+    cached = await get_cached_media(file_hash, target_lang)
+    if cached:
+        logger.info("Media analysis cache hit for event %s (hash=%s…)", body.message_event_id, file_hash[:12])
+        await insert_media_analysis(
+            body.message_event_id, "cached", cached,
+            "completed", 0, body.requested_by,
+        )
+        return {"result_text": cached, "analysis_type": "cached", "processing_ms": 0}
+
     t0 = time.monotonic()
     analysis_type = "unknown"
     try:
@@ -719,6 +732,7 @@ async def analyze_media(body: AnalyzeRequest):
             return JSONResponse({"error": f"unsupported media type: {msg_type}"}, status_code=400)
 
         processing_ms = int((time.monotonic() - t0) * 1000)
+        await set_cached_media(file_hash, target_lang, result_text)
         await insert_media_analysis(
             body.message_event_id, analysis_type, result_text,
             "completed", processing_ms, body.requested_by,

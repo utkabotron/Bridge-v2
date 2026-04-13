@@ -295,8 +295,11 @@ def generate_suggestions(evaluations: list[dict], pending_suggestions: list[dict
 
     existing_block = ""
     if pending_suggestions:
-        items = "\n".join(f"- {s['suggestion'][:120]}" for s in pending_suggestions)
-        existing_block = f"\n\nAlready pending suggestions (do NOT suggest duplicates — skip anything substantively identical to the list below):\n{items}"
+        items = "\n".join(
+            f"- {s['suggestion'][:120]} (rationale: {s.get('rationale', '')[:80]})"
+            for s in pending_suggestions
+        )
+        existing_block = f"\n\nAlready pending suggestions (do NOT suggest duplicates — skip anything substantively identical to the list below, even if rephrased):\n{items}"
 
     system_prompt = f"""You are an expert in translation prompt engineering.
 Given the current translation prompt and real examples of poor translations,
@@ -410,10 +413,13 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
             ),
         )
 
-    # Store prompt suggestions (skip duplicates of pending suggestions)
+    # Store prompt suggestions (skip duplicates across all statuses within 30 days)
     for sug in suggestion_result.get("suggestions", []):
         cur.execute(
-            "SELECT 1 FROM prompt_suggestions WHERE status = 'pending' AND lower(suggestion) = lower(%s) LIMIT 1",
+            """SELECT 1 FROM prompt_suggestions
+               WHERE lower(suggestion) = lower(%s)
+                 AND created_at > now() - interval '30 days'
+               LIMIT 1""",
             (sug["suggestion"],),
         )
         if cur.fetchone():

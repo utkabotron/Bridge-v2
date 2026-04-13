@@ -163,8 +163,8 @@ def analyze_with_llm(stats: dict, open_issues: list[dict] | None = None) -> dict
 
     existing_block = ""
     if open_issues:
-        items = "\n".join(f"- {i['title']}: {i.get('description', '')[:120]}" for i in open_issues)
-        existing_block = f"\n\nAlready tracked open issues (do NOT generate duplicate issues for these — skip any issue substantively identical to one below):\n{items}"
+        items = "\n".join(f"- [{i.get('category', 'other')}] {i['title']}: {i.get('description', '')[:120]}" for i in open_issues)
+        existing_block = f"\n\nAlready tracked open issues (do NOT generate duplicate issues for these — skip any issue substantively identical to one below, even if rephrased):\n{items}"
 
     system_prompt = f"""You are a DevOps/SRE analyst for a WhatsApp→Telegram message bridge.
 Analyze the provided 24h statistics and identify issues that need attention.
@@ -274,12 +274,19 @@ def store_results(stats: dict, analysis: dict) -> int:
             ),
         )
 
-    # Copy critical issues to persistent backlog (skip duplicates by title)
+    # Copy critical issues to persistent backlog (skip duplicates by category+title or fuzzy title match)
     for issue in issues:
         if issue["severity"] == "critical":
+            # Extract first 10 words for fuzzy matching
+            first_10_words = " ".join(issue["title"].split()[:10])
             cur.execute(
-                "SELECT 1 FROM issues_backlog WHERE status = 'open' AND lower(title) = lower(%s) LIMIT 1",
-                (issue["title"],),
+                """SELECT 1 FROM issues_backlog
+                   WHERE status = 'open'
+                     AND lower(category) = lower(%s)
+                     AND (lower(title) = lower(%s)
+                          OR lower(title) LIKE '%%' || lower(%s) || '%%')
+                   LIMIT 1""",
+                (issue["category"], issue["title"], first_10_words),
             )
             if cur.fetchone():
                 logger.info("Skipping duplicate backlog issue: %s", issue["title"])
