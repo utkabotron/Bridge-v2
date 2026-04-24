@@ -156,14 +156,11 @@ async function createWhatsAppClient(userId) {
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html',
-    },
+    webVersionCache: { type: 'local' },
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      protocolTimeout: 30000, // 30s instead of default 180s — fail fast on hung Chromium
+      protocolTimeout: config.PUPPETEER_PROTOCOL_TIMEOUT,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',

@@ -19,7 +19,7 @@ module.exports = {
 
   // WhatsApp client
   MAX_CONCURRENT_CLIENTS: parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 10,
-  MAX_PARALLEL_INIT: parseInt(process.env.MAX_PARALLEL_INIT) || 3,
+  MAX_PARALLEL_INIT: parseInt(process.env.MAX_PARALLEL_INIT) || 1,
   QR_TIMEOUT_MS: parseInt(process.env.QR_TIMEOUT_MS) || 60 * 60 * 1000,
   RECONNECT_DELAYS: [5000, 15000, 45000],
   HEALTH_CHECK_INTERVAL: parseInt(process.env.HEALTH_CHECK_INTERVAL) || 30000,
@@ -27,7 +27,7 @@ module.exports = {
   MAX_MESSAGE_ERRORS: parseInt(process.env.MAX_MESSAGE_ERRORS) || 5,
   GET_CHATS_TIMEOUT: parseInt(process.env.GET_CHATS_TIMEOUT) || 15000,
   OLD_MESSAGE_THRESHOLD: parseInt(process.env.OLD_MESSAGE_THRESHOLD) || 120,
-  PUPPETEER_PROTOCOL_TIMEOUT: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT) || 30000,
+  PUPPETEER_PROTOCOL_TIMEOUT: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT) || 120000,
   SESSION_RESTORE_BATCH_DELAY: parseInt(process.env.SESSION_RESTORE_BATCH_DELAY) || 1000,
 
   // Message dedup
