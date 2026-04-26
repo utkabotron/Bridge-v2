@@ -47,4 +47,11 @@ async function deleteChatPair(pairId) {
   return rowCount > 0;
 }
 
-module.exports = { pool, getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair };
+async function setWaDisconnected(tgUserId) {
+  await pool.query(
+    'UPDATE users SET wa_connected = false WHERE tg_user_id = $1',
+    [tgUserId]
+  );
+}
+
+module.exports = { pool, getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, setWaDisconnected };

@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
+const { setWaDisconnected } = require('./db');
 const config = require('./config');
 
 // Map<userId:number, ClientData>
@@ -78,6 +79,9 @@ async function reconnectClient(userId, reason) {
   }
 
   console.error(`CRITICAL: All ${RECONNECT_DELAYS.length} reconnect attempts exhausted for user ${userId}. Session lost.`);
+  await setWaDisconnected(userId).catch((err) =>
+    console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+  );
 }
 
 // ── Periodic health check ─────────────────────────────────
@@ -205,6 +209,10 @@ async function createWhatsAppClient(userId) {
             console.error(`Failed to remove session dir ${sessionDir}: ${err.message}`);
           }
         }
+
+        setWaDisconnected(userId).catch((err) =>
+          console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+        );
       }, QR_TIMEOUT_MS);
     }
   });
@@ -253,6 +261,10 @@ async function createWhatsAppClient(userId) {
     }
 
     console.error(`User ${userId}: session lost after auth_failure, new QR scan required`);
+
+    setWaDisconnected(userId).catch((err) =>
+      console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+    );
   });
 
   client.on('disconnected', (reason) => {
