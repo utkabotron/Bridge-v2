@@ -51,6 +51,13 @@ beforeEach(() => {
 
 // ── GET /health ───────────────────────────────────────────
 
+describe('no-store cache headers', () => {
+  test('dynamic API responses are not cacheable', async () => {
+    const res = await request(app).get('/status/42');
+    expect(res.headers['cache-control']).toMatch(/no-store/);
+  });
+});
+
 describe('GET /health', () => {
   test('returns status ok with activeClients and redis', async () => {
     const res = await request(app).get('/health');

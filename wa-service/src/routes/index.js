@@ -7,6 +7,16 @@ const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExi
 
 const router = express.Router();
 
+// Dynamic API responses must never be cached. Telegram's WebView aggressively caches
+// GETs (ETag/304), which served a stale `wa_connected:false` / `isReady:false` long
+// after WhatsApp reconnected — forcing users back to the QR screen and blocking
+// "Add new pair". no-store guarantees the Mini App always sees fresh state.
+// (The /miniapp static file manages its own caching headers via res.sendFile.)
+router.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  next();
+});
+
 // ── Mini App ─────────────────────────────────────────────
 router.get('/miniapp', (req, res) => {
   res.sendFile('miniapp.html', { root: path.join(__dirname, '..', '..', 'public') });
