@@ -29,6 +29,13 @@ const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
 const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
 
+// Persistent recovery: capped backoff that NEVER gives up (unlike RECONNECT_DELAYS,
+// which exhausts after 3 tries). A transient DNS/network glitch at startup or
+// mid-session must not become a multi-week silent outage.
+const RECOVERY_BACKOFF = [30000, 60000, 120000, 300000]; // 30s, 1m, 2m, then 5m cap
+const recoveryState = new Map(); // uid -> { attempts, nextAttempt } for lost authenticated sessions
+const inProgress = new Set();    // uids with an in-flight (re)connect — prevents double Chromium
+
 function getClientId(userId) {
   return `user-${userId}`;
 }
@@ -92,47 +99,119 @@ async function destroyClient(client, userId) {
 // ── Reconnect with exponential backoff ────────────────────
 
 async function reconnectClient(userId, reason) {
-  for (let attempt = 0; attempt < RECONNECT_DELAYS.length; attempt++) {
-    const delay = RECONNECT_DELAYS[attempt];
-    console.log(`Reconnect attempt ${attempt + 1}/${RECONNECT_DELAYS.length} for user ${userId} in ${delay / 1000}s (reason: ${reason})`);
-    await new Promise((r) => setTimeout(r, delay));
+  // Don't run two (re)connects for the same user at once — the recovery loop and a
+  // disconnect handler can both fire. Whoever holds inProgress wins; the other skips.
+  if (inProgress.has(userId)) {
+    console.log(`Reconnect for user ${userId} skipped — connect already in progress`);
+    return;
+  }
+  inProgress.add(userId);
+  try {
+    for (let attempt = 0; attempt < RECONNECT_DELAYS.length; attempt++) {
+      const delay = RECONNECT_DELAYS[attempt];
+      console.log(`Reconnect attempt ${attempt + 1}/${RECONNECT_DELAYS.length} for user ${userId} in ${delay / 1000}s (reason: ${reason})`);
+      await new Promise((r) => setTimeout(r, delay));
 
-    // If someone else already reconnected this user, stop
-    const existing = clients.get(userId);
-    if (existing && existing.isReady) {
-      console.log(`User ${userId} already reconnected, skipping`);
-      return;
-    }
-
-    // Another create/reconnect is already bringing this user up — don't race it.
-    if (connecting.has(userId)) {
-      console.log(`User ${userId} reconnect already in progress, skipping`);
-      return;
-    }
-
-    // Destroy any stale (non-ready) client before recreating, so its Chromium exits
-    // and releases the SingletonLock instead of colliding with the new instance.
-    if (existing?.client) {
-      await destroyClient(existing.client, userId);
-    }
-    clients.delete(userId);
-    cleanupSessionLock(userId);
-
-    try {
-      const created = await createWhatsAppClient(userId);
-      if (created) {
-        console.log(`Reconnect successful for user ${userId} on attempt ${attempt + 1}`);
+      // If someone else already reconnected this user, stop
+      const existing = clients.get(userId);
+      if (existing && existing.isReady) {
+        console.log(`User ${userId} already reconnected, skipping`);
+        return;
       }
-      return;
+
+      // Another create/reconnect is already bringing this user up — don't race it.
+      if (connecting.has(userId)) {
+        console.log(`User ${userId} reconnect already in progress, skipping`);
+        return;
+      }
+
+      // Destroy any stale (non-ready) client before recreating, so its Chromium exits
+      // and releases the SingletonLock instead of colliding with the new instance.
+      if (existing?.client) {
+        await destroyClient(existing.client, userId);
+      }
+      clients.delete(userId);
+      cleanupSessionLock(userId);
+
+      try {
+        const created = await createWhatsAppClient(userId);
+        if (created) {
+          console.log(`Reconnect successful for user ${userId} on attempt ${attempt + 1}`);
+        }
+        return;
+      } catch (err) {
+        console.error(`Reconnect attempt ${attempt + 1} failed for user ${userId}: ${err.message}`);
+      }
+    }
+
+    // Fast retries exhausted — but the session is still authenticated on disk, so this
+    // is almost certainly transient. Mark the flag honest (disconnected) and hand off
+    // to the persistent recovery loop, which keeps retrying on a capped backoff forever.
+    console.error(`All ${RECONNECT_DELAYS.length} fast reconnect attempts exhausted for user ${userId} — handing off to recovery loop.`);
+    await setWaDisconnected(userId).catch((err) =>
+      console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+    );
+  } finally {
+    inProgress.delete(userId);
+  }
+}
+
+// ── Persistent session recovery ───────────────────────────
+// A session with an `.authenticated` marker on disk *should* be connected. If it has
+// no live client (failed restore at startup, exhausted fast reconnects, …), keep
+// retrying on a capped backoff — forever — so a transient glitch can't strand it.
+// Terminal losses (LOGOUT, auth_failure) remove the session dir, so they are excluded.
+
+function getAuthenticatedSessionUids() {
+  const authDir = '.wwebjs_auth';
+  if (!fs.existsSync(authDir)) return [];
+  const uids = [];
+  for (const dir of fs.readdirSync(authDir)) {
+    if (!dir.startsWith('user-') && !dir.startsWith('session-user-')) continue;
+    if (!fs.existsSync(path.join(authDir, dir, '.authenticated'))) continue;
+    const uid = parseInt(dir.replace('session-user-', '').replace('user-', ''));
+    if (!isNaN(uid)) uids.push(uid);
+  }
+  return uids;
+}
+
+function removeSessionDir(userId) {
+  const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
+  if (!fs.existsSync(sessionDir)) return;
+  try {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+    console.log(`Removed session dir: ${sessionDir}`);
+  } catch (err) {
+    console.error(`Failed to remove session dir ${sessionDir}: ${err.message}`);
+  }
+}
+
+async function recoverLostSessions() {
+  const now = Date.now();
+  for (const uid of getAuthenticatedSessionUids()) {
+    const existing = clients.get(uid);
+    if (existing && existing.isReady) { recoveryState.delete(uid); continue; } // healthy
+    if (existing) continue;            // initializing / QR-waiting — leave to health check
+    if (inProgress.has(uid)) continue; // a reconnect or recovery attempt already running
+
+    const state = recoveryState.get(uid) || { attempts: 0, nextAttempt: 0 };
+    if (now < state.nextAttempt) continue; // still backing off
+
+    inProgress.add(uid);
+    try {
+      console.warn(`Recovery: restoring lost session for user ${uid} (attempt ${state.attempts + 1})`);
+      await createWhatsAppClient(uid);
+      console.log(`Recovery: session restored for user ${uid}`);
+      recoveryState.delete(uid);
     } catch (err) {
-      console.error(`Reconnect attempt ${attempt + 1} failed for user ${userId}: ${err.message}`);
+      const attempts = state.attempts + 1;
+      const delay = RECOVERY_BACKOFF[Math.min(attempts - 1, RECOVERY_BACKOFF.length - 1)];
+      recoveryState.set(uid, { attempts, nextAttempt: Date.now() + delay });
+      console.error(`Recovery: failed for user ${uid} (attempt ${attempts}), retrying in ${delay / 1000}s: ${err.message}`);
+    } finally {
+      inProgress.delete(uid);
     }
   }
-
-  console.error(`CRITICAL: All ${RECONNECT_DELAYS.length} reconnect attempts exhausted for user ${userId}. Session lost.`);
-  await setWaDisconnected(userId).catch((err) =>
-    console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
-  );
 }
 
 // ── Periodic health check ─────────────────────────────────
@@ -181,6 +260,9 @@ function startHealthCheck() {
   healthCheckTimer = setInterval(() => {
     checkClientHealth().catch((err) =>
       console.error('Health check loop error:', err.message)
+    );
+    recoverLostSessions().catch((err) =>
+      console.error('Recovery loop error:', err.message)
     );
   }, HEALTH_CHECK_INTERVAL);
   console.log(`Session health check started (every ${HEALTH_CHECK_INTERVAL / 1000}s)`);
@@ -350,11 +432,13 @@ async function createWhatsAppClient(userId) {
     }
 
     // LOGOUT is terminal — the session is dead and requires a fresh QR scan. Reset the DB
-    // flag immediately instead of burning the whole reconnect ladder on a doomed session.
+    // flag and drop the session dir so the recovery loop won't keep retrying a doomed session.
     if (reason === 'LOGOUT') {
       setWaDisconnected(userId).catch((err) =>
         console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
       );
+      removeSessionDir(userId);
+      recoveryState.delete(userId);
       return;
     }
 
@@ -622,4 +706,15 @@ async function destroyAllClients() {
   console.log('All WhatsApp clients destroyed');
 }
 
-module.exports = { clients, connecting, createWhatsAppClient, restoreExistingSessions, destroyAllClients, stopHealthCheck };
+module.exports = {
+  clients,
+  connecting,
+  createWhatsAppClient,
+  restoreExistingSessions,
+  destroyAllClients,
+  stopHealthCheck,
+  recoverLostSessions,
+  getAuthenticatedSessionUids,
+  recoveryState,
+  inProgress,
+};

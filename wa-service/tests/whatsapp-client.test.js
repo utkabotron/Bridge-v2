@@ -43,6 +43,10 @@ const {
   clients,
   createWhatsAppClient,
   destroyAllClients,
+  recoverLostSessions,
+  getAuthenticatedSessionUids,
+  recoveryState,
+  inProgress,
 } = require('../src/whatsapp-client');
 
 // Event handlers are async (they await destroyClient before deleting the client from the
@@ -57,6 +61,8 @@ const flush = () => new Promise((r) => setImmediate(r));
 beforeEach(() => {
   jest.clearAllMocks();
   clients.clear();
+  recoveryState.clear();
+  inProgress.clear();
   mockInitialize.mockResolvedValue();
   mockDestroy.mockResolvedValue();
   mockGetState.mockResolvedValue('CONNECTED');
@@ -223,7 +229,7 @@ describe('reconnect behavior', () => {
     expect(mockInitialize).toHaveBeenCalledTimes(2);
   });
 
-  test('all attempts exhausted after failures', async () => {
+  test('fast attempts exhausted — hands off to recovery loop', async () => {
     const clientData = await createWhatsAppClient(42);
     const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
 
@@ -238,8 +244,10 @@ describe('reconnect behavior', () => {
     await jest.advanceTimersByTimeAsync(45000);
 
     expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining('CRITICAL')
+      expect.stringContaining('handing off to recovery loop')
     );
+    // inProgress must be released so the recovery loop can take over.
+    expect(inProgress.has(42)).toBe(false);
     consoleSpy.mockRestore();
   });
 
@@ -412,5 +420,74 @@ describe('destroyAllClients', () => {
 
     expect(clients.size).toBe(0);
     consoleSpy.mockRestore();
+  });
+});
+
+// ── Persistent session recovery ──────────────────────────
+
+describe('recoverLostSessions', () => {
+  // Pretend one authenticated session (user 42) exists on disk.
+  function mockAuthenticatedDisk(dirs = ['session-user-42']) {
+    fs.existsSync.mockImplementation(
+      (p) => p === '.wwebjs_auth' || String(p).endsWith('.authenticated')
+    );
+    fs.readdirSync.mockReturnValue(dirs);
+  }
+
+  test('getAuthenticatedSessionUids returns uids of marked sessions only', () => {
+    fs.existsSync.mockImplementation(
+      (p) => p === '.wwebjs_auth' || String(p).includes('session-user-42')
+    );
+    fs.readdirSync.mockReturnValue(['session-user-42', 'session-user-99', 'junk']);
+
+    expect(getAuthenticatedSessionUids()).toEqual([42]);
+  });
+
+  test('restores a lost authenticated session not in the client map', async () => {
+    mockAuthenticatedDisk();
+
+    await recoverLostSessions();
+
+    expect(mockInitialize).toHaveBeenCalledTimes(1);
+    expect(clients.has(42)).toBe(true);
+    expect(recoveryState.has(42)).toBe(false);
+  });
+
+  test('skips a session that is already connected and ready', async () => {
+    const clientData = await createWhatsAppClient(42);
+    clientData.isReady = true;
+    recoveryState.set(42, { attempts: 3, nextAttempt: 0 });
+    mockInitialize.mockClear();
+    mockAuthenticatedDisk();
+
+    await recoverLostSessions();
+
+    expect(mockInitialize).not.toHaveBeenCalled();
+    expect(recoveryState.has(42)).toBe(false); // cleared — it's healthy
+  });
+
+  test('backs off and does not give up after a failed attempt', async () => {
+    mockAuthenticatedDisk();
+    mockInitialize.mockRejectedValue(new Error('ERR_NAME_NOT_RESOLVED'));
+
+    await recoverLostSessions();
+
+    expect(clients.has(42)).toBe(false);
+    const state = recoveryState.get(42);
+    expect(state.attempts).toBe(1);
+    expect(state.nextAttempt).toBeGreaterThan(Date.now());
+
+    // Immediate second pass is skipped while backing off — no extra init attempt.
+    await recoverLostSessions();
+    expect(mockInitialize).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not retry a session already in progress', async () => {
+    mockAuthenticatedDisk();
+    inProgress.add(42);
+
+    await recoverLostSessions();
+
+    expect(mockInitialize).not.toHaveBeenCalled();
   });
 });
