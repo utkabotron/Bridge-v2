@@ -10,6 +10,11 @@ jest.mock('../src/redis-publisher', () => ({
 jest.mock('../src/media-handler', () => ({
   handleMedia: jest.fn(),
 }));
+jest.mock('../src/db', () => ({
+  setWaConnected: jest.fn().mockResolvedValue(true),
+  setWaDisconnected: jest.fn().mockResolvedValue(),
+  userExists: jest.fn().mockResolvedValue(true),
+}));
 
 // Mock whatsapp-web.js — Client extends EventEmitter so we can emit events
 // Variables prefixed with `mock` are allowed inside jest.mock factory
@@ -176,6 +181,23 @@ describe('disconnected handler', () => {
 
     expect(clients.has(42)).toBe(false);
     expect(clientData.isReady).toBe(false);
+  });
+
+  test('LOGOUT resets wa_connected and does not reconnect', async () => {
+    const { setWaDisconnected } = require('../src/db');
+    const clientData = await createWhatsAppClient(42);
+    const client = clientData.client;
+
+    mockInitialize.mockClear();
+    client.emit('disconnected', 'LOGOUT');
+    await Promise.resolve(); // flush the setWaDisconnected microtask
+
+    expect(setWaDisconnected).toHaveBeenCalledWith(42);
+    expect(clients.has(42)).toBe(false);
+
+    // No reconnect should be scheduled for a terminal LOGOUT.
+    jest.advanceTimersByTime(60000);
+    expect(mockInitialize).not.toHaveBeenCalled();
   });
 });
 

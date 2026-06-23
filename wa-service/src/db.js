@@ -31,6 +31,14 @@ async function getWaConnected(tgUserId) {
   return rows.length > 0 ? rows[0].wa_connected : false;
 }
 
+async function setWaConnected(tgUserId, connected) {
+  const { rowCount } = await pool.query(
+    'UPDATE users SET wa_connected = $1 WHERE tg_user_id = $2',
+    [connected, tgUserId]
+  );
+  return rowCount > 0;
+}
+
 async function setChatPairStatus(pairId, status) {
   const { rowCount } = await pool.query(
     'UPDATE chat_pairs SET status = $1 WHERE id = $2',
@@ -65,4 +73,4 @@ async function userExists(tgUserId) {
   return rows.length > 0;
 }
 
-module.exports = { pool, getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, setWaDisconnected, userExists };
+module.exports = { pool, getChatPairs, getWaConnected, setWaConnected, setChatPairStatus, deleteChatPair, setWaDisconnected, userExists };

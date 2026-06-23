@@ -349,7 +349,16 @@ async function createWhatsAppClient(userId) {
       return;
     }
 
-    // Auto-reconnect with exponential backoff
+    // LOGOUT is terminal — the session is dead and requires a fresh QR scan. Reset the DB
+    // flag immediately instead of burning the whole reconnect ladder on a doomed session.
+    if (reason === 'LOGOUT') {
+      setWaDisconnected(userId).catch((err) =>
+        console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+      );
+      return;
+    }
+
+    // Other reasons (NAVIGATION, network blips) — auto-reconnect with exponential backoff
     reconnectClient(userId, reason).catch(console.error);
   });
 
