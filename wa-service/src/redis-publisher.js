@@ -1,4 +1,5 @@
 const Redis = require('ioredis');
+const crypto = require('crypto');
 const {
   REDIS_HOST, REDIS_PORT, REDIS_DB,
   REDIS_RETRY_LIMIT, REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
@@ -25,15 +26,37 @@ redis.on('connect', () => console.log('Redis connected'));
 redis.on('error', (err) => console.error('Redis error:', err.message));
 
 /**
+ * Build a content-based dedup id for messages whose wa_message_id is missing.
+ * Uses user + chat + timestamp + body/media hash so genuine re-emits still collapse,
+ * but distinct messages get distinct keys instead of a shared "undefined".
+ */
+function fallbackDedupId(payload) {
+  const parts = [
+    payload.user_id,
+    payload.wa_chat_id,
+    payload.timestamp,
+    payload.body || '',
+    payload.media_s3_url || '',
+  ].join('|');
+  const hash = crypto.createHash('sha256').update(parts).digest('hex').slice(0, 16);
+  return `fallback:${hash}`;
+}
+
+/**
  * Push a WhatsApp message to the processor queue.
  * Processor does BRPOP on "messages:in".
  * Uses Redis SET NX to deduplicate — whatsapp-web.js can emit the same message twice.
  */
 async function publishMessage(payload) {
-  const dedupKey = `dedup:msg:${payload.wa_message_id}`;
+  // whatsapp-web.js can emit messages with an undefined id._serialized when its
+  // WhatsApp Web session drifts. Falling back to a constant "undefined" key would
+  // collapse every message into one dedup bucket and drop all but the first in the
+  // TTL window. Derive a stable per-message key from content instead.
+  const dedupId = payload.wa_message_id || fallbackDedupId(payload);
+  const dedupKey = `dedup:msg:${dedupId}`;
   const isNew = await redis.set(dedupKey, '1', 'EX', DEDUP_TTL, 'NX');
   if (!isNew) {
-    console.log(`Dedup: skipping duplicate message ${payload.wa_message_id}`);
+    console.log(`Dedup: skipping duplicate message ${dedupId}`);
     return;
   }
   // LPUSH first, then SET dedup key — if LPUSH fails, dedup key already set
