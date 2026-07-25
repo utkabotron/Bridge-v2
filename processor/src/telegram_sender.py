@@ -22,7 +22,39 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = TELEGRAM_BOT_TOKEN
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Telegram hard limits. Exceeding them returns a 400 that no retry recovers, so we split
+# up front instead of silently losing long messages / oversized media captions.
+TG_MAX_TEXT = 4096
+TG_MAX_CAPTION = 1024
+
 _client: Optional[httpx.AsyncClient] = None
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """Split text into <=limit chunks, preferring newline boundaries."""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            head, text = text[:limit], text[limit:]
+        else:
+            head, text = text[:cut], text[cut + 1:]  # drop the newline we split on
+        chunks.append(head)
+    chunks.append(text)
+    return chunks
+
+
+def _split_caption(caption: str) -> Tuple[str, Optional[str]]:
+    """Return (caption<=1024, overflow_text_or_None). Keeps media native; the remainder
+    is sent as a follow-up text message so nothing is lost."""
+    if len(caption) <= TG_MAX_CAPTION:
+        return caption, None
+    head = caption[:TG_MAX_CAPTION]
+    nl = head.rfind("\n")
+    if nl > TG_MAX_CAPTION // 2:  # avoid cutting mid-line when a reasonable break exists
+        head = head[:nl]
+    overflow = caption[len(head):].lstrip("\n")
+    return head, overflow
 
 
 def get_client() -> httpx.AsyncClient:
@@ -174,6 +206,20 @@ async def send_message(
 
 
 async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Send text, splitting into <=4096-char chunks. Returns the last chunk's result;
+    stops and reports the first failing chunk."""
+    if len(text) <= TG_MAX_TEXT:
+        return await _send_text_single(chat_id, text)
+
+    result: Tuple[bool, Optional[str], Optional[int]] = (True, None, None)
+    for chunk in _split_text(text, TG_MAX_TEXT):
+        result = await _send_text_single(chat_id, chunk)
+        if not result[0]:
+            return result  # abort on first failure
+    return result
+
+
+async def _send_text_single(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:
     r = await get_client().post(
         f"{BASE_URL}/sendMessage",
         json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
@@ -197,6 +243,31 @@ async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Opti
 
 
 async def _send_media_multipart(
+    endpoint: str,
+    field_name: str,
+    chat_id: int,
+    caption: str,
+    url: str,
+    media_filename: Optional[str] = None,
+    media_mime: Optional[str] = None,
+    reply_markup: Optional[dict] = None,
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Send media natively, splitting an over-long caption so the media stays native and
+    the caption remainder follows as a separate text message."""
+    caption, overflow = _split_caption(caption)
+    ok, err, msg_id = await _do_send_media(
+        endpoint, field_name, chat_id, caption, url, media_filename, media_mime, reply_markup,
+    )
+    if ok and overflow:
+        # best-effort — don't fail the media delivery if the overflow text errors
+        try:
+            await _send_text(chat_id, overflow)
+        except Exception as exc:
+            logger.warning("Failed to send caption overflow for chat %s: %s", chat_id, exc)
+    return ok, err, msg_id
+
+
+async def _do_send_media(
     endpoint: str,
     field_name: str,
     chat_id: int,

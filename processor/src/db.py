@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 
 _pool: Optional[asyncpg.Pool] = None
 
+# Counts persistence failures so silent DB-write breakage (like the July 15 message_events
+# freeze) surfaces in /metrics instead of hiding for days behind a swallowed exception.
+_db_write_failures = 0
+
+
+def get_db_write_failures() -> int:
+    return _db_write_failures
+
 
 async def get_pool() -> asyncpg.Pool:
     global _pool
@@ -124,11 +132,27 @@ async def insert_message_event(state: dict[str, Any], return_id: bool = False) -
         )
         if return_id:
             row = await pool.fetchrow(query, *params)
+            if row is None:
+                # Upsert matched an existing row whose WHERE guard blocked the update
+                # (already delivered) so RETURNING is empty. With unique per-message ids
+                # this should be rare; log it so a regression is visible.
+                logger.warning(
+                    "insert_message_event(return_id) affected 0 rows for wa_message_id=%s",
+                    state.get("wa_message_id"),
+                )
             return row["id"] if row else None
         else:
-            await pool.execute(query, *params)
+            status = await pool.execute(query, *params)
+            # asyncpg returns e.g. "INSERT 0 1"; a trailing 0 means nothing was written.
+            if status and status.rsplit(" ", 1)[-1] == "0":
+                logger.warning(
+                    "insert_message_event wrote 0 rows (status=%s) for wa_message_id=%s",
+                    status, state.get("wa_message_id"),
+                )
             return None
     except Exception as exc:
+        global _db_write_failures
+        _db_write_failures += 1
         logger.error("Failed to insert message_event: %s", exc)
         return None
 

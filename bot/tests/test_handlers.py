@@ -210,7 +210,8 @@ async def test_handle_direct_text_success():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
         await handle_direct_text(update, ctx)
 
     preview_msg.edit_text.assert_called_once()
@@ -231,7 +232,8 @@ async def test_handle_direct_text_processor_error():
     mock_resp.status_code = 500
     mock_resp.text = "Internal Server Error"
 
-    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
         await handle_direct_text(update, ctx)
 
     text = preview_msg.edit_text.call_args[0][0]
@@ -248,7 +250,8 @@ async def test_handle_direct_text_timeout():
     update.message.reply_text = AsyncMock(return_value=preview_msg)
     ctx = MagicMock()
 
-    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")):
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, side_effect=httpx.TimeoutException("timeout")), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
         await handle_direct_text(update, ctx)
 
     text = preview_msg.edit_text.call_args[0][0]

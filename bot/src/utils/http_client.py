@@ -29,6 +29,15 @@ def get_client() -> httpx.AsyncClient:
     return _client
 
 
+# Errors where the request provably never reached the server, so a retry cannot duplicate
+# a side effect. Safe to retry for any method.
+_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+# A read/pool timeout means the request may already be executing on the server. Retrying a
+# non-idempotent POST (e.g. /analyze, /translate) would double the LLM call and its writes,
+# so we only retry these for idempotent GETs.
+_READ_ERRORS = (httpx.ReadTimeout, httpx.PoolTimeout, httpx.WriteTimeout)
+
+
 async def request(
     method: str,
     url: str,
@@ -36,15 +45,23 @@ async def request(
     timeout: float | None = None,
     **kwargs: Any,
 ) -> httpx.Response:
-    """Make an HTTP request with 1 retry on ConnectError/TimeoutException."""
+    """Make an HTTP request with a single, method-aware retry.
+
+    - Connect errors (request never sent): retried for any method.
+    - Read/pool timeouts (request may be running): retried only for idempotent GET.
+    """
     client = get_client()
     req_kwargs = dict(**kwargs)
     if timeout is not None:
         req_kwargs["timeout"] = timeout
 
+    retriable = _CONNECT_ERRORS
+    if method.upper() in ("GET", "HEAD", "OPTIONS"):
+        retriable = _CONNECT_ERRORS + _READ_ERRORS
+
     try:
         return await client.request(method, url, **req_kwargs)
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+    except retriable as exc:
         logger.warning("HTTP %s %s failed (%s), retrying in %ds", method, url, exc, RETRY_DELAY)
         await asyncio.sleep(RETRY_DELAY)
         return await client.request(method, url, **req_kwargs)

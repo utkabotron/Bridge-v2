@@ -8,6 +8,7 @@ Starts two concurrent tasks:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -74,11 +75,19 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(consume_loop())
     logger.info("Processor started")
     yield
-    task.cancel()
+    # Graceful drain: ask the loop to stop after the current message, and give it time to
+    # finish an in-flight one (which runs under asyncio.shield). Only hard-cancel if it
+    # overruns, so a redeploy doesn't drop a message that was mid-pipeline.
+    _shutting_down.set()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
+        await asyncio.wait_for(task, timeout=BRPOP_TIMEOUT + 30)
+    except asyncio.TimeoutError:
+        logger.warning("Consumer loop did not drain in time — cancelling")
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Bridge v2 — Processor", version="2.0.0", lifespan=lifespan)
@@ -101,10 +110,21 @@ async def health():
 @app.get("/metrics")
 async def metrics():
     """Simple counters — replace with Prometheus if needed later."""
-    return {"processed": _counter["processed"], "failed": _counter["failed"], "skipped": _counter["skipped"], "dlq": _counter["dlq"]}
+    from .db import get_db_write_failures
+    return {
+        "processed": _counter["processed"],
+        "failed": _counter["failed"],
+        "skipped": _counter["skipped"],
+        "dlq": _counter["dlq"],
+        "db_write_failed": get_db_write_failures(),
+    }
 
 
 _counter = {"processed": 0, "failed": 0, "skipped": 0, "dlq": 0}
+
+# Set by lifespan on shutdown so consume_loop stops after the current message instead of
+# being cancelled mid-pipeline.
+_shutting_down = asyncio.Event()
 
 # ── 401 alert ────────────────────────────────────────────
 _unauth_times: deque = deque()  # timestamps of recent 401 errors
@@ -448,15 +468,22 @@ async def api_dlq_retry():
         db=REDIS_DB,
         decode_responses=True,
     )
+    # Atomic per item: pop from DLQ, unwrap the {"payload": ...} envelope, and requeue in
+    # one server-side script so a crash between pop and push can't lose the message.
+    lua = """
+    local item = redis.call('RPOP', KEYS[1])
+    if not item then return nil end
+    local payload = item
+    local ok, entry = pcall(cjson.decode, item)
+    if ok and type(entry) == 'table' and entry['payload'] ~= nil then
+      payload = cjson.encode(entry['payload'])
+    end
+    redis.call('LPUSH', KEYS[2], payload)
+    return 1
+    """
     try:
         count = 0
-        while True:
-            item = await r.rpop("messages:dlq")
-            if item is None:
-                break
-            entry = json.loads(item)
-            payload = entry.get("payload", entry)
-            await r.lpush("messages:in", json.dumps(payload, default=str))
+        while await r.eval(lua, 2, "messages:dlq", "messages:in") is not None:
             count += 1
         return {"retried": count}
     finally:
@@ -817,6 +844,181 @@ async def analyze_direct(
 NODES = ["validate", "translate", "format", "deliver"]
 
 
+def _surrogate_id(payload: dict) -> str:
+    """Stable id for a message whose wa_message_id is missing — mirrors the wa-service
+    content fallback so dedup and the message_events unique key stay coherent."""
+    raw = "|".join(str(payload.get(k, "")) for k in ("user_id", "wa_chat_id", "timestamp", "body"))
+    return "noid:" + hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+async def _dlq_push(r, payload, error: str) -> None:
+    """Envelope a message into the DLQ ({"payload": ...}) matching /api/dlq/retry."""
+    try:
+        entry = json.dumps({
+            "payload": payload,
+            "error": error,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }, default=str)
+        await r.lpush("messages:dlq", entry)
+        _counter["dlq"] += 1
+    except Exception as dlq_exc:
+        logger.error("Failed to push to DLQ: %s", dlq_exc)
+
+
+async def _process_message(r, raw: str) -> None:
+    """Handle one popped message end-to-end. Any failure routes the message to the DLQ so
+    that BRPOP's destructive read can never silently lose it."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        # Unparseable — can't envelope as payload; store the raw string for inspection.
+        logger.error("Invalid JSON in messages:in: %s", exc)
+        try:
+            await r.lpush("messages:dlq", json.dumps({"raw": raw, "error": str(exc)}))
+        except Exception as dlq_exc:
+            logger.error("Failed to push malformed message to DLQ: %s", dlq_exc)
+        return
+
+    try:
+        try:
+            user_id = int(payload.get("user_id") or 0)
+        except (TypeError, ValueError):
+            user_id = 0
+
+        wa_message_id = payload.get("wa_message_id") or _surrogate_id(payload)
+
+        state = {
+            "wa_message_id": wa_message_id,
+            "wa_chat_id": payload.get("wa_chat_id", ""),
+            "wa_chat_name": payload.get("wa_chat_name", ""),
+            "user_id": user_id,
+            "sender_name": payload.get("sender_name", ""),
+            "original_text": payload.get("body", ""),
+            "message_type": payload.get("message_type", "text"),
+            "media_s3_url": payload.get("media_s3_url"),
+            "media_mime": payload.get("media_mime"),
+            "media_filename": payload.get("media_filename"),
+            "timestamp": payload.get("timestamp", 0),
+            "from_me": payload.get("from_me", False),
+            "is_edited": payload.get("is_edited", False),
+            # Will be resolved by validate node
+            "chat_pair_id": None,
+            "tg_chat_id": None,
+            "target_language": TARGET_LANGUAGE,
+            "translated_text": None,
+            "translation_ms": None,
+            "cache_hit": False,
+            "formatted_text": None,
+            "delivery_status": "pending",
+            "error": None,
+        }
+
+        # ── DB dedup: skip if already delivered ──
+        # A dedup-lookup failure (DB down/timeout) must NOT drop the message — process it.
+        try:
+            pool = await get_pool()
+            existing = await pool.fetchval(
+                "SELECT delivery_status FROM message_events WHERE wa_message_id = $1",
+                wa_message_id,
+            )
+            if existing == "delivered":
+                _counter["skipped"] += 1
+                logger.info("Dedup skip: %s already delivered", wa_message_id)
+                return
+        except Exception as dexc:
+            logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, dexc)
+
+        msg_id = wa_message_id[:12]
+        sender = state["sender_name"] or "unknown"
+        text_preview = (state["original_text"] or "")[:60]
+
+        emit("message_received", {
+            "msg_id": msg_id,
+            "sender": sender,
+            "text": text_preview,
+            "chat": state["wa_chat_name"],
+        })
+    except Exception as exc:
+        # Failure in parse/build/dedup/emit — the popped message would otherwise vanish.
+        _counter["failed"] += 1
+        logger.error("Pre-pipeline error for %s: %s", payload.get("wa_message_id"), exc)
+        await _dlq_push(r, payload, str(exc))
+        return
+
+    try:
+        final_state = None
+        t0 = time.monotonic()
+
+        async for chunk in pipeline.astream(state, stream_mode="updates"):
+            for node_name, node_output in chunk.items():
+                elapsed = int((time.monotonic() - t0) * 1000)
+                evt = {
+                    "msg_id": msg_id,
+                    "node": node_name,
+                    "elapsed_ms": elapsed,
+                    "status": node_output.get("delivery_status", "ok"),
+                    "error": node_output.get("error"),
+                }
+                if node_name == "validate":
+                    evt["chat_pair_id"] = node_output.get("chat_pair_id")
+                    evt["tg_chat_id"] = node_output.get("tg_chat_id")
+                    evt["target_lang"] = node_output.get("target_language")
+                    evt["msg_type"] = node_output.get("message_type", "text")
+                elif node_name == "translate":
+                    evt["cache_hit"] = node_output.get("cache_hit")
+                    evt["translation_ms"] = node_output.get("translation_ms")
+                    orig = (node_output.get("original_text") or "")[:40]
+                    trans = (node_output.get("translated_text") or "")[:40]
+                    evt["original"] = orig
+                    evt["translated"] = trans
+                elif node_name == "format":
+                    fmt = (node_output.get("formatted_text") or "")[:80]
+                    evt["preview"] = fmt
+                    evt["text_len"] = len(node_output.get("formatted_text") or "")
+                elif node_name == "deliver":
+                    evt["tg_chat_id"] = node_output.get("tg_chat_id")
+                    evt["delivery_status"] = node_output.get("delivery_status")
+                emit("node_done", evt)
+                final_state = node_output
+
+        if final_state and final_state.get("delivery_status") == "delivered":
+            _counter["processed"] += 1
+            total_ms = int((time.monotonic() - t0) * 1000)
+            emit("message_delivered", {
+                "msg_id": msg_id,
+                "total_ms": total_ms,
+                "cache_hit": final_state.get("cache_hit"),
+            })
+            _track_delivery(failed=False)
+            logger.info(
+                "Delivered %s (lang=%s, cache=%s, ms=%s)",
+                wa_message_id,
+                final_state.get("target_language"),
+                final_state.get("cache_hit"),
+                final_state.get("translation_ms"),
+            )
+        elif final_state and final_state.get("delivery_status") == "skipped":
+            _counter["skipped"] += 1
+            emit("message_skipped", {
+                "msg_id": msg_id,
+                "error": final_state.get("error", "no_chat_pair"),
+            })
+            logger.debug("Skipped %s: %s", wa_message_id, final_state.get("error"))
+        else:
+            _counter["failed"] += 1
+            err = final_state.get("error") if final_state else "no_output"
+            _track_delivery(failed=True)
+            if err == "401_UNAUTHORIZED":
+                _track_unauth_error()
+            emit("message_failed", {"msg_id": msg_id, "error": err})
+            logger.warning("Failed %s: %s", wa_message_id, err)
+    except Exception as exc:
+        _counter["failed"] += 1
+        emit("message_failed", {"msg_id": msg_id, "error": str(exc)})
+        logger.error("Pipeline error for %s: %s", wa_message_id, exc)
+        await _dlq_push(r, payload, str(exc))
+
+
 async def consume_loop():
     r = aioredis.Redis(
         host=REDIS_HOST,
@@ -827,163 +1029,34 @@ async def consume_loop():
 
     logger.info("Consumer loop started — waiting for messages:in")
 
-    while True:
+    while not _shutting_down.is_set():
+        raw = None
         try:
             result = await r.brpop("messages:in", timeout=BRPOP_TIMEOUT)
             if result is None:
                 continue  # timeout — loop again
-
             _, raw = result
-            payload = json.loads(raw)
-
-            # Build initial state from the wa-service payload
-            state = {
-                "wa_message_id": payload.get("wa_message_id", ""),
-                "wa_chat_id": payload.get("wa_chat_id", ""),
-                "wa_chat_name": payload.get("wa_chat_name", ""),
-                "user_id": int(payload.get("user_id", 0)),
-                "sender_name": payload.get("sender_name", ""),
-                "original_text": payload.get("body", ""),
-                "message_type": payload.get("message_type", "text"),
-                "media_s3_url": payload.get("media_s3_url"),
-                "media_mime": payload.get("media_mime"),
-                "media_filename": payload.get("media_filename"),
-                "timestamp": payload.get("timestamp", 0),
-                "from_me": payload.get("from_me", False),
-                "is_edited": payload.get("is_edited", False),
-                # Will be resolved by validate node
-                "chat_pair_id": None,
-                "tg_chat_id": None,
-                "target_language": TARGET_LANGUAGE,
-                "translated_text": None,
-                "translation_ms": None,
-                "cache_hit": False,
-                "formatted_text": None,
-                "delivery_status": "pending",
-                "error": None,
-            }
-
-            # ── DB dedup: skip if already delivered ──
-            wa_msg_id = state["wa_message_id"]
-            if wa_msg_id:
-                pool = await get_pool()
-                existing = await pool.fetchval(
-                    "SELECT delivery_status FROM message_events WHERE wa_message_id = $1",
-                    wa_msg_id,
-                )
-                if existing == "delivered":
-                    _counter["skipped"] += 1
-                    logger.info("Dedup skip: %s already delivered", wa_msg_id)
-                    continue
-
-            msg_id = state["wa_message_id"][:12]
-            sender = state["sender_name"] or "unknown"
-            text_preview = (state["original_text"] or "")[:60]
-
-            emit("message_received", {
-                "msg_id": msg_id,
-                "sender": sender,
-                "text": text_preview,
-                "chat": state["wa_chat_name"],
-            })
-
-            try:
-                final_state = None
-                t0 = time.monotonic()
-
-                async for chunk in pipeline.astream(state, stream_mode="updates"):
-                    for node_name, node_output in chunk.items():
-                        elapsed = int((time.monotonic() - t0) * 1000)
-                        evt = {
-                            "msg_id": msg_id,
-                            "node": node_name,
-                            "elapsed_ms": elapsed,
-                            "status": node_output.get("delivery_status", "ok"),
-                            "error": node_output.get("error"),
-                        }
-                        if node_name == "validate":
-                            evt["chat_pair_id"] = node_output.get("chat_pair_id")
-                            evt["tg_chat_id"] = node_output.get("tg_chat_id")
-                            evt["target_lang"] = node_output.get("target_language")
-                            evt["msg_type"] = node_output.get("message_type", "text")
-                        elif node_name == "translate":
-                            evt["cache_hit"] = node_output.get("cache_hit")
-                            evt["translation_ms"] = node_output.get("translation_ms")
-                            orig = (node_output.get("original_text") or "")[:40]
-                            trans = (node_output.get("translated_text") or "")[:40]
-                            evt["original"] = orig
-                            evt["translated"] = trans
-                        elif node_name == "format":
-                            fmt = (node_output.get("formatted_text") or "")[:80]
-                            evt["preview"] = fmt
-                            evt["text_len"] = len(node_output.get("formatted_text") or "")
-                        elif node_name == "deliver":
-                            evt["tg_chat_id"] = node_output.get("tg_chat_id")
-                            evt["delivery_status"] = node_output.get("delivery_status")
-                        emit("node_done", evt)
-                        final_state = node_output
-
-                if final_state and final_state.get("delivery_status") == "delivered":
-                    _counter["processed"] += 1
-                    total_ms = int((time.monotonic() - t0) * 1000)
-                    emit("message_delivered", {
-                        "msg_id": msg_id,
-                        "total_ms": total_ms,
-                        "cache_hit": final_state.get("cache_hit"),
-                    })
-                    _track_delivery(failed=False)
-                    logger.info(
-                        "Delivered %s (lang=%s, cache=%s, ms=%s)",
-                        state["wa_message_id"],
-                        final_state.get("target_language"),
-                        final_state.get("cache_hit"),
-                        final_state.get("translation_ms"),
-                    )
-                elif final_state and final_state.get("delivery_status") == "skipped":
-                    _counter["skipped"] += 1
-                    emit("message_skipped", {
-                        "msg_id": msg_id,
-                        "error": final_state.get("error", "no_chat_pair"),
-                    })
-                    logger.debug(
-                        "Skipped %s: %s",
-                        state["wa_message_id"],
-                        final_state.get("error"),
-                    )
-                else:
-                    _counter["failed"] += 1
-                    err = final_state.get("error") if final_state else "no_output"
-                    _track_delivery(failed=True)
-                    if err == "401_UNAUTHORIZED":
-                        _track_unauth_error()
-                    emit("message_failed", {
-                        "msg_id": msg_id,
-                        "error": err,
-                    })
-                    logger.warning(
-                        "Failed %s: %s",
-                        state["wa_message_id"],
-                        err,
-                    )
-            except Exception as exc:
-                _counter["failed"] += 1
-                _counter["dlq"] += 1
-                emit("message_failed", {"msg_id": msg_id, "error": str(exc)})
-                logger.error("Pipeline error for %s: %s", state.get("wa_message_id"), exc)
-                try:
-                    dlq_entry = json.dumps({
-                        "payload": payload, "error": str(exc),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }, default=str)
-                    await r.lpush("messages:dlq", dlq_entry)
-                except Exception as dlq_exc:
-                    logger.error("Failed to push to DLQ: %s", dlq_exc)
-
-        except json.JSONDecodeError as exc:
-            logger.error("Invalid JSON in messages:in: %s", exc)
+            # Shield so a shutdown cancel can't interrupt a message we've already popped
+            # from Redis — it finishes (or DLQs) before the loop exits.
+            await asyncio.shield(_process_message(r, raw))
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error("Consumer loop error: %s", exc)
-            await asyncio.sleep(2)
+            # Backstop: if we popped a message but blew up outside _process_message's own
+            # handling, DLQ the raw item rather than lose it.
+            if raw is not None:
+                try:
+                    await r.lpush("messages:dlq", json.dumps({"raw": raw, "error": str(exc)}))
+                except Exception:
+                    pass
+            await asyncio.sleep(1)
+
+    try:
+        await r.aclose()
+    except Exception:
+        pass
+    logger.info("Consumer loop stopped (graceful)")
 
 
 # ── Dashboard HTML (loaded from external file) ──────────

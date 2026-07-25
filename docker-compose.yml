@@ -9,8 +9,10 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # Bind to loopback only. Redis has no auth; on a public-IP VPS an open 6379 lets anyone
+    # FLUSHALL the whole pipeline. Containers reach it over the compose network by name.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -29,8 +31,10 @@ services:
       POSTGRES_DB: bridge
       TZ: Asia/Jerusalem
       PGTZ: Asia/Jerusalem
+    # Loopback only — the DB (weak bridge:bridge creds) must not be reachable from the
+    # public internet. Services connect over the compose network via the `postgres` host.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/migrations:/docker-entrypoint-initdb.d
@@ -46,8 +50,10 @@ services:
     logging: *default-logging
     command: server /data --console-address ":9001"
     ports:
+      # 9000 (S3 API) stays public — Telegram fetches media via the URL fallback path.
       - "9000:9000"
-      - "9001:9001"
+      # Admin console is loopback only — no reason to expose it to the internet.
+      - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: bridge
       MINIO_ROOT_PASSWORD: bridgeminio

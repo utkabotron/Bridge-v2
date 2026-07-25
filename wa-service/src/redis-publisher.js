@@ -2,7 +2,7 @@ const Redis = require('ioredis');
 const crypto = require('crypto');
 const {
   REDIS_HOST, REDIS_PORT, REDIS_DB,
-  REDIS_RETRY_LIMIT, REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
+  REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
   DEDUP_TTL, CHAT_PAIRS_CACHE_TTL,
 } = require('./config');
 
@@ -10,25 +10,42 @@ const redis = new Redis({
   host: REDIS_HOST,
   port: REDIS_PORT,
   db: REDIS_DB,
+  // NEVER give up: returning null puts ioredis into a terminal "end" state and it
+  // never reconnects — the single wa-service replica would then silently drop every
+  // message until a manual restart. Retry forever with a capped backoff instead.
   retryStrategy: (times) => {
-    if (times > REDIS_RETRY_LIMIT) {
-      console.error(`Redis: failed after ${REDIS_RETRY_LIMIT} retries`);
-      return null;
-    }
     const delay = Math.min(times * REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX);
-    console.warn(`Redis: retry attempt ${times}/${REDIS_RETRY_LIMIT} in ${delay}ms`);
+    if (times % 20 === 1) {
+      console.warn(`Redis: reconnect attempt ${times}, next in ${delay}ms`);
+    }
     return delay;
   },
+  maxRetriesPerRequest: null, // don't fail in-flight commands during a reconnect
   lazyConnect: false,
 });
 
 redis.on('connect', () => console.log('Redis connected'));
 redis.on('error', (err) => console.error('Redis error:', err.message));
 
+// Atomic dedup + enqueue: SET NX and LPUSH run server-side in one script, so either
+// both happen or neither does. This closes the crash-between-two-commands window that
+// could otherwise leave a dedup marker set while the message never reached the queue
+// (permanent loss), and it never double-pushes a genuine duplicate.
+// Returns 1 if enqueued, 0 if it was a duplicate.
+const DEDUP_ENQUEUE_LUA = `
+if redis.call('SET', KEYS[1], '1', 'EX', tonumber(ARGV[1]), 'NX') then
+  redis.call('LPUSH', KEYS[2], ARGV[2])
+  return 1
+else
+  return 0
+end`;
+
 /**
  * Build a content-based dedup id for messages whose wa_message_id is missing.
- * Uses user + chat + timestamp + body/media hash so genuine re-emits still collapse,
+ * Uses user + chat + timestamp + body hash so genuine re-emits still collapse,
  * but distinct messages get distinct keys instead of a shared "undefined".
+ * Edits get their own namespace so an edit is never dropped as a duplicate of
+ * the original message it revises.
  */
 function fallbackDedupId(payload) {
   const parts = [
@@ -36,7 +53,7 @@ function fallbackDedupId(payload) {
     payload.wa_chat_id,
     payload.timestamp,
     payload.body || '',
-    payload.media_s3_url || '',
+    payload.media_mime || '',
   ].join('|');
   const hash = crypto.createHash('sha256').update(parts).digest('hex').slice(0, 16);
   return `fallback:${hash}`;
@@ -45,23 +62,32 @@ function fallbackDedupId(payload) {
 /**
  * Push a WhatsApp message to the processor queue.
  * Processor does BRPOP on "messages:in".
- * Uses Redis SET NX to deduplicate — whatsapp-web.js can emit the same message twice.
+ *
+ * The dedup id is written back into payload.wa_message_id so it is the SINGLE source
+ * of truth: the Redis dedup key, the processor's DB dedup, and the message_events
+ * UNIQUE key all use the same stable per-message id. Before this, a missing
+ * id._serialized (whatsapp-web.js session drift) reached the processor as "" and
+ * collapsed every such message into one message_events row (media silently undelivered).
  */
 async function publishMessage(payload) {
-  // whatsapp-web.js can emit messages with an undefined id._serialized when its
-  // WhatsApp Web session drifts. Falling back to a constant "undefined" key would
-  // collapse every message into one dedup bucket and drop all but the first in the
-  // TTL window. Derive a stable per-message key from content instead.
-  const dedupId = payload.wa_message_id || fallbackDedupId(payload);
-  const dedupKey = `dedup:msg:${dedupId}`;
-  const isNew = await redis.set(dedupKey, '1', 'EX', DEDUP_TTL, 'NX');
-  if (!isNew) {
-    console.log(`Dedup: skipping duplicate message ${dedupId}`);
-    return;
+  let dedupId = payload.wa_message_id || fallbackDedupId(payload);
+  // Edits share the original message id — give them a distinct id so they are neither
+  // dropped by dedup nor mistaken for the original in the DB.
+  if (payload.is_edited) {
+    const bodyHash = crypto.createHash('sha256')
+      .update(payload.body || '').digest('hex').slice(0, 12);
+    dedupId = `${dedupId}:edit:${bodyHash}`;
   }
-  // LPUSH first, then SET dedup key — if LPUSH fails, dedup key already set
-  // but duplicate processing is safer than message loss (processor deduplicates by DB)
-  await redis.lpush('messages:in', JSON.stringify(payload));
+  payload.wa_message_id = dedupId;
+
+  const dedupKey = `dedup:msg:${dedupId}`;
+  const enqueued = await redis.eval(
+    DEDUP_ENQUEUE_LUA, 2, dedupKey, 'messages:in',
+    DEDUP_TTL, JSON.stringify(payload),
+  );
+  if (enqueued === 0) {
+    console.log(`Dedup: skipping duplicate message ${dedupId}`);
+  }
 }
 
 /**
@@ -99,4 +125,4 @@ async function setChatPairsCache(userId, chatId, data) {
   }
 }
 
-module.exports = { redis, publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache };
+module.exports = { redis, publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache, fallbackDedupId };

@@ -25,6 +25,7 @@ jest.mock('../src/db', () => ({
   getWaConnected: jest.fn(),
   setChatPairStatus: jest.fn(),
   deleteChatPair: jest.fn(),
+  userExists: jest.fn(),
 }));
 
 // QRCode mock (avoids real PNG generation in tests)
@@ -32,7 +33,7 @@ jest.mock('qrcode', () => ({
   toBuffer: jest.fn().mockResolvedValue(Buffer.from('fake-png')),
 }));
 
-const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair } = require('../src/db');
+const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../src/db');
 const { createWhatsAppClient } = require('../src/whatsapp-client');
 const router = require('../src/routes/index');
 
@@ -43,6 +44,9 @@ app.use('/', router);
 beforeEach(() => {
   jest.clearAllMocks();
   mockClients.clear();
+  // Default: caller is a known/active user so the whitelist gate on client-creating
+  // routes (/connect, /reconnect, /qr/image) passes. Individual tests can override.
+  userExists.mockResolvedValue(true);
 });
 
 // ── GET /health ───────────────────────────────────────────

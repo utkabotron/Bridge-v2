@@ -36,6 +36,14 @@ async def cb_analyze_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     requested_by = query.from_user.id if query.from_user else 0
 
+    # Ownership: the Analyze button lives in the group the media was delivered to, so a
+    # legitimate press comes from that chat. Reject a callback whose event belongs to a
+    # different chat (cross-tenant media leak + LLM cost).
+    from ..db import event_in_chat
+    if query.message and not await event_in_chat(event_id, query.message.chat_id):
+        await query.answer("Not allowed", show_alert=True)
+        return
+
     # Instant feedback
     await query.answer("Analyzing...")
 

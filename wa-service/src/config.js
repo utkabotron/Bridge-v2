@@ -38,8 +38,9 @@ module.exports = {
 
   // Media
   MAX_FILE_SIZE: parseInt(process.env.MAX_FILE_SIZE) || 50 * 1024 * 1024,
+  MAX_CONCURRENT_MEDIA: parseInt(process.env.MAX_CONCURRENT_MEDIA) || 2,
 
   // S3/MinIO
-  S3_BUCKET: process.env.S3_BUCKET || 'bridge-v2-media',
+  S3_BUCKET: process.env.S3_BUCKET || 'bridge-media',
   S3_PUBLIC_URL: process.env.S3_PUBLIC_URL || 'http://localhost:9000',
 };

@@ -14,6 +14,12 @@ const config = require('./config');
 // Map<userId:number, ClientData>
 const clients = new Map();
 
+// Per-user lock: userIds with a create/reconnect currently in flight. A synchronous
+// guard (checked/added before the first await) prevents two concurrent reconnect loops
+// (e.g. health check + 'disconnected') from racing on the same session and spawning a
+// second Chromium on the same auth dir.
+const connecting = new Set();
+
 const MAX_CONCURRENT_CLIENTS = config.MAX_CONCURRENT_CLIENTS;
 const MAX_PARALLEL_INIT = config.MAX_PARALLEL_INIT;
 const QR_TIMEOUT_MS = config.QR_TIMEOUT_MS;
@@ -21,9 +27,14 @@ const RECONNECT_DELAYS = config.RECONNECT_DELAYS;
 const HEALTH_CHECK_INTERVAL = config.HEALTH_CHECK_INTERVAL;
 const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
 const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
+const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
 
 function getClientId(userId) {
   return `user-${userId}`;
+}
+
+function safeMessageId(message) {
+  return message?.id?._serialized || '(no-id)';
 }
 
 // ── SingletonLock cleanup ─────────────────────────────────
@@ -51,6 +62,33 @@ function cleanupSingletonLocks() {
   }
 }
 
+// Remove the SingletonLock of a single session dir (after its Chromium has exited).
+function cleanupSessionLock(userId) {
+  const lockPath = path.join('.wwebjs_auth', `session-${getClientId(userId)}`, 'SingletonLock');
+  try {
+    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+  } catch (err) {
+    console.warn(`Failed to remove SingletonLock for user ${userId}: ${err.message}`);
+  }
+}
+
+// Destroy a client and wait for Chromium to actually exit (bounded), so callers can
+// safely recreate on / delete the same auth dir afterwards.
+async function destroyClient(client, userId) {
+  if (!client) return;
+  let timer;
+  try {
+    await Promise.race([
+      client.destroy(),
+      new Promise((r) => { timer = setTimeout(r, 10000); }),
+    ]);
+  } catch (err) {
+    console.warn(`destroy() for user ${userId} errored: ${err.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ── Reconnect with exponential backoff ────────────────────
 
 async function reconnectClient(userId, reason) {
@@ -66,12 +104,25 @@ async function reconnectClient(userId, reason) {
       return;
     }
 
-    // Clean up old client if still in map
+    // Another create/reconnect is already bringing this user up — don't race it.
+    if (connecting.has(userId)) {
+      console.log(`User ${userId} reconnect already in progress, skipping`);
+      return;
+    }
+
+    // Destroy any stale (non-ready) client before recreating, so its Chromium exits
+    // and releases the SingletonLock instead of colliding with the new instance.
+    if (existing?.client) {
+      await destroyClient(existing.client, userId);
+    }
     clients.delete(userId);
+    cleanupSessionLock(userId);
 
     try {
-      await createWhatsAppClient(userId);
-      console.log(`Reconnect successful for user ${userId} on attempt ${attempt + 1}`);
+      const created = await createWhatsAppClient(userId);
+      if (created) {
+        console.log(`Reconnect successful for user ${userId} on attempt ${attempt + 1}`);
+      }
       return;
     } catch (err) {
       console.error(`Reconnect attempt ${attempt + 1} failed for user ${userId}: ${err.message}`);
@@ -95,7 +146,7 @@ async function checkClientHealth() {
       // Only clean up if client has been sitting idle (not freshly created)
       if (clientData.qrTimer === null && clientData.qr !== null) {
         console.warn(`Health check: user ${userId} not ready and no QR timer — destroying idle client`);
-        try { await clientData.client.destroy(); } catch { /* ignore */ }
+        await destroyClient(clientData.client, userId);
         clients.delete(userId);
       }
       continue;
@@ -111,14 +162,14 @@ async function checkClientHealth() {
       if (state !== 'CONNECTED') {
         console.warn(`Health check: user ${userId} state=${state}, triggering reconnect`);
         clientData.isReady = false;
-        try { await clientData.client.destroy(); } catch { /* ignore */ }
+        await destroyClient(clientData.client, userId);
         clients.delete(userId);
         reconnectClient(userId, `health_check_state_${state}`).catch(console.error);
       }
     } catch (err) {
       console.warn(`Health check: user ${userId} failed (${err.message}), triggering reconnect`);
       clientData.isReady = false;
-      try { await clientData.client.destroy(); } catch { /* ignore */ }
+      await destroyClient(clientData.client, userId);
       clients.delete(userId);
       reconnectClient(userId, 'health_check_error').catch(console.error);
     }
@@ -152,11 +203,20 @@ async function createWhatsAppClient(userId) {
     return clients.get(userId);
   }
 
+  // Synchronous lock (before any await) — blocks a concurrent create/reconnect for the
+  // same user from spawning a second Chromium on the same auth dir.
+  if (connecting.has(userId)) {
+    console.log(`Client for user ${userId} is already initializing — skipping`);
+    return null;
+  }
+
   if (clients.size >= MAX_CONCURRENT_CLIENTS) {
     throw new Error(`Max clients reached (${MAX_CONCURRENT_CLIENTS})`);
   }
 
-  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null, errorCount: 0 };
+  connecting.add(userId);
+
+  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null, errorCount: 0, intentionalDestroy: false };
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
@@ -194,10 +254,11 @@ async function createWhatsAppClient(userId) {
     // Start QR timeout on first QR event — destroy client if user never scans
     if (clientData.qrTimer === null) {
       console.log(`QR timeout started for user ${userId} (${QR_TIMEOUT_MS / 1000}s)`);
-      clientData.qrTimer = setTimeout(() => {
+      clientData.qrTimer = setTimeout(async () => {
         console.warn(`QR timeout expired for user ${userId} — destroying idle client`);
         clientData.qrTimer = null;
-        client.destroy().catch(() => {});
+        clientData.intentionalDestroy = true;
+        await destroyClient(client, userId);
         clients.delete(userId);
 
         const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
@@ -233,21 +294,25 @@ async function createWhatsAppClient(userId) {
     console.log(`WhatsApp authenticated for user ${userId}`);
     clearTimeout(clientData.qrTimer);
     clientData.qrTimer = null;
-    clientData.isReady = true;
+    // NOTE: do NOT set isReady here. 'authenticated' fires before chat sync completes;
+    // marking ready now makes the health check call getState() mid-sync, see a
+    // non-CONNECTED state, and destroy+reconnect in a loop. isReady is set only on 'ready'.
     clientData.qr = null;
     clientData.errorCount = 0;
     writeAuthMarker(userId);
     await publishQrScanned(userId, 'authenticated').catch(console.error);
   });
 
-  client.on('auth_failure', (msg) => {
+  client.on('auth_failure', async (msg) => {
     console.error(`Auth failed for user ${userId}:`, msg);
     clearTimeout(clientData.qrTimer);
     clientData.qrTimer = null;
     clientData.isReady = false;
+    clientData.intentionalDestroy = true;
 
-    // Destroy zombie client and clean up broken session
-    client.destroy().catch(() => {});
+    // Destroy zombie client and WAIT for Chromium to exit before removing the session
+    // dir — otherwise the live browser recreates the dir / SingletonLock we just deleted.
+    await destroyClient(client, userId);
     clients.delete(userId);
 
     const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
@@ -267,13 +332,22 @@ async function createWhatsAppClient(userId) {
     );
   });
 
-  client.on('disconnected', (reason) => {
+  client.on('disconnected', async (reason) => {
     console.log(`WhatsApp disconnected for user ${userId}: ${reason}`);
     clearTimeout(clientData.qrTimer);
     clientData.qrTimer = null;
     clientData.isReady = false;
     clientData.qr = null;
+
+    // Destroy the dead client so Chromium exits and releases its SingletonLock before we
+    // recreate on the same auth dir; a leaked browser would block every reconnect attempt.
+    await destroyClient(client, userId);
     clients.delete(userId);
+
+    if (clientData.intentionalDestroy) {
+      console.log(`User ${userId}: intentional disconnect — not auto-reconnecting`);
+      return;
+    }
 
     // Auto-reconnect with exponential backoff
     reconnectClient(userId, reason).catch(console.error);
@@ -290,7 +364,7 @@ async function createWhatsAppClient(userId) {
         console.error(`Too many message errors (${MAX_MESSAGE_ERRORS}), triggering reconnect for user ${userId}`);
         clientData.isReady = false;
         clientData.errorCount = 0;
-        try { await client.destroy(); } catch { /* ignore */ }
+        await destroyClient(client, userId);
         clients.delete(userId);
         reconnectClient(userId, 'message_errors').catch(console.error);
       }
@@ -308,7 +382,7 @@ async function createWhatsAppClient(userId) {
         console.error(`Too many message errors (${MAX_MESSAGE_ERRORS}), triggering reconnect for user ${userId}`);
         clientData.isReady = false;
         clientData.errorCount = 0;
-        try { await client.destroy(); } catch { /* ignore */ }
+        await destroyClient(client, userId);
         clients.delete(userId);
         reconnectClient(userId, 'message_errors').catch(console.error);
       }
@@ -324,6 +398,8 @@ async function createWhatsAppClient(userId) {
     console.error(`Failed to init client for user ${userId}:`, error.message);
     clients.delete(userId);
     throw error;
+  } finally {
+    connecting.delete(userId);
   }
 
   return clientData;
@@ -332,11 +408,21 @@ async function createWhatsAppClient(userId) {
 // ── Incoming message handler ──────────────────────────────
 
 async function handleIncomingMessage(userId, message, isEdited) {
-  // Skip old messages (e.g. after session restore) — 2 min threshold
-  const ageSeconds = Math.floor(Date.now() / 1000) - (message.timestamp || 0);
-  if (ageSeconds > 120) {
-    console.log(`Skipping old message ${message.id._serialized} (age=${ageSeconds}s)`);
-    return;
+  const safeId = safeMessageId(message);
+
+  // Skip old messages (e.g. after session restore). Edits carry the ORIGINAL timestamp,
+  // so never age-filter them. A missing timestamp (same session-drift mode that drops
+  // id._serialized) must NOT be treated as "infinitely old" — rely on dedup instead of
+  // silently discarding a live message.
+  const ts = message.timestamp;
+  if (!isEdited && ts) {
+    const ageSeconds = Math.floor(Date.now() / 1000) - ts;
+    if (ageSeconds > OLD_MESSAGE_THRESHOLD) {
+      console.log(`Skipping old message ${safeId} (age=${ageSeconds}s)`);
+      return;
+    }
+  } else if (!ts) {
+    console.warn(`Message ${safeId} has no timestamp — forwarding (relying on dedup)`);
   }
 
   let chatId, chatName;
@@ -350,7 +436,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
       chatId = chat.id._serialized;
       chatName = chat.name;
     } catch (err) {
-      console.warn(`getChat() failed for message ${message.id._serialized}: ${err.message} — using fallback`);
+      console.warn(`getChat() failed for message ${safeId}: ${err.message} — using fallback`);
       chatId = message.from;
       chatName = message._data?.subject || message._data?.notifyName || '';
     }
@@ -397,11 +483,11 @@ async function handleIncomingMessage(userId, message, isEdited) {
   }
 
   if (mediaFailed) {
-    console.warn(`Media failed for ${message.id._serialized} — sending without media`);
+    console.warn(`Media failed for ${safeId} — sending without media`);
   }
 
   const payload = {
-    wa_message_id: message.id._serialized,
+    wa_message_id: message.id?._serialized, // may be undefined → redis-publisher assigns a stable fallback id
     wa_chat_id: chatId,
     wa_chat_name: chatName,
     user_id: userId,
@@ -416,12 +502,11 @@ async function handleIncomingMessage(userId, message, isEdited) {
     media_filename: mediaInfo?.filename || null,
   };
 
-  try {
-    await publishMessage(payload);
-    console.log(`Queued message ${message.id._serialized} from chat ${chatName}`);
-  } catch (err) {
-    console.error(`[DLQ] Failed to publish message: ${err.message}`, JSON.stringify(payload));
-  }
+  // publishMessage assigns payload.wa_message_id (real or content-fallback) and enqueues
+  // atomically. On Redis failure it throws — the message handler counts the error and,
+  // past the threshold, reconnects; the message is not silently marked handled.
+  await publishMessage(payload);
+  console.log(`Queued message ${payload.wa_message_id} from chat ${chatName}`);
 }
 
 // ── Auth marker — only restore sessions that were actually authenticated ──
@@ -500,7 +585,7 @@ async function restoreExistingSessions() {
       })
     );
     if (i + MAX_PARALLEL_INIT < authenticatedSessions.length) {
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, config.SESSION_RESTORE_BATCH_DELAY));
     }
   }
 
@@ -515,6 +600,7 @@ async function destroyAllClients() {
   const destroyPromises = [];
   for (const [userId, clientData] of clients) {
     clearTimeout(clientData.qrTimer);
+    clientData.intentionalDestroy = true;
     console.log(`Destroying client for user ${userId}...`);
     destroyPromises.push(
       clientData.client.destroy().catch((err) =>
@@ -527,4 +613,4 @@ async function destroyAllClients() {
   console.log('All WhatsApp clients destroyed');
 }
 
-module.exports = { clients, createWhatsAppClient, restoreExistingSessions, destroyAllClients, stopHealthCheck };
+module.exports = { clients, connecting, createWhatsAppClient, restoreExistingSessions, destroyAllClients, stopHealthCheck };

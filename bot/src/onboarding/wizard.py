@@ -170,6 +170,13 @@ async def handle_webapp_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     data = update.effective_message.web_app_data.data
     tg_id = update.effective_user.id
 
+    # Gate here too — otherwise a deactivated user with a stale Mini App open could create
+    # a pair (and reactivate themselves via ON CONFLICT in add_chat_pair).
+    from ..db import is_whitelisted
+    if not await is_whitelisted(tg_id):
+        await update.message.reply_text(render("not_authorized"), parse_mode="Markdown")
+        return
+
     try:
         payload = json.loads(data)
         wa_chat_id = payload["wa_chat_id"]

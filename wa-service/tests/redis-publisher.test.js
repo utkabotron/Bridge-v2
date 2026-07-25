@@ -7,6 +7,7 @@ const mockRedisInstance = {
   get: jest.fn(),
   setex: jest.fn(),
   lpush: jest.fn(),
+  eval: jest.fn(),
   publish: jest.fn(),
   on: jest.fn(),
   disconnect: jest.fn(),
@@ -39,13 +40,15 @@ describe('retryStrategy', () => {
     expect(capturedRetryStrategy(10)).toBe(5000);
   });
 
-  test('returns null after 10 attempts', () => {
-    expect(capturedRetryStrategy(11)).toBeNull();
-    expect(capturedRetryStrategy(20)).toBeNull();
+  test('never returns null — reconnects forever with capped delay', () => {
+    // Returning null would put ioredis into a terminal state and silently drop every
+    // message on the single replica until a manual restart. It must keep retrying.
+    expect(capturedRetryStrategy(11)).toBe(5000);
+    expect(capturedRetryStrategy(20)).toBe(5000);
+    expect(capturedRetryStrategy(1000)).toBe(5000);
   });
 
   test('caps delay at 5000ms', () => {
-    // times * 500 for times=10 is 5000, which equals min(5000, 5000)
     expect(capturedRetryStrategy(10)).toBe(5000);
     // For times=9: min(4500, 5000) = 4500
     expect(capturedRetryStrategy(9)).toBe(4500);
@@ -55,39 +58,60 @@ describe('retryStrategy', () => {
 // ── publishMessage ───────────────────────────────────────
 
 describe('publishMessage', () => {
-  const payload = {
-    wa_message_id: 'msg_123',
-    body: 'hello',
-    wa_chat_id: 'chat_1',
-    user_id: 42,
-  };
+  function basePayload() {
+    return {
+      wa_message_id: 'msg_123',
+      body: 'hello',
+      wa_chat_id: 'chat_1',
+      user_id: 42,
+      timestamp: 1700000000,
+    };
+  }
 
-  test('new message — dedup SET NX succeeds, LPUSH called', async () => {
-    mockRedisInstance.set.mockResolvedValue('OK');
-    mockRedisInstance.lpush.mockResolvedValue(1);
+  test('new message — atomic dedup+enqueue via eval', async () => {
+    mockRedisInstance.eval.mockResolvedValue(1);
+    const payload = basePayload();
 
     await publishMessage(payload);
 
-    expect(mockRedisInstance.set).toHaveBeenCalledWith(
-      'dedup:msg:msg_123',
-      '1',
-      'EX',
-      300,
-      'NX'
-    );
-    expect(mockRedisInstance.lpush).toHaveBeenCalledWith(
-      'messages:in',
-      JSON.stringify(payload)
-    );
+    expect(mockRedisInstance.eval).toHaveBeenCalledTimes(1);
+    const args = mockRedisInstance.eval.mock.calls[0];
+    // args: [lua, numKeys, dedupKey, queueKey, ttl, json]
+    expect(args[1]).toBe(2);
+    expect(args[2]).toBe('dedup:msg:msg_123');
+    expect(args[3]).toBe('messages:in');
+    expect(args[4]).toBe(300);
+    expect(JSON.parse(args[5]).wa_message_id).toBe('msg_123');
   });
 
-  test('duplicate message — SET NX returns null, LPUSH NOT called', async () => {
-    mockRedisInstance.set.mockResolvedValue(null);
+  test('missing wa_message_id — stable content fallback assigned to payload', async () => {
+    mockRedisInstance.eval.mockResolvedValue(1);
+    const payload = basePayload();
+    delete payload.wa_message_id;
 
     await publishMessage(payload);
 
-    expect(mockRedisInstance.set).toHaveBeenCalled();
-    expect(mockRedisInstance.lpush).not.toHaveBeenCalled();
+    // The fallback id is written back into the payload so Redis dedup AND the processor's
+    // DB unique key use the same stable per-message id (root-cause fix for the media loss).
+    expect(payload.wa_message_id).toMatch(/^fallback:[0-9a-f]{16}$/);
+    const args = mockRedisInstance.eval.mock.calls[0];
+    expect(args[2]).toBe(`dedup:msg:${payload.wa_message_id}`);
+  });
+
+  test('edit — gets its own dedup namespace (not dropped as duplicate of original)', async () => {
+    mockRedisInstance.eval.mockResolvedValue(1);
+    const payload = { ...basePayload(), is_edited: true };
+
+    await publishMessage(payload);
+
+    expect(payload.wa_message_id).toMatch(/^msg_123:edit:[0-9a-f]{12}$/);
+  });
+
+  test('duplicate message — eval returns 0, does not throw', async () => {
+    mockRedisInstance.eval.mockResolvedValue(0);
+
+    await expect(publishMessage(basePayload())).resolves.not.toThrow();
+    expect(mockRedisInstance.eval).toHaveBeenCalledTimes(1);
   });
 });
 

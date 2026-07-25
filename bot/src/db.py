@@ -166,7 +166,8 @@ async def add_chat_pair(
         tg_chat_id,
         tg_chat_title,
     )
-    return dict(row)
+    # row is None if no users row matched tg_user_id — return None so callers don't dict(None).
+    return dict(row) if row else None
 
 
 async def set_chat_pair_status(pair_id: int, status: str) -> None:
@@ -174,6 +175,38 @@ async def set_chat_pair_status(pair_id: int, status: str) -> None:
     await pool.execute(
         "update public.chat_pairs set status = $1 where id = $2", status, pair_id
     )
+
+
+async def set_chat_pair_status_owned(pair_id: int, tg_user_id: int, status: str) -> bool:
+    """Update a pair's status only if it belongs to tg_user_id. Prevents a forged
+    `chat:pause:<id>` callback from pausing/resuming another user's bridge.
+    Returns True if a row was updated."""
+    pool = await get_pool()
+    status_tag = await pool.execute(
+        """
+        update public.chat_pairs
+        set status = $1
+        where id = $2
+          and user_id = (select id from public.users where tg_user_id = $3)
+        """,
+        status, pair_id, tg_user_id,
+    )
+    return bool(status_tag) and status_tag.rsplit(" ", 1)[-1] != "0"
+
+
+async def event_in_chat(event_id: int, tg_chat_id: int) -> bool:
+    """True if message_event `event_id` belongs to a chat pair delivered to `tg_chat_id`.
+    Used to reject an Analyze callback forged against another chat's event."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        select 1 from public.message_events me
+        join public.chat_pairs cp on cp.id = me.chat_pair_id
+        where me.id = $1 and cp.tg_chat_id = $2
+        """,
+        event_id, tg_chat_id,
+    )
+    return row is not None
 
 
 # ── All users (admin) ─────────────────────────────────────

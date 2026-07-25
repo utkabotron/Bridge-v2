@@ -19,6 +19,11 @@ _CACHE_PREFIX = "ff:"
 
 _redis: aioredis.Redis | None = None
 
+# Last value we successfully read from Redis/DB, per flag. Used as a fallback when BOTH
+# Redis and DB are unreachable, so a flag an admin turned OFF (e.g. to stop runaway LLM
+# cost) does not silently flip back ON via the permissive env default during an outage.
+_last_known: dict[str, bool] = {}
+
 
 def _get_redis() -> aioredis.Redis:
     global _redis
@@ -36,7 +41,9 @@ async def is_enabled(flag_name: str) -> bool:
     try:
         cached = await _get_redis().get(f"{_CACHE_PREFIX}{flag_name}")
         if cached is not None:
-            return cached == "1"
+            val = cached == "1"
+            _last_known[flag_name] = val
+            return val
     except Exception:
         pass
 
@@ -49,6 +56,7 @@ async def is_enabled(flag_name: str) -> bool:
         )
         if row is not None:
             enabled = row["enabled"]
+            _last_known[flag_name] = enabled
             try:
                 await _get_redis().setex(
                     f"{_CACHE_PREFIX}{flag_name}", _CACHE_TTL, "1" if enabled else "0",
@@ -58,6 +66,12 @@ async def is_enabled(flag_name: str) -> bool:
             return enabled
     except Exception as exc:
         logger.warning("Failed to read flag %s from DB: %s", flag_name, exc)
+
+    # Both Redis and DB unavailable: prefer the last value we actually observed over the
+    # permissive env default, so an intentionally-disabled flag stays disabled in an outage.
+    if flag_name in _last_known:
+        logger.warning("Flag %s: Redis+DB down, using last-known value %s", flag_name, _last_known[flag_name])
+        return _last_known[flag_name]
 
     # Env var fallback (e.g. MEDIA_ANALYSIS_ENABLED=false)
     env_val = os.getenv(flag_name.upper(), "true")

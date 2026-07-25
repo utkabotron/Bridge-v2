@@ -137,10 +137,20 @@ async def translate_node(state: MessageState) -> MessageState:
 
     translated = response.content.strip()
 
-    # Store in cache: always pair-specific; also global when no profile
-    await set_cached(text, lang, translated, chat_pair_id)
-    if not has_profile:
-        await set_cached_global(text, lang, translated)
+    # Guard against caching a degenerate translation (empty or a tiny fragment of a long
+    # source — usually a truncated/filtered LLM response). Caching it would serve that bad
+    # result for 24h, and globally it would poison every profileless pair. Deliver what we
+    # got this once, but do not persist it to cache.
+    is_degenerate = (not translated) or (len(text) > 80 and len(translated) < 0.3 * len(text))
+    if is_degenerate:
+        logger.warning(
+            "Skipping cache for degenerate translation (src_len=%d, out_len=%d, lang=%s)",
+            len(text), len(translated), lang,
+        )
+    else:
+        await set_cached(text, lang, translated, chat_pair_id)
+        if not has_profile:
+            await set_cached_global(text, lang, translated)
 
     return {**state, "translated_text": translated, "translation_ms": translation_ms, "cache_hit": False}
 
@@ -189,7 +199,9 @@ async def deliver_node(state: MessageState) -> MessageState:
 
     tg_chat_id = state.get("tg_chat_id")
     if not tg_chat_id:
-        return {**state, "delivery_status": "failed", "error": "missing tg_chat_id"}
+        result = {**state, "delivery_status": "failed", "error": "missing tg_chat_id"}
+        await _persist_event(result)  # record the failure — otherwise it vanishes from the DB
+        return result
 
     has_media = bool(state.get("media_s3_url"))
     msg_type = state.get("message_type", "text")
@@ -244,10 +256,12 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
     pending_state = {**state, "delivery_status": "pending"}
     event_id = await insert_message_event(pending_state, return_id=True)
     if not event_id:
-        logger.error("Failed to get event_id for two-phase delivery")
-        result = {**state, "delivery_status": "failed", "error": "db_insert_failed"}
-        await _persist_event(result)
-        return result
+        # DB write failed (or the row was already delivered). The Analyze button needs a
+        # real event_id, but the message itself MUST still be delivered — falling back to a
+        # plain send is what keeps media flowing when persistence is degraded. (This exact
+        # path silently dropped all media from July 15 until the id-propagation fix.)
+        logger.error("No event_id for two-phase delivery — delivering media without Analyze button")
+        return await _deliver_simple(state, tg_chat_id)
 
     # Phase 2: Send with inline keyboard
     reply_markup = {
@@ -337,7 +351,7 @@ async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> N
         pool = await get_pool()
         await pool.execute(
             "UPDATE chat_pairs SET tg_chat_id = $1 WHERE id = $2",
-            str(new_tg_chat_id), chat_pair_id,
+            int(new_tg_chat_id), chat_pair_id,  # column is bigint — passing str raised DataError, so the update never persisted
         )
         logger.info("Migrated chat_pair %s to new tg_chat_id %s", chat_pair_id, new_tg_chat_id)
     except Exception as exc:

@@ -9,6 +9,8 @@ from telegram import Update
 from ..utils import http_client
 from telegram.ext import ContextTypes
 from ..utils.telegram_format import esc, italic
+from ..db import is_whitelisted
+from ..templates.messages import render
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,11 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user_id = msg.from_user.id if msg.from_user else 0
+    # Gate the LLM behind the whitelist — otherwise any stranger who finds the bot gets
+    # free translation/analysis on our OpenAI bill.
+    if not await is_whitelisted(user_id):
+        await msg.reply_text(render("not_authorized"), parse_mode="Markdown")
+        return
 
     # Phase 1: instant preview with hourglass
     preview_msg = await msg.reply_text("⏳")
@@ -69,6 +76,9 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     user_id = msg.from_user.id if msg.from_user else 0
+    if not await is_whitelisted(user_id):
+        await msg.reply_text(render("not_authorized"), parse_mode="Markdown")
+        return
 
     # Determine media type and get file
     if msg.photo:

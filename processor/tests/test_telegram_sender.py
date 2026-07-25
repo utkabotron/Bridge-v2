@@ -261,3 +261,43 @@ async def test_send_message_exception_handled():
 
     assert ok is False
     assert "network error" in err
+
+
+# ── Length-limit splitting (4096 text / 1024 caption) ─────
+
+def test_split_text_under_limit_single_chunk():
+    from processor.src.telegram_sender import _split_text
+    assert _split_text("hello", 4096) == ["hello"]
+
+
+def test_split_text_prefers_newline_boundaries():
+    from processor.src.telegram_sender import _split_text
+    text = "\n".join(["line" + str(i) for i in range(1000)])
+    chunks = _split_text(text, 100)
+    assert all(len(c) <= 100 for c in chunks)
+    # Reassembling with newlines reproduces the original (we split on newlines).
+    assert "\n".join(chunks) == text
+
+
+def test_split_text_hard_splits_when_no_newline():
+    from processor.src.telegram_sender import _split_text
+    text = "x" * 5000
+    chunks = _split_text(text, 4096)
+    assert [len(c) for c in chunks] == [4096, 904]
+    assert "".join(chunks) == text
+
+
+def test_split_caption_under_limit():
+    from processor.src.telegram_sender import _split_caption
+    cap, overflow = _split_caption("short caption")
+    assert cap == "short caption"
+    assert overflow is None
+
+
+def test_split_caption_overflow_kept():
+    from processor.src.telegram_sender import _split_caption, TG_MAX_CAPTION
+    cap, overflow = _split_caption("a" * 2000)
+    assert len(cap) <= TG_MAX_CAPTION
+    assert overflow is not None
+    # Nothing is dropped: caption + overflow reconstruct the source.
+    assert cap + overflow == "a" * 2000

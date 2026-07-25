@@ -22,6 +22,21 @@ _loop = None
 _pending_events: list[dict] = []
 
 
+def _dispatch(data: dict) -> None:
+    """Schedule handle_qr_event on the bot loop and LOG any failure — a bare
+    run_coroutine_threadsafe drops the returned future, so exceptions inside
+    (bad userId, DB down) would otherwise vanish and the user would hang in qr_pending."""
+    fut = asyncio.run_coroutine_threadsafe(handle_qr_event(data), _loop)
+
+    def _log_result(f):
+        try:
+            f.result()
+        except Exception as exc:
+            logger.error("handle_qr_event failed for %s: %s", data.get("userId"), exc)
+
+    fut.add_done_callback(_log_result)
+
+
 def set_bot_app(app):
     global _bot_app
     _bot_app = app
@@ -29,7 +44,7 @@ def set_bot_app(app):
     if _pending_events and _loop and _loop.is_running():
         logger.info("Draining %d buffered QR events", len(_pending_events))
         for evt in _pending_events:
-            asyncio.run_coroutine_threadsafe(handle_qr_event(evt), _loop)
+            _dispatch(evt)
         _pending_events.clear()
 
 
@@ -38,14 +53,18 @@ def set_event_loop(loop):
     _loop = loop
 
 
-def _make_redis():
+def _make_pubsub_redis():
+    # NOTE: no socket_timeout here. A read timeout on a blocking pubsub.listen() raises
+    # every few seconds, forcing a resubscribe; any qr_scanned published during that gap is
+    # lost (pub/sub has no replay). health_check_interval keeps the connection alive instead.
     return redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
         port=int(os.getenv("REDIS_PORT", 6379)),
         db=int(os.getenv("REDIS_DB", 0)),
         decode_responses=True,
         socket_connect_timeout=5,
-        socket_timeout=5,
+        socket_keepalive=True,
+        health_check_interval=30,
     )
 
 
@@ -94,7 +113,7 @@ async def handle_qr_event(data: dict) -> None:
 
 def redis_subscriber_loop():
     """Blocking pub/sub loop — runs in a thread (via asyncio.to_thread)."""
-    client = _make_redis()
+    client = _make_pubsub_redis()
     pubsub = client.pubsub()
 
     def on_message(message):
@@ -103,7 +122,7 @@ def redis_subscriber_loop():
         try:
             data = json.loads(message["data"])
             if _loop and _loop.is_running():
-                asyncio.run_coroutine_threadsafe(handle_qr_event(data), _loop)
+                _dispatch(data)
             else:
                 logger.warning("No running event loop — buffering QR event for user %s", data.get("userId"))
                 _pending_events.append(data)
@@ -121,5 +140,5 @@ def redis_subscriber_loop():
         except Exception as exc:
             logger.error("Redis subscriber error: %s — reconnecting in 5s", exc)
             time.sleep(5)
-            client = _make_redis()
+            client = _make_pubsub_redis()
             pubsub = client.pubsub()

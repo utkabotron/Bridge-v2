@@ -25,7 +25,7 @@ from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
 from .handlers.analyze import cb_analyze_media, cb_noop
 from .handlers.translate import handle_direct_media, handle_direct_text
 from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
-from .handlers.groups import handle_my_chat_member
+from .handlers.groups import handle_my_chat_member, cb_cmd_add
 from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
 from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop
 
@@ -48,7 +48,9 @@ def main() -> None:
         t.start()
         logger.info("Redis subscriber thread started")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    # concurrent_updates(True): process updates concurrently. Without it a single slow
+    # handler (media analysis/translate up to ~2 min) blocks EVERY user's updates serially.
+    app = Application.builder().token(token).post_init(post_init).concurrent_updates(True).build()
 
     # Inject bot reference into redis_sub module
     set_bot_app(app)
@@ -71,6 +73,7 @@ def main() -> None:
 
     # ── Group tracking (my_chat_member) ───────────────────
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(CallbackQueryHandler(cb_cmd_add, pattern="^cmd:add$"))
 
     # ── Media analysis ─────────────────────────────────────
     app.add_handler(CallbackQueryHandler(cb_analyze_media, pattern=r"^analyze:\d+$"))

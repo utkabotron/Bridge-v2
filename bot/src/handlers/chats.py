@@ -7,7 +7,7 @@ import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from ..db import get_chat_pairs, set_chat_pair_status, add_chat_pair, is_whitelisted
+from ..db import get_chat_pairs, set_chat_pair_status_owned, add_chat_pair, is_whitelisted
 from ..onboarding.wizard import finish_onboarding
 from ..templates.messages import render
 
@@ -54,13 +54,15 @@ async def cmd_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     tg_id = update.effective_user.id
     chat = update.effective_chat
+    # effective_message works whether /add came as a command or via the cmd:add button.
+    reply = update.effective_message.reply_text
 
     if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text(render("add_group_only"), parse_mode="Markdown")
+        await reply(render("add_group_only"), parse_mode="Markdown")
         return
 
     if not await is_whitelisted(tg_id):
-        await update.message.reply_text(render("not_authorized"), parse_mode="Markdown")
+        await reply(render("not_authorized"), parse_mode="Markdown")
         return
 
     # Fetch WA status + groups
@@ -70,22 +72,23 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         data = r.json()
     except Exception as exc:
         logger.error("WA status error: %s", exc)
-        await update.message.reply_text(render("error_wa_service"), parse_mode="Markdown")
+        await reply(render("error_wa_service"), parse_mode="Markdown")
         return
 
     if not data.get("isReady"):
-        await update.message.reply_text(render("add_not_connected"), parse_mode="Markdown")
+        await reply(render("add_not_connected"), parse_mode="Markdown")
         return
 
     groups = data.get("groups", [])
     if not groups:
-        await update.message.reply_text(render("error_no_wa_groups"), parse_mode="Markdown")
+        await reply(render("error_no_wa_groups"), parse_mode="Markdown")
         return
 
-    # Store tg_chat context and group list for callback
-    ctx.user_data["linking_tg_chat_id"] = chat.id
-    ctx.user_data["linking_tg_chat_title"] = chat.title or str(chat.id)
-    ctx.user_data["wa_groups"] = groups[:20]
+    # Store the WA group list keyed by THIS TG chat, so a second /add in another group
+    # can't overwrite it and make an old keyboard link the wrong pair. The target TG chat
+    # is read back from the callback message itself (see cb_link_chat), not from user_data.
+    groups_by_chat = ctx.user_data.setdefault("wa_groups_by_chat", {})
+    groups_by_chat[chat.id] = groups[:20]
 
     # Use index as callback_data to stay within 64-byte Telegram limit
     kb = [
@@ -93,7 +96,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         for i, g in enumerate(groups[:20])
     ]
 
-    await update.message.reply_text(
+    await reply(
         render("add_select_header", escape=True, tg_group=chat.title or "this group"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -106,23 +109,26 @@ async def cb_link_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
-    idx = int(query.data.split(":", 1)[1])
     tg_id = query.from_user.id
+    if not await is_whitelisted(tg_id):
+        await query.answer(render("not_authorized"), show_alert=True)
+        return
 
-    wa_groups = ctx.user_data.get("wa_groups", [])
+    idx = int(query.data.split(":", 1)[1])
+
+    # The target TG chat is the chat the button lives in — immune to a concurrent /add in
+    # another group overwriting shared state.
+    tg_chat = query.message.chat
+    tg_chat_id = tg_chat.id
+    tg_chat_title = tg_chat.title or str(tg_chat_id)
+
+    wa_groups = ctx.user_data.get("wa_groups_by_chat", {}).get(tg_chat_id, [])
     if idx >= len(wa_groups):
         await query.edit_message_text("Session expired. Please run /add again.")
         return
 
     wa_chat_id = wa_groups[idx]["id"]
     wa_chat_name = wa_groups[idx]["name"]
-
-    tg_chat_id = ctx.user_data.get("linking_tg_chat_id")
-    tg_chat_title = ctx.user_data.get("linking_tg_chat_title", "")
-
-    if not tg_chat_id:
-        await query.edit_message_text("Session expired. Please run /add again.")
-        return
 
     await finish_onboarding(tg_id, wa_chat_id, wa_chat_name, tg_chat_id, tg_chat_title)
     await query.edit_message_text(
@@ -137,11 +143,16 @@ async def cb_chat_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     query = update.callback_query
     await query.answer()
 
+    tg_id = query.from_user.id
     _, action, pair_id_str = query.data.split(":", 2)
     pair_id = int(pair_id_str)
 
     new_status = "paused" if action == "pause" else "active"
-    await set_chat_pair_status(pair_id, new_status)
+    # Ownership-scoped: a forged chat:pause:<id> for someone else's pair updates nothing.
+    ok = await set_chat_pair_status_owned(pair_id, tg_id, new_status)
+    if not ok:
+        await query.answer(render("not_authorized"), show_alert=True)
+        return
 
     msg = render("chat_paused") if new_status == "paused" else render("chat_resumed")
     await query.edit_message_text(msg, parse_mode="Markdown")

@@ -6,11 +6,16 @@ const { redis } = require('./redis-publisher');
 const routes = require('./routes');
 
 // ── Global error handlers ─────────────────────────────────
+// Do NOT exit on unhandledRejection: whatsapp-web.js / puppeteer routinely reject
+// internal promises outside our code (e.g. "Protocol error: Target closed" during a
+// destroy/reconnect). Killing the single wa-service replica for those drops every user's
+// session and loses all in-flight messages. Log for visibility instead.
 process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled rejection — exiting:', reason);
-  process.exit(1);
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  console.error('Unhandled rejection (continuing):', msg);
 });
 
+// uncaughtException leaves the process in an undefined state — exit so Docker restarts it.
 process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error);
   process.exit(1);

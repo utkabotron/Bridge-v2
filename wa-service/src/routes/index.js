@@ -3,7 +3,7 @@ const path = require('path');
 const QRCode = require('qrcode');
 const { clients, createWhatsAppClient } = require('../whatsapp-client');
 const { redis } = require('../redis-publisher');
-const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair } = require('../db');
+const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
 
 const router = express.Router();
 
@@ -29,7 +29,10 @@ router.get('/qr/image/:userId', async (req, res) => {
   const clientData = clients.get(userId);
 
   if (!clientData) {
-    // Auto-create client and start QR generation
+    // Auto-create client and start QR generation — only for known/active users.
+    if (!(await userExists(userId))) {
+      return res.status(403).json({ error: 'Unknown user' });
+    }
     try {
       createWhatsAppClient(userId).catch(console.error); // fire & forget
       return res.status(202).json({ status: 'initializing', message: 'Client starting, retry in 5s' });
@@ -160,6 +163,10 @@ router.post('/connect/:userId', async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
   if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
+  if (!(await userExists(userId))) {
+    return res.status(403).json({ error: 'Unknown user' });
+  }
+
   try {
     createWhatsAppClient(userId).catch(console.error); // fire & forget
     res.json({ message: 'Client starting', qrPageUrl: `/qr/page/${userId}` });
@@ -177,6 +184,9 @@ router.post('/disconnect/:userId', async (req, res) => {
   if (!clientData) return res.status(404).json({ error: 'Not found' });
 
   try {
+    // Mark intentional so the 'disconnected' event that destroy() may emit does not
+    // trigger an auto-reconnect that resurrects the client we're tearing down.
+    clientData.intentionalDestroy = true;
     await clientData.client.destroy();
     clients.delete(userId);
     res.json({ message: 'Disconnected' });
@@ -190,8 +200,15 @@ router.post('/reconnect/:userId', async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
   if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
+  if (!(await userExists(userId))) {
+    return res.status(403).json({ error: 'Unknown user' });
+  }
+
   const existing = clients.get(userId);
   if (existing?.client) {
+    // Intentional teardown — suppress the auto-reconnect that destroy() may trigger,
+    // so it doesn't race the explicit createWhatsAppClient below.
+    existing.intentionalDestroy = true;
     try { await existing.client.destroy(); } catch {}
     clients.delete(userId);
   }

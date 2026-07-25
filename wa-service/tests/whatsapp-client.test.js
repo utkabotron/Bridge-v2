@@ -40,6 +40,11 @@ const {
   destroyAllClients,
 } = require('../src/whatsapp-client');
 
+// Event handlers are async (they await destroyClient before deleting the client from the
+// map), so tests must let those microtasks/timers settle before asserting. Under real
+// timers use setImmediate; under fake timers use advanceTimersByTimeAsync(0).
+const flush = () => new Promise((r) => setImmediate(r));
+
 // We need access to internal functions not exported — re-read the module source
 // Actually, cleanupSingletonLocks, reconnectClient, checkClientHealth, etc. are NOT exported.
 // We test them indirectly through the exported functions + event handlers.
@@ -128,6 +133,7 @@ describe('auth_failure handler', () => {
     const client = clientData.client;
 
     client.emit('auth_failure', 'auth failed');
+    await flush();
 
     expect(mockDestroy).toHaveBeenCalled();
     expect(clients.has(42)).toBe(false);
@@ -143,6 +149,7 @@ describe('auth_failure handler', () => {
 
     const clientData = await createWhatsAppClient(42);
     clientData.client.emit('auth_failure', 'bad creds');
+    await flush();
 
     expect(fs.rmSync).not.toHaveBeenCalled();
     expect(clients.has(42)).toBe(false);
@@ -165,6 +172,7 @@ describe('disconnected handler', () => {
     const client = clientData.client;
 
     client.emit('disconnected', 'NAVIGATION');
+    await jest.advanceTimersByTimeAsync(0);
 
     expect(clients.has(42)).toBe(false);
     expect(clientData.isReady).toBe(false);
@@ -217,13 +225,15 @@ describe('reconnect behavior', () => {
     const clientData = await createWhatsAppClient(42);
     clientData.client.emit('disconnected', 'NAVIGATION');
 
-    // Before timer fires, simulate someone else reconnecting
+    // Let the async disconnected handler finish tearing down (destroy + delete) first...
+    await jest.advanceTimersByTimeAsync(0);
+    // ...then simulate someone else having reconnected this user before the retry fires.
     const fakeReconnected = { isReady: true, client: {} };
     clients.set(42, fakeReconnected);
 
     await jest.advanceTimersByTimeAsync(5000);
 
-    // initialize should only have been called once (original create)
+    // reconnectClient sees an already-ready client → skips; initialize stays at 1.
     expect(mockInitialize).toHaveBeenCalledTimes(1);
   });
 });
@@ -315,8 +325,8 @@ describe('QR timeout', () => {
 
     expect(clientData.qrTimer).not.toBeNull();
 
-    // Advance past QR_TIMEOUT_MS (60 minutes)
-    jest.advanceTimersByTime(60 * 60 * 1000);
+    // Advance past QR_TIMEOUT_MS (60 minutes); async callback awaits destroy before delete.
+    await jest.advanceTimersByTimeAsync(60 * 60 * 1000);
 
     expect(mockDestroy).toHaveBeenCalled();
     expect(clients.has(42)).toBe(false);

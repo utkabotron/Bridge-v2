@@ -54,4 +54,15 @@ async function setWaDisconnected(tgUserId) {
   );
 }
 
-module.exports = { pool, getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, setWaDisconnected };
+// Whitelist gate for client creation: only known/active users may spin up a WhatsApp
+// (Chromium) client. Without this, any numeric userId hitting /connect or /qr/image
+// spawns a ~300 MB browser — a trivial memory-DoS on the 3.8 GiB VPS.
+async function userExists(tgUserId) {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM users WHERE tg_user_id = $1 AND is_active = true',
+    [tgUserId]
+  );
+  return rows.length > 0;
+}
+
+module.exports = { pool, getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, setWaDisconnected, userExists };
