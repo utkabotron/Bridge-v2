@@ -30,6 +30,16 @@ module.exports = {
   PUPPETEER_PROTOCOL_TIMEOUT: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT) || 120000,
   SESSION_RESTORE_BATCH_DELAY: parseInt(process.env.SESSION_RESTORE_BATCH_DELAY) || 1000,
 
+  // Pin the WhatsApp Web build. whatsapp-web.js reaches into WA's minified Store,
+  // so a WA release can break getChats()/getChat() (they start throwing 'r') while
+  // the library still lags months behind. Setting WA_WEB_VERSION to a known-good
+  // build from wppconnect-team/wa-version freezes WA at that build; empty means
+  // "whatever WA serves today" (type: 'local'), which is what broke us.
+  WA_WEB_VERSION: process.env.WA_WEB_VERSION || '',
+  WA_WEB_VERSION_BASE_URL:
+    process.env.WA_WEB_VERSION_BASE_URL ||
+    'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html',
+
   // Message dedup
   DEDUP_TTL: parseInt(process.env.DEDUP_TTL) || 300,
 

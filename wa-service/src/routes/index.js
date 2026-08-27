@@ -150,7 +150,13 @@ router.get('/status/:userId', async (req, res) => {
     }));
     res.json({ isReady: true, hasQR: false, groups });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    // getChats() reaches into WA's minified Store and dies (a bare 'r') whenever WA ships
+    // a build the library hasn't caught up with. That must not read as "not connected":
+    // a 500 here sent the Mini App back to the Connect screen to wait for a QR that can
+    // never arrive, because the user is in fact connected. Report the session honestly
+    // and let the client show an empty group list with an error instead.
+    console.error(`getChats failed for user ${userId}: ${err.message}`);
+    res.json({ isReady: true, hasQR: false, groups: [], groupsError: err.message });
   }
 });
 

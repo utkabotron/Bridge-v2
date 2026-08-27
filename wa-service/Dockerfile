@@ -18,7 +18,10 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --only=production
+# npm ci, not npm install: the lockfile is the whole point here. whatsapp-web.js rides
+# WhatsApp's minified internals, so which exact version ships must never drift silently
+# between rebuilds.
+RUN npm ci --omit=dev
 
 COPY src/ ./src/
 COPY public/ ./public/

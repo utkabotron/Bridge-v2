@@ -99,6 +99,42 @@ describe('GET /status/:userId', () => {
     const res = await request(app).get('/status/42');
     expect(res.body.hasQR).toBe(false);
   });
+
+  test('ready client returns its groups', async () => {
+    mockClients.set(42, {
+      isReady: true,
+      qr: null,
+      client: {
+        getChats: jest.fn().mockResolvedValue([
+          { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [1, 2] },
+          { isGroup: false, id: { _serialized: 'p1@c.us' }, name: 'Bob' },
+        ]),
+      },
+    });
+    const res = await request(app).get('/status/42');
+    expect(res.status).toBe(200);
+    expect(res.body.isReady).toBe(true);
+    expect(res.body.groups).toEqual([{ id: 'g1@g.us', name: 'Team', participants: 2 }]);
+    expect(res.body.groupsError).toBeUndefined();
+  });
+
+  // Regression: getChats() throws a bare 'r' whenever WhatsApp ships a build the library
+  // hasn't caught up with. This used to answer 500, and the Mini App — which only reads
+  // data.isReady — fell back to the Connect screen and waited forever for a QR that a
+  // connected user never gets. The session state must survive a failing group lookup.
+  test('getChats failure still reports the session as connected', async () => {
+    mockClients.set(42, {
+      isReady: true,
+      qr: null,
+      client: { getChats: jest.fn().mockRejectedValue(new Error('r')) },
+    });
+    const res = await request(app).get('/status/42');
+    expect(res.status).toBe(200);
+    expect(res.body.isReady).toBe(true);
+    expect(res.body.hasQR).toBe(false);
+    expect(res.body.groups).toEqual([]);
+    expect(res.body.groupsError).toBe('r');
+  });
 });
 
 // ── GET /qr/image/:userId ─────────────────────────────────

@@ -18,6 +18,7 @@ jest.mock('../src/db', () => ({
 
 // Mock whatsapp-web.js — Client extends EventEmitter so we can emit events
 // Variables prefixed with `mock` are allowed inside jest.mock factory
+const mockClientOptions = [];
 const mockInitialize = jest.fn().mockResolvedValue();
 const mockDestroy = jest.fn().mockResolvedValue();
 const mockGetState = jest.fn().mockResolvedValue('CONNECTED');
@@ -25,8 +26,9 @@ const mockGetState = jest.fn().mockResolvedValue('CONNECTED');
 jest.mock('whatsapp-web.js', () => {
   const { EventEmitter } = require('events');
   class MockClient extends EventEmitter {
-    constructor() {
+    constructor(opts) {
       super();
+      mockClientOptions.push(opts);
       this.initialize = mockInitialize;
       this.destroy = mockDestroy;
       this.getState = mockGetState;
@@ -489,5 +491,42 @@ describe('recoverLostSessions', () => {
     await recoverLostSessions();
 
     expect(mockInitialize).not.toHaveBeenCalled();
+  });
+});
+
+
+// ── WhatsApp Web version pinning ──────────────────────────
+// whatsapp-web.js drives WhatsApp's minified Store, so an unpinned WA build can break
+// getChats()/getChat() overnight. WA_WEB_VERSION freezes WA at a known-good build.
+describe('webVersionCache pinning', () => {
+  const ORIGINAL = process.env.WA_WEB_VERSION;
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.WA_WEB_VERSION;
+    else process.env.WA_WEB_VERSION = ORIGINAL;
+    jest.resetModules();
+  });
+
+  function freshCreate() {
+    jest.resetModules();
+    return require('../src/whatsapp-client').createWhatsAppClient;
+  }
+
+  test('unset WA_WEB_VERSION keeps the local cache (whatever WA serves)', async () => {
+    delete process.env.WA_WEB_VERSION;
+    mockClientOptions.length = 0;
+    await freshCreate()(4242);
+    expect(mockClientOptions.at(-1).webVersionCache).toEqual({ type: 'local' });
+  });
+
+  test('WA_WEB_VERSION pins WA to that build via a remote path', async () => {
+    process.env.WA_WEB_VERSION = '2.3000.1046140131-alpha';
+    mockClientOptions.length = 0;
+    await freshCreate()(4243);
+    const cache = mockClientOptions.at(-1).webVersionCache;
+    expect(cache.type).toBe('remote');
+    expect(cache.remotePath).toBe(
+      'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1046140131-alpha.html'
+    );
   });
 });

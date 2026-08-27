@@ -70,6 +70,18 @@ function cleanupSingletonLocks() {
 }
 
 // Remove the SingletonLock of a single session dir (after its Chromium has exited).
+// Pin WA to a known-good build when WA_WEB_VERSION is set. Left empty, whatsapp-web.js
+// takes whatever WA serves today — and a WA release can break the minified Store calls
+// behind getChats()/getChat() (they throw a bare 'r'), which silently kills the Mini App's
+// group list while message delivery keeps limping along on fallbacks.
+function buildWebVersionCache() {
+  const version = config.WA_WEB_VERSION;
+  if (!version) return { type: 'local' };
+  const remotePath = `${config.WA_WEB_VERSION_BASE_URL}/${version}.html`;
+  console.log(`Pinning WhatsApp Web to ${version} (${remotePath})`);
+  return { type: 'remote', remotePath };
+}
+
 function cleanupSessionLock(userId) {
   const lockPath = path.join('.wwebjs_auth', `session-${getClientId(userId)}`, 'SingletonLock');
   try {
@@ -302,7 +314,7 @@ async function createWhatsAppClient(userId) {
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
-    webVersionCache: { type: 'local' },
+    webVersionCache: buildWebVersionCache(),
     puppeteer: {
       headless: true,
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,

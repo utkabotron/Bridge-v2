@@ -587,7 +587,7 @@
             needsReconnect = false;
             loadPairs();
           } else {
-            showWaGroupList(data.groups || []);
+            showWaGroupList(data.groups || [], data.groupsError);
           }
         } else {
           startConnect();
@@ -630,7 +630,7 @@
             needsReconnect = false;
             loadPairs();
           } else {
-            showWaGroupList(data.groups || []);
+            showWaGroupList(data.groups || [], data.groupsError);
           }
           return;
         }
@@ -660,7 +660,7 @@
   };
 
   // ── WA Groups ─────────────────────────────────────────────
-  function showWaGroupList(groups) {
+  function showWaGroupList(groups, groupsError) {
     showScreen('screen-wa-groups');
 
     // Back button
@@ -676,7 +676,13 @@
     list.innerHTML = '';
 
     if (groups.length === 0) {
-      list.innerHTML = '<p class="subtitle">No WhatsApp groups found. Make sure you have groups in WhatsApp.</p>';
+      // Distinguish "you genuinely have no groups" from "WhatsApp Web changed under us
+      // and getChats() threw" — telling a connected user they have no groups sends them
+      // hunting through WhatsApp for a problem that is on our side.
+      list.innerHTML = groupsError
+        ? '<p class="subtitle">Couldn\'t read your WhatsApp groups (' + escapeHtml(String(groupsError)) +
+          '). Your session is connected — this is a problem on our side, please try again later.</p>'
+        : '<p class="subtitle">No WhatsApp groups found. Make sure you have groups in WhatsApp.</p>';
       return;
     }
 
@@ -713,7 +719,7 @@
       fetch('/status/' + userId)
         .then(function(r) { return r.json(); })
         .then(function(data) {
-          if (data.isReady) showWaGroupList(data.groups || []);
+          if (data.isReady) showWaGroupList(data.groups || [], data.groupsError);
           else startQRFlow();
         })
         .catch(function() { startQRFlow(); });
