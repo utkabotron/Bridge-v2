@@ -134,6 +134,68 @@ describe('createWhatsAppClient', () => {
     await expect(createWhatsAppClient(99)).rejects.toThrow('init failed');
     expect(clients.has(99)).toBe(false);
   });
+
+  // Regression: dropping the client from the map is not enough — a failed initialize()
+  // leaves its Chromium alive holding the profile's SingletonLock, so the next attempt
+  // dies with "browser is already running" and the orphan keeps its memory. Thirty such
+  // orphans is what put the 3.8 GB box into swap death.
+  test('initialize failure destroys the browser and frees the profile lock', async () => {
+    mockInitialize.mockRejectedValueOnce(new Error('init failed'));
+    mockDestroy.mockClear();
+    fs.unlinkSync.mockClear();
+    fs.unlinkSync.mockImplementation(() => {});
+
+    await expect(createWhatsAppClient(99)).rejects.toThrow('init failed');
+
+    expect(mockDestroy).toHaveBeenCalled();
+    expect(fs.unlinkSync).toHaveBeenCalledWith(
+      expect.stringContaining('session-user-99')
+    );
+  });
+
+  test('a second attempt can start after a failed one', async () => {
+    mockInitialize.mockRejectedValueOnce(new Error('init failed'));
+    await expect(createWhatsAppClient(99)).rejects.toThrow('init failed');
+
+    // connecting must be released, or the retry is refused as "already initializing"
+    mockInitialize.mockResolvedValueOnce();
+    const retried = await createWhatsAppClient(99);
+    expect(retried).not.toBeNull();
+    expect(clients.has(99)).toBe(true);
+  });
+});
+
+// ── SingletonLock cleanup ─────────────────────────────────
+// The lock is a symlink to "<hostname>-<pid>". existsSync() follows it, so a lock left
+// by a dead browser reports false — the exact case cleanup exists for. Unlink blind.
+describe('session lock cleanup', () => {
+  test('removes a lock whose symlink target is gone', async () => {
+    // existsSync false everywhere = dangling symlink, as seen on the box
+    fs.existsSync.mockReturnValue(false);
+    fs.unlinkSync.mockClear();
+    fs.unlinkSync.mockImplementation(() => {});
+    mockInitialize.mockRejectedValueOnce(new Error('init failed'));
+
+    await expect(createWhatsAppClient(77)).rejects.toThrow('init failed');
+
+    expect(fs.unlinkSync).toHaveBeenCalledWith(expect.stringContaining('SingletonLock'));
+  });
+
+  test('a missing lock is not an error', async () => {
+    fs.unlinkSync.mockClear();
+    fs.unlinkSync.mockImplementation(() => {
+      const err = new Error('ENOENT');
+      err.code = 'ENOENT';
+      throw err;
+    });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+    mockInitialize.mockRejectedValueOnce(new Error('init failed'));
+
+    await expect(createWhatsAppClient(78)).rejects.toThrow('init failed');
+
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('SingletonLock'));
+    warnSpy.mockRestore();
+  });
 });
 
 // ── auth_failure event ───────────────────────────────────

@@ -85,9 +85,14 @@ function buildWebVersionCache() {
 function cleanupSessionLock(userId) {
   const lockPath = path.join('.wwebjs_auth', `session-${getClientId(userId)}`, 'SingletonLock');
   try {
-    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+    // SingletonLock is a symlink to "<hostname>-<pid>". existsSync follows the link, so a
+    // lock left by a dead browser answers false and never gets cleaned — which is exactly
+    // the case this function exists for. Unlink unconditionally; ENOENT means it is gone.
+    fs.unlinkSync(lockPath);
   } catch (err) {
-    console.warn(`Failed to remove SingletonLock for user ${userId}: ${err.message}`);
+    if (err.code !== 'ENOENT') {
+      console.warn(`Failed to remove SingletonLock for user ${userId}: ${err.message}`);
+    }
   }
 }
 
@@ -579,6 +584,12 @@ async function createWhatsAppClient(userId) {
   } catch (error) {
     console.error(`Failed to init client for user ${userId}:`, error.message);
     clients.delete(userId);
+    // A failed initialize() still leaves its Chromium running, holding the profile's
+    // SingletonLock — so every later attempt dies with "browser is already running" and
+    // the orphan keeps its ~500 MB. That is how 30 stray browsers piled up and pushed a
+    // 3.8 GB box into swap death. Tear it down before giving up on this attempt.
+    await destroyClient(client, userId);
+    cleanupSessionLock(userId);
     throw error;
   } finally {
     connecting.delete(userId);
