@@ -14,6 +14,7 @@ const mockRedis = {
 jest.mock('../src/whatsapp-client', () => ({
   clients: mockClients,
   createWhatsAppClient: jest.fn(),
+  getGroups: jest.fn(),
 }));
 
 jest.mock('../src/redis-publisher', () => ({
@@ -34,7 +35,7 @@ jest.mock('qrcode', () => ({
 }));
 
 const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../src/db');
-const { createWhatsAppClient } = require('../src/whatsapp-client');
+const { createWhatsAppClient, getGroups } = require('../src/whatsapp-client');
 const router = require('../src/routes/index');
 
 const app = express();
@@ -101,16 +102,8 @@ describe('GET /status/:userId', () => {
   });
 
   test('ready client returns its groups', async () => {
-    mockClients.set(42, {
-      isReady: true,
-      qr: null,
-      client: {
-        getChats: jest.fn().mockResolvedValue([
-          { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [1, 2] },
-          { isGroup: false, id: { _serialized: 'p1@c.us' }, name: 'Bob' },
-        ]),
-      },
-    });
+    mockClients.set(42, { isReady: true, qr: null, client: {} });
+    getGroups.mockResolvedValue([{ id: 'g1@g.us', name: 'Team', participants: 2 }]);
     const res = await request(app).get('/status/42');
     expect(res.status).toBe(200);
     expect(res.body.isReady).toBe(true);
@@ -123,11 +116,8 @@ describe('GET /status/:userId', () => {
   // data.isReady — fell back to the Connect screen and waited forever for a QR that a
   // connected user never gets. The session state must survive a failing group lookup.
   test('getChats failure still reports the session as connected', async () => {
-    mockClients.set(42, {
-      isReady: true,
-      qr: null,
-      client: { getChats: jest.fn().mockRejectedValue(new Error('r')) },
-    });
+    mockClients.set(42, { isReady: true, qr: null, client: {} });
+    getGroups.mockRejectedValue(new Error('r'));
     const res = await request(app).get('/status/42');
     expect(res.status).toBe(200);
     expect(res.body.isReady).toBe(true);

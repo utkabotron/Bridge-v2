@@ -44,6 +44,7 @@ const fs = require('fs');
 const {
   clients,
   createWhatsAppClient,
+  getGroups,
   destroyAllClients,
   recoverLostSessions,
   getAuthenticatedSessionUids,
@@ -528,5 +529,46 @@ describe('webVersionCache pinning', () => {
     expect(cache.remotePath).toBe(
       'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1046140131-alpha.html'
     );
+  });
+});
+
+
+// ── Group listing ─────────────────────────────────────────
+// getChats() maps groups through GroupMetadata.update(), which throws a bare 'r' when
+// WhatsApp reshuffles its minified internals. A healthy session must still list groups.
+describe('getGroups', () => {
+  test('uses getChats when it works, keeping participant counts', async () => {
+    const client = {
+      getChats: jest.fn().mockResolvedValue([
+        { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [1, 2, 3] },
+        { isGroup: false, id: { _serialized: 'p1@c.us' }, name: 'Bob' },
+      ]),
+      pupPage: { evaluate: jest.fn() },
+    };
+    await expect(getGroups(client, 5000)).resolves.toEqual([
+      { id: 'g1@g.us', name: 'Team', participants: 3 },
+    ]);
+    expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+  });
+
+  test("falls back to the lightweight read when getChats throws 'r'", async () => {
+    const client = {
+      getChats: jest.fn().mockRejectedValue(new Error('r')),
+      pupPage: {
+        evaluate: jest.fn().mockResolvedValue([{ id: 'g1@g.us', name: 'Zomer', participants: 0 }]),
+      },
+    };
+    await expect(getGroups(client, 5000)).resolves.toEqual([
+      { id: 'g1@g.us', name: 'Zomer', participants: 0 },
+    ]);
+    expect(client.pupPage.evaluate).toHaveBeenCalled();
+  });
+
+  test('propagates the error when the fallback fails too', async () => {
+    const client = {
+      getChats: jest.fn().mockRejectedValue(new Error('r')),
+      pupPage: { evaluate: jest.fn().mockRejectedValue(new Error('Store missing')) },
+    };
+    await expect(getGroups(client, 5000)).rejects.toThrow('Store missing');
   });
 });

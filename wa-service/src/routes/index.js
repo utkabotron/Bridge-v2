@@ -1,7 +1,8 @@
 const express = require('express');
 const path = require('path');
 const QRCode = require('qrcode');
-const { clients, createWhatsAppClient } = require('../whatsapp-client');
+const { clients, createWhatsAppClient, getGroups } = require('../whatsapp-client');
+const config = require('../config');
 const { redis } = require('../redis-publisher');
 const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
 
@@ -138,16 +139,7 @@ router.get('/status/:userId', async (req, res) => {
   }
 
   try {
-    const chatsPromise = clientData.client.getChats();
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('getChats timeout (15s)')), 15000)
-    );
-    const chats = await Promise.race([chatsPromise, timeoutPromise]);
-    const groups = chats.filter((c) => c.isGroup).map((c) => ({
-      id: c.id._serialized,
-      name: c.name,
-      participants: c.participants?.length || 0,
-    }));
+    const groups = await getGroups(clientData.client, config.GET_CHATS_TIMEOUT);
     res.json({ isReady: true, hasQR: false, groups });
   } catch (err) {
     // getChats() reaches into WA's minified Store and dies (a bare 'r') whenever WA ships

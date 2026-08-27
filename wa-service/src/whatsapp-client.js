@@ -168,6 +168,83 @@ async function reconnectClient(userId, reason) {
   }
 }
 
+// ── Group listing ─────────────────────────────────────────
+// client.getChats() maps every chat through WWebJS.getChatModel, which for groups calls
+// GroupMetadata.update() and reaches into participants._models. That path breaks (throws
+// a bare 'r') whenever WhatsApp reshuffles its minified internals — and it took the Mini
+// App's group picker down with it, even though the session was perfectly healthy.
+//
+// Listing groups needs an id and a name, nothing else. Read them straight off the chat
+// collection and skip the metadata machinery entirely.
+async function getGroupsLite(client) {
+  return client.pupPage.evaluate(() => {
+    const tryRequire = (name) => {
+      try {
+        return window.require(name);
+      } catch {
+        return null;
+      }
+    };
+
+    // window.Store is whatsapp-web.js's own alias for require('WAWebCollections'). When
+    // WhatsApp renames that module the alias never gets built, which is why every Store
+    // call starts throwing a bare 'r'. Go to the collection directly, trying the module
+    // names WhatsApp has used, before giving up.
+    const collections = window.Store || tryRequire('WAWebCollections');
+    let Chat = collections?.Chat;
+    if (!Chat) {
+      for (const name of ['WAWebChatCollection', 'WAWebChatStorage', 'ChatCollection']) {
+        const mod = tryRequire(name);
+        Chat = mod?.ChatCollection || mod?.Chat || mod?.default;
+        if (Chat?.getModelsArray) break;
+        Chat = null;
+      }
+    }
+
+    if (!Chat?.getModelsArray) {
+      const diag = [
+        `store=${typeof window.Store}`,
+        `require=${typeof window.require}`,
+        `wwebjs=${typeof window.WWebJS}`,
+        `collections=${collections ? Object.keys(collections).slice(0, 8).join('/') : 'none'}`,
+      ].join(' ');
+      throw new Error(`chat collection unavailable (${diag})`);
+    }
+
+    return Chat.getModelsArray()
+      .filter((c) => c.id?._serialized?.endsWith('@g.us'))
+      .map((c) => ({
+        id: c.id._serialized,
+        name: c.name || c.formattedTitle || c.id.user,
+        participants: c.groupMetadata?.participants?._models?.length || 0,
+      }));
+  });
+}
+
+// Full model first (it carries participant counts); fall back to the lightweight read
+// when WhatsApp has moved on from what the library expects.
+async function getGroups(client, timeoutMs) {
+  const withTimeout = (promise, label) =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${label} timeout (${timeoutMs / 1000}s)`)), timeoutMs)
+      ),
+    ]);
+
+  try {
+    const chats = await withTimeout(client.getChats(), 'getChats');
+    return chats.filter((c) => c.isGroup).map((c) => ({
+      id: c.id._serialized,
+      name: c.name,
+      participants: c.participants?.length || 0,
+    }));
+  } catch (err) {
+    console.warn(`getChats failed (${err.message}) — falling back to lightweight group read`);
+    return withTimeout(getGroupsLite(client), 'getGroupsLite');
+  }
+}
+
 // ── Persistent session recovery ───────────────────────────
 // A session with an `.authenticated` marker on disk *should* be connected. If it has
 // no live client (failed restore at startup, exhausted fast reconnects, …), keep
@@ -721,6 +798,7 @@ async function destroyAllClients() {
 module.exports = {
   clients,
   connecting,
+  getGroups,
   createWhatsAppClient,
   restoreExistingSessions,
   destroyAllClients,
