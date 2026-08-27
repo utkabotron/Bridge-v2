@@ -196,7 +196,7 @@ describe('disconnected handler', () => {
 
     mockInitialize.mockClear();
     client.emit('disconnected', 'LOGOUT');
-    await Promise.resolve(); // flush the setWaDisconnected microtask
+    await jest.advanceTimersByTimeAsync(0); // flush destroyClient + setWaDisconnected
 
     expect(setWaDisconnected).toHaveBeenCalledWith(42);
     expect(clients.has(42)).toBe(false);
