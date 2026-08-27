@@ -112,6 +112,11 @@ services:
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - PORT=3000
       - TZ=Asia/Jerusalem
+      # environment is an explicit allow-list: anything not named here never reaches the
+      # container, no matter what .env says. Both of these are operational knobs we need
+      # to turn without rebuilding the image.
+      - WA_WEB_VERSION=${WA_WEB_VERSION:-}
+      - MAX_CONCURRENT_CLIENTS=${MAX_CONCURRENT_CLIENTS:-10}
     volumes:
       - wa_sessions:/app/.wwebjs_auth
     healthcheck:
