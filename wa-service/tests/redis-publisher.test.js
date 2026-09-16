@@ -98,6 +98,37 @@ describe('publishMessage', () => {
     expect(args[2]).toBe(`dedup:msg:${payload.wa_message_id}`);
   });
 
+  test('missing wa_message_id — same group message from two clients collapses to one enqueue', async () => {
+    // Every WA client in a group receives the same message. While the fallback id hashed
+    // user_id, four clients produced four ids → four translations → four Telegram messages.
+    mockRedisInstance.eval.mockResolvedValue(1);
+    const fromClientA = { ...basePayload(), user_id: 42 };
+    const fromClientB = { ...basePayload(), user_id: 77, sender_name: 'Alice (work)' };
+    delete fromClientA.wa_message_id;
+    delete fromClientB.wa_message_id;
+
+    await publishMessage(fromClientA);
+    await publishMessage(fromClientB);
+
+    expect(fromClientB.wa_message_id).toBe(fromClientA.wa_message_id);
+    expect(mockRedisInstance.eval.mock.calls[1][2]).toBe(
+      mockRedisInstance.eval.mock.calls[0][2]
+    );
+  });
+
+  test('missing wa_message_id — different chats keep different dedup ids', async () => {
+    mockRedisInstance.eval.mockResolvedValue(1);
+    const first = { ...basePayload(), wa_chat_id: 'chat_1' };
+    const second = { ...basePayload(), wa_chat_id: 'chat_2' };
+    delete first.wa_message_id;
+    delete second.wa_message_id;
+
+    await publishMessage(first);
+    await publishMessage(second);
+
+    expect(second.wa_message_id).not.toBe(first.wa_message_id);
+  });
+
   test('edit — gets its own dedup namespace (not dropped as duplicate of original)', async () => {
     mockRedisInstance.eval.mockResolvedValue(1);
     const payload = { ...basePayload(), is_edited: true };

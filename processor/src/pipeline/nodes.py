@@ -42,16 +42,25 @@ def get_llm() -> ChatOpenAI:
 
 # ── DB helpers (lazy import to avoid circular deps) ──────
 
-async def _fetch_chat_pair(user_id: int, wa_chat_id: str) -> dict | None:
-    from ..db import fetch_active_chat_pair
-    return await fetch_active_chat_pair(user_id, wa_chat_id)
+async def _fetch_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
+    from ..db import fetch_active_chat_pairs
+    return await fetch_active_chat_pairs(user_id, wa_chat_id)
 
 
 # ── Node: validate ────────────────────────────────────────
 
 async def validate_node(state: MessageState) -> MessageState:
-    """Resolve chat_pair_id, tg_chat_id, target_language from DB."""
-    pair = await _fetch_chat_pair(state["user_id"], state["wa_chat_id"])
+    """Resolve chat_pair_id, tg_chat_id, target_language from DB.
+
+    The consumer resolves the pairs itself to fan a group message out to every active
+    pair of that chat, and hands each run its own pre-resolved pair — in that case this
+    node is a pass-through instead of a second identical query.
+    """
+    if state.get("chat_pair_id"):
+        return state
+
+    pairs = await _fetch_chat_pairs(state["user_id"], state["wa_chat_id"])
+    pair = pairs[0] if pairs else None
 
     if not pair:
         logger.warning("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
@@ -239,6 +248,9 @@ async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
         if ok:
             tg_chat_id = migrate_id
 
+    if not ok:
+        await _pause_dead_chat(state, error)
+
     new_status = "delivered" if ok else "failed"
     result = {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status,
               "error": error, "tg_message_id": tg_msg_id}
@@ -294,6 +306,9 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
         if ok:
             tg_chat_id = migrate_id
 
+    if not ok:
+        await _pause_dead_chat(state, error)
+
     # Phase 3: UPDATE event with delivery status + tg_message_id
     new_status = "delivered" if ok else "failed"
     await update_event_after_send(event_id, new_status, error, tg_msg_id)
@@ -342,10 +357,41 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
     return result
 
 
+async def _pause_dead_chat(state: MessageState, error: str | None) -> None:
+    """Pause a pair whose Telegram chat is gone and tell its owner once.
+
+    Without this every later message from that WA chat burns a translation and a failed
+    Telegram call forever — and the owner never learns why their group went quiet.
+    """
+    from ..db import pause_chat_pair
+    from ..telegram_sender import is_dead_chat, send_message
+
+    chat_pair_id = state.get("chat_pair_id")
+    if not chat_pair_id or not is_dead_chat(error):
+        return
+
+    owner_tg_id = await pause_chat_pair(chat_pair_id)
+    logger.warning("Paused chat_pair %s — Telegram chat unreachable: %s", chat_pair_id, error)
+    if not owner_tg_id:
+        return  # already paused by an earlier message — do not notify twice
+
+    chat_name = state.get("wa_chat_name") or "WhatsApp chat"
+    await send_message(
+        chat_id=owner_tg_id,
+        text=(
+            f"\u23f8 Bridge paused for {bold(esc(chat_name))} \u2014 the linked Telegram "
+            "group is no longer reachable.\n\n"
+            "Create a new group, add the bot to it, and link the chat again with /add."
+        ),
+    )
+
+
 async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> None:
     """Update chat_pairs tg_chat_id when Telegram group migrates to supergroup."""
     if not chat_pair_id:
         return
+    import asyncpg
+
     try:
         from ..db import get_pool
         pool = await get_pool()
@@ -354,6 +400,20 @@ async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> N
             int(new_tg_chat_id), chat_pair_id,  # column is bigint — passing str raised DataError, so the update never persisted
         )
         logger.info("Migrated chat_pair %s to new tg_chat_id %s", chat_pair_id, new_tg_chat_id)
+    except asyncpg.exceptions.UniqueViolationError:
+        # The user already re-linked this WA chat to the new supergroup by hand, so a second
+        # row holds the target tg_chat_id. Fold the stale pair into it — leaving both active
+        # would deliver every message into that group twice under fan-out.
+        from ..db import find_chat_pair_by_tg_chat, merge_chat_pairs
+        target_id = await find_chat_pair_by_tg_chat(chat_pair_id, int(new_tg_chat_id))
+        if not target_id:
+            logger.error("chat_pair %s collides on tg_chat_id %s but no target pair found",
+                         chat_pair_id, new_tg_chat_id)
+            return
+        try:
+            await merge_chat_pairs(stale_id=chat_pair_id, target_id=target_id)
+        except Exception as exc:
+            logger.error("Failed to merge chat_pair %s into %s: %s", chat_pair_id, target_id, exc)
     except Exception as exc:
         logger.error("Failed to migrate chat_pair %s: %s", chat_pair_id, exc)
 

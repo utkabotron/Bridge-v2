@@ -37,47 +37,116 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 
-async def fetch_active_chat_pair(user_id: int, wa_chat_id: str) -> Optional[dict]:
-    """Return the active chat_pair for a user+WA chat, or None.
+async def fetch_active_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
+    """Return every active chat_pair a WhatsApp message must be delivered to.
 
-    First tries exact match by user_id + wa_chat_id.
-    If not found, falls back to ANY active pair for this wa_chat_id
-    (handles race condition when multiple WA clients are in the same group
-    and a different client wins the Redis dedup race).
+    A group message is seen by EVERY WhatsApp client that sits in that group, and dedup
+    collapses those copies into a single payload carrying one arbitrary client's user_id.
+    So for groups we fan out to all active pairs of the chat, regardless of who owns them —
+    otherwise whichever user did not win the dedup race silently stops receiving messages
+    (that is how pair 15 starved while pair 11 delivered, both on the same WA group).
+
+    Private chats are scoped to the owning user and NEVER fanned out: a @c.us wa_chat_id is
+    just the other party's JID, so two users talking to the same contact would otherwise be
+    delivered each other's private conversations.
     """
     pool = await get_pool()
-    row = await pool.fetchrow(
-        """
-        select cp.id, cp.tg_chat_id, u.target_language
-        from public.chat_pairs cp
-        join public.users u on u.id = cp.user_id
-        where cp.user_id = (select id from public.users where tg_user_id = $1)
-          and cp.wa_chat_id = $2
-          and cp.status = 'active'
-        limit 1
-        """,
-        user_id,
-        wa_chat_id,
-    )
-    if row:
-        return dict(row)
 
-    # Fallback: any active pair for this wa_chat_id regardless of user
-    row = await pool.fetchrow(
+    if wa_chat_id.endswith("@g.us"):
+        rows = await pool.fetch(
+            """
+            select cp.id, cp.tg_chat_id, u.target_language
+            from public.chat_pairs cp
+            join public.users u on u.id = cp.user_id
+            where cp.wa_chat_id = $1
+              and cp.status = 'active'
+            order by cp.id
+            """,
+            wa_chat_id,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            select cp.id, cp.tg_chat_id, u.target_language
+            from public.chat_pairs cp
+            join public.users u on u.id = cp.user_id
+            where cp.user_id = (select id from public.users where tg_user_id = $1)
+              and cp.wa_chat_id = $2
+              and cp.status = 'active'
+            order by cp.id
+            """,
+            user_id,
+            wa_chat_id,
+        )
+
+    return [dict(row) for row in rows]
+
+
+async def merge_chat_pairs(stale_id: int, target_id: int) -> None:
+    """Fold a stale chat_pair into the pair that already holds its new tg_chat_id.
+
+    Happens when a Telegram group is upgraded to a supergroup and the user re-linked the
+    chat manually before the migration landed: two rows then describe the same bridge, and
+    with fan-out both would deliver into the same group.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Drop rows that would collide on unique (wa_message_id, chat_pair_id)
+            await conn.execute(
+                """
+                delete from public.message_events a
+                using public.message_events b
+                where a.chat_pair_id = $1
+                  and b.chat_pair_id = $2
+                  and a.wa_message_id = b.wa_message_id
+                """,
+                stale_id, target_id,
+            )
+            await conn.execute(
+                "update public.message_events set chat_pair_id = $1 where chat_pair_id = $2",
+                target_id, stale_id,
+            )
+            await conn.execute("delete from public.chat_pairs where id = $1", stale_id)
+    logger.warning("Merged stale chat_pair %s into %s", stale_id, target_id)
+
+
+async def find_chat_pair_by_tg_chat(chat_pair_id: int, tg_chat_id: int) -> Optional[int]:
+    """Id of the pair that already bridges the same WA chat to tg_chat_id, if any."""
+    pool = await get_pool()
+    return await pool.fetchval(
         """
-        select cp.id, cp.tg_chat_id, u.target_language
-        from public.chat_pairs cp
-        join public.users u on u.id = cp.user_id
-        where cp.wa_chat_id = $1
-          and cp.status = 'active'
+        select other.id
+        from public.chat_pairs other
+        join public.chat_pairs stale
+          on stale.user_id = other.user_id
+         and stale.wa_chat_id = other.wa_chat_id
+        where stale.id = $1
+          and other.tg_chat_id = $2
+          and other.id <> stale.id
         limit 1
         """,
-        wa_chat_id,
+        chat_pair_id, tg_chat_id,
     )
-    if row:
-        logger.info("Chat pair fallback: user_id=%s not matched, using pair %s for chat %s",
-                     user_id, row["id"], wa_chat_id)
-    return dict(row) if row else None
+
+
+async def pause_chat_pair(chat_pair_id: int) -> Optional[int]:
+    """Pause a pair whose Telegram chat is gone. Returns the owner's tg_user_id."""
+    pool = await get_pool()
+    try:
+        return await pool.fetchval(
+            """
+            update public.chat_pairs cp
+            set status = 'paused'
+            from public.users u
+            where cp.id = $1 and u.id = cp.user_id and cp.status = 'active'
+            returning u.tg_user_id
+            """,
+            chat_pair_id,
+        )
+    except Exception as exc:
+        logger.error("Failed to pause chat_pair %s: %s", chat_pair_id, exc)
+        return None
 
 
 async def fetch_chat_profile(chat_pair_id: int) -> Optional[dict]:
@@ -109,7 +178,7 @@ async def insert_message_event(state: dict[str, Any], return_id: bool = False) -
                message_type, media_s3_key, translation_ms, delivery_status, error_message,
                tg_message_id)
             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            on conflict (wa_message_id) do update
+            on conflict (wa_message_id, chat_pair_id) do update
               set delivery_status = excluded.delivery_status,
                   translated_text = excluded.translated_text,
                   error_message   = excluded.error_message,

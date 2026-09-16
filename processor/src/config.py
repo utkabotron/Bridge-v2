@@ -9,6 +9,27 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 BRPOP_TIMEOUT = int(os.getenv("BRPOP_TIMEOUT", 5))
+# MUST stay strictly greater than BRPOP_TIMEOUT. redis-py 8.x applies socket_timeout to
+# blocking commands too, so an equal (or unset — it then defaults to something shorter than
+# the server-side block) value makes every idle brpop die with "Timeout reading from redis"
+# instead of returning None: 1395 bogus ERROR lines a day and a reconnect every minute.
+REDIS_SOCKET_TIMEOUT = int(os.getenv("REDIS_SOCKET_TIMEOUT", BRPOP_TIMEOUT + 5))
+REDIS_CONNECT_TIMEOUT = int(os.getenv("REDIS_CONNECT_TIMEOUT", 5))
+
+
+def redis_kwargs(**overrides) -> dict:
+    """Connection kwargs shared by every Redis client in the processor."""
+    kwargs = {
+        "host": REDIS_HOST,
+        "port": REDIS_PORT,
+        "db": REDIS_DB,
+        "decode_responses": True,
+        "socket_timeout": REDIS_SOCKET_TIMEOUT,
+        "socket_connect_timeout": REDIS_CONNECT_TIMEOUT,
+        "health_check_interval": 30,
+    }
+    kwargs.update(overrides)
+    return kwargs
 
 # ── Database ─────────────────────────────────────────────
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")

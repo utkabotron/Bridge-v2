@@ -39,7 +39,7 @@ async def test_validate_node_no_pair():
     """When no chat pair exists, delivery_status should be 'skipped'."""
     from processor.src.pipeline.nodes import validate_node
 
-    with patch("processor.src.pipeline.nodes._fetch_chat_pair", new=AsyncMock(return_value=None)):
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])):
         result = await validate_node(_base_state())
 
     assert result["delivery_status"] == "skipped"
@@ -52,13 +52,28 @@ async def test_validate_node_with_pair():
     from processor.src.pipeline.nodes import validate_node
 
     pair = {"id": 7, "tg_chat_id": -1001234567890, "target_language": "Hebrew"}
-    with patch("processor.src.pipeline.nodes._fetch_chat_pair", new=AsyncMock(return_value=pair)):
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[pair])):
         result = await validate_node(_base_state())
 
     assert result["chat_pair_id"] == 7
     assert result["tg_chat_id"] == -1001234567890
     assert result["target_language"] == "Hebrew"
     assert result["delivery_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_validate_node_pair_already_resolved():
+    """A pre-resolved pair (fan-out branch) passes through without a second DB query."""
+    from processor.src.pipeline.nodes import validate_node
+
+    fetch = AsyncMock(return_value=[])
+    state = _base_state(chat_pair_id=9, tg_chat_id=-100999, target_language="Hebrew")
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=fetch):
+        result = await validate_node(state)
+
+    fetch.assert_not_awaited()
+    assert result["chat_pair_id"] == 9
+    assert result["tg_chat_id"] == -100999
 
 
 # ── translate_node ────────────────────────────────────────
@@ -164,3 +179,88 @@ def test_should_translate_routing():
 
     # Normal → translate
     assert _should_translate({"delivery_status": "pending", "original_text": "hello"}) == "translate"
+
+
+# ── fan-out over chat pairs ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_process_message_fans_out_to_every_pair():
+    """A group message runs once per active pair of that chat.
+
+    Dedup in wa-service keeps a single copy of a group message, so delivering it to just
+    one pair would starve every other user bridging the same WhatsApp group.
+    """
+    import json
+
+    import processor.src.main as main
+
+    payload = {
+        "wa_message_id": "fallback:abc",
+        "wa_chat_id": "1234567890@g.us",
+        "user_id": 100,
+        "body": "שלום",
+    }
+    pairs = [
+        {"id": 11, "tg_chat_id": -1001, "target_language": "Russian"},
+        {"id": 15, "tg_chat_id": -1002, "target_language": "Hebrew"},
+    ]
+    runs = []
+
+    async def fake_run(r, payload_, state, msg_id, wa_message_id):
+        runs.append((state["chat_pair_id"], state["tg_chat_id"], state["target_language"]))
+
+    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=pairs)), \
+         patch("processor.src.main._already_delivered", new=AsyncMock(return_value=False)), \
+         patch("processor.src.main._run_pipeline", new=fake_run):
+        await main._process_message(MagicMock(), json.dumps(payload))
+
+    assert runs == [(11, -1001, "Russian"), (15, -1002, "Hebrew")]
+
+
+@pytest.mark.asyncio
+async def test_process_message_skips_pair_already_delivered():
+    """Per-pair dedup: a pair that already got the message is skipped, the other still runs."""
+    import json
+
+    import processor.src.main as main
+
+    payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@g.us", "user_id": 100, "body": "hi"}
+    pairs = [
+        {"id": 11, "tg_chat_id": -1001, "target_language": "Russian"},
+        {"id": 15, "tg_chat_id": -1002, "target_language": "Russian"},
+    ]
+    runs = []
+
+    async def fake_run(r, payload_, state, msg_id, wa_message_id):
+        runs.append(state["chat_pair_id"])
+
+    async def fake_delivered(wa_message_id, chat_pair_id):
+        return chat_pair_id == 11
+
+    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=pairs)), \
+         patch("processor.src.main._already_delivered", new=fake_delivered), \
+         patch("processor.src.main._run_pipeline", new=fake_run):
+        await main._process_message(MagicMock(), json.dumps(payload))
+
+    assert runs == [15]
+
+
+@pytest.mark.asyncio
+async def test_process_message_without_pairs_still_runs_once():
+    """No pair at all → one pair-less run, so validate_node decides skip vs admin fallback."""
+    import json
+
+    import processor.src.main as main
+
+    payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@g.us", "user_id": 100, "body": "hi"}
+    runs = []
+
+    async def fake_run(r, payload_, state, msg_id, wa_message_id):
+        runs.append(state["chat_pair_id"])
+
+    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.main._already_delivered", new=AsyncMock(return_value=False)), \
+         patch("processor.src.main._run_pipeline", new=fake_run):
+        await main._process_message(MagicMock(), json.dumps(payload))
+
+    assert runs == [None]

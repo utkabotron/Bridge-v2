@@ -19,7 +19,7 @@ from typing import Optional
 import redis.asyncio as aioredis
 
 from ..config import (
-    REDIS_HOST, REDIS_PORT, REDIS_DB,
+    redis_kwargs,
     TRANSLATION_CACHE_TTL, PROFILE_CACHE_TTL, MEDIA_CACHE_TTL,
 )
 
@@ -30,12 +30,7 @@ CACHE_TTL = TRANSLATION_CACHE_TTL
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:
-        _client = aioredis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            decode_responses=True,
-        )
+        _client = aioredis.Redis(**redis_kwargs())
     return _client
 
 

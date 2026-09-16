@@ -73,6 +73,28 @@ def _parse_migrate(resp_text: str) -> Optional[int]:
         return None
 
 
+# Telegram errors that mean the chat is gone for good: retrying it costs a failed API call
+# per message forever (pair 15 burned 14 deliveries a day this way). A supergroup migration
+# is NOT in this list — that one is recoverable via migrate_to_chat_id.
+_DEAD_CHAT_MARKERS = (
+    "group chat was deleted",
+    "bot was kicked",
+    "bot is not a member",
+    "chat not found",
+    "user is deactivated",
+)
+
+
+def is_dead_chat(resp_text: Optional[str]) -> bool:
+    """True when Telegram says this chat can never accept messages again."""
+    if not resp_text:
+        return False
+    if _parse_migrate(resp_text):
+        return False
+    lowered = resp_text.lower()
+    return any(marker in lowered for marker in _DEAD_CHAT_MARKERS)
+
+
 def _parse_retry_after(resp_text: str) -> Optional[int]:
     """Extract retry_after seconds from Telegram 429 response."""
     try:

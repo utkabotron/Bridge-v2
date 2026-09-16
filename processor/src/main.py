@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import (
-    REDIS_HOST, REDIS_PORT, REDIS_DB, BRPOP_TIMEOUT,
+    BRPOP_TIMEOUT, redis_kwargs,
     ADMIN_TG_IDS as _CFG_ADMIN_TG_IDS,
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
     FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
@@ -34,7 +34,7 @@ from .config import (
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
-from .db import get_pool, insert_direct_translation, insert_direct_media_analysis
+from .db import get_pool, fetch_active_chat_pairs, insert_direct_translation, insert_direct_media_analysis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -446,12 +446,7 @@ async def api_backlog_update(issue_id: int = Path(...), body: BacklogUpdate = ..
 @app.get("/api/dlq")
 async def api_dlq():
     """List messages in the dead-letter queue."""
-    r = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True,
-    )
+    r = aioredis.Redis(**redis_kwargs())
     try:
         items = await r.lrange("messages:dlq", 0, 99)
         return [json.loads(item) for item in items]
@@ -462,12 +457,7 @@ async def api_dlq():
 @app.post("/api/dlq/retry")
 async def api_dlq_retry():
     """Move all DLQ messages back to messages:in for reprocessing."""
-    r = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True,
-    )
+    r = aioredis.Redis(**redis_kwargs())
     # Atomic per item: pop from DLQ, unwrap the {"payload": ...} envelope, and requeue in
     # one server-side script so a crash between pop and push can't lose the message.
     lua = """
@@ -913,21 +903,6 @@ async def _process_message(r, raw: str) -> None:
             "error": None,
         }
 
-        # ── DB dedup: skip if already delivered ──
-        # A dedup-lookup failure (DB down/timeout) must NOT drop the message — process it.
-        try:
-            pool = await get_pool()
-            existing = await pool.fetchval(
-                "SELECT delivery_status FROM message_events WHERE wa_message_id = $1",
-                wa_message_id,
-            )
-            if existing == "delivered":
-                _counter["skipped"] += 1
-                logger.info("Dedup skip: %s already delivered", wa_message_id)
-                return
-        except Exception as dexc:
-            logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, dexc)
-
         msg_id = wa_message_id[:12]
         sender = state["sender_name"] or "unknown"
         text_preview = (state["original_text"] or "")[:60]
@@ -938,12 +913,60 @@ async def _process_message(r, raw: str) -> None:
             "text": text_preview,
             "chat": state["wa_chat_name"],
         })
+        # Every active pair of this chat gets its own run: a WhatsApp group message is
+        # seen by several clients but dedup keeps only one copy, so fanning out here is
+        # what stops the pairs that did not win the dedup race from starving.
+        pairs = await fetch_active_chat_pairs(user_id, state["wa_chat_id"])
     except Exception as exc:
-        # Failure in parse/build/dedup/emit — the popped message would otherwise vanish.
+        # Failure in parse/build/lookup/emit — the popped message would otherwise vanish.
         _counter["failed"] += 1
         logger.error("Pre-pipeline error for %s: %s", payload.get("wa_message_id"), exc)
         await _dlq_push(r, payload, str(exc))
         return
+
+    # No pair → a single pair-less run, so validate_node still decides between the
+    # admin fallback and "skipped".
+    branches = [
+        {
+            **state,
+            "chat_pair_id": pair["id"],
+            "tg_chat_id": pair["tg_chat_id"],
+            "target_language": pair.get("target_language") or "Russian",
+        }
+        for pair in pairs
+    ] or [state]
+
+    for branch in branches:
+        chat_pair_id = branch.get("chat_pair_id")
+        if await _already_delivered(wa_message_id, chat_pair_id):
+            _counter["skipped"] += 1
+            logger.info("Dedup skip: %s already delivered to pair %s", wa_message_id, chat_pair_id)
+            continue
+        await _run_pipeline(r, payload, branch, msg_id, wa_message_id)
+
+
+async def _already_delivered(wa_message_id: str, chat_pair_id: int | None) -> bool:
+    """True if this message was already delivered to this pair.
+
+    A lookup failure (DB down/timeout) must NOT drop the message — process it.
+    """
+    try:
+        pool = await get_pool()
+        existing = await pool.fetchval(
+            """
+            SELECT delivery_status FROM message_events
+            WHERE wa_message_id = $1 AND chat_pair_id IS NOT DISTINCT FROM $2
+            """,
+            wa_message_id, chat_pair_id,
+        )
+        return existing == "delivered"
+    except Exception as exc:
+        logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, exc)
+        return False
+
+
+async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_id: str) -> None:
+    """Run the LangGraph pipeline for one (message, chat pair) branch."""
 
     try:
         final_state = None
@@ -954,6 +977,9 @@ async def _process_message(r, raw: str) -> None:
                 elapsed = int((time.monotonic() - t0) * 1000)
                 evt = {
                     "msg_id": msg_id,
+                    # One message can run once per chat pair — the dashboard needs the pair
+                    # to keep those branches apart.
+                    "chat_pair_id": state.get("chat_pair_id"),
                     "node": node_name,
                     "elapsed_ms": elapsed,
                     "status": node_output.get("delivery_status", "ok"),
@@ -986,6 +1012,7 @@ async def _process_message(r, raw: str) -> None:
             total_ms = int((time.monotonic() - t0) * 1000)
             emit("message_delivered", {
                 "msg_id": msg_id,
+                "chat_pair_id": state.get("chat_pair_id"),
                 "total_ms": total_ms,
                 "cache_hit": final_state.get("cache_hit"),
             })
@@ -1001,6 +1028,7 @@ async def _process_message(r, raw: str) -> None:
             _counter["skipped"] += 1
             emit("message_skipped", {
                 "msg_id": msg_id,
+                "chat_pair_id": state.get("chat_pair_id"),
                 "error": final_state.get("error", "no_chat_pair"),
             })
             logger.debug("Skipped %s: %s", wa_message_id, final_state.get("error"))
@@ -1020,12 +1048,7 @@ async def _process_message(r, raw: str) -> None:
 
 
 async def consume_loop():
-    r = aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        db=REDIS_DB,
-        decode_responses=True,
-    )
+    r = aioredis.Redis(**redis_kwargs())
 
     logger.info("Consumer loop started — waiting for messages:in")
 

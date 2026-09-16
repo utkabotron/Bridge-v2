@@ -61,10 +61,28 @@ def cleanup_table(label: str, query: str, params: tuple | None) -> int:
 
 @flow(name="daily-cleanup", log_prints=True)
 def daily_cleanup():
-    """Daily cleanup: old messages + stale onboarding sessions + old analysis + old direct interactions."""
+    """Daily cleanup: old messages + stale onboarding sessions + old analysis + old direct interactions.
+
+    Each table is cleaned independently: one failing table used to abort the whole flow,
+    so a FK violation on message_events meant nothing at all got cleaned for weeks.
+    """
+    logger = get_run_logger()
     results = {}
+    failures = {}
+
     for label, query, params in _CLEANUP_TASKS:
-        results[f"{label}_deleted"] = cleanup_table(label, query, params)
+        try:
+            results[f"{label}_deleted"] = cleanup_table(label, query, params)
+        except Exception as exc:
+            failures[label] = str(exc)
+            results[f"{label}_deleted"] = None
+            logger.error("Cleanup of %s failed: %s — continuing with the other tables", label, exc)
+
+    if failures:
+        results["failures"] = failures
+        if len(failures) == len(_CLEANUP_TASKS):
+            raise RuntimeError(f"All cleanup tasks failed: {failures}")
+
     return results
 
 

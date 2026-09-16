@@ -42,14 +42,21 @@ end`;
 
 /**
  * Build a content-based dedup id for messages whose wa_message_id is missing.
- * Uses user + chat + timestamp + body hash so genuine re-emits still collapse,
- * but distinct messages get distinct keys instead of a shared "undefined".
+ * Uses chat + timestamp + body hash so genuine re-emits still collapse, but distinct
+ * messages get distinct keys instead of a shared "undefined".
+ *
+ * Deliberately NOT keyed by user_id: every WhatsApp client sitting in a group receives
+ * the same message, so hashing the receiving client turned one group message into one
+ * queue entry PER CLIENT — four clients meant four translations and four Telegram
+ * messages. All fields below are identical across clients for the same message;
+ * sender_name is not (pushname vs. contact name), which is why it stays out.
+ * The processor fans the single surviving copy out to every active pair of the chat.
+ *
  * Edits get their own namespace so an edit is never dropped as a duplicate of
  * the original message it revises.
  */
 function fallbackDedupId(payload) {
   const parts = [
-    payload.user_id,
     payload.wa_chat_id,
     payload.timestamp,
     payload.body || '',

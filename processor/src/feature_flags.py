@@ -10,7 +10,7 @@ import os
 
 import redis.asyncio as aioredis
 
-from .config import REDIS_HOST, REDIS_PORT, REDIS_DB
+from .config import redis_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +28,7 @@ _last_known: dict[str, bool] = {}
 def _get_redis() -> aioredis.Redis:
     global _redis
     if _redis is None:
-        _redis = aioredis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
-            decode_responses=True,
-        )
+        _redis = aioredis.Redis(**redis_kwargs())
     return _redis
 
 

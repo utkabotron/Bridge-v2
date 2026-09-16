@@ -301,3 +301,26 @@ def test_split_caption_overflow_kept():
     assert overflow is not None
     # Nothing is dropped: caption + overflow reconstruct the source.
     assert cap + overflow == "a" * 2000
+
+
+# ── dead chat detection ───────────────────────────────────
+
+def test_is_dead_chat_detects_unrecoverable_errors():
+    """403/400 responses that mean the chat can never accept messages again."""
+    from processor.src.telegram_sender import is_dead_chat
+
+    assert is_dead_chat('{"ok":false,"error_code":403,"description":"Forbidden: the group chat was deleted"}')
+    assert is_dead_chat('{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked from the group chat"}')
+    assert is_dead_chat('{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}')
+
+
+def test_is_dead_chat_ignores_recoverable_errors():
+    """A supergroup migration is recoverable — pausing the pair there would break the bridge."""
+    from processor.src.telegram_sender import is_dead_chat
+
+    migrated = ('{"ok":false,"error_code":400,"description":"Bad Request: group chat was upgraded to a '
+                'supergroup chat","parameters":{"migrate_to_chat_id":-1004396105698}}')
+    assert not is_dead_chat(migrated)
+    assert not is_dead_chat('{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5"}')
+    assert not is_dead_chat(None)
+    assert not is_dead_chat("")
