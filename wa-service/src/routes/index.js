@@ -46,45 +46,6 @@ router.get('/health', (req, res) => {
   });
 });
 
-// ── Everything below requires an authenticated Telegram identity ──
-router.use(authenticate);
-
-// ── QR image ──────────────────────────────────────────────
-router.get('/qr/image/:userId', requireSelf, async (req, res) => {
-  const userId = parseInt(req.params.userId, 10);
-
-  const clientData = clients.get(userId);
-
-  if (!clientData) {
-    // Auto-create client and start QR generation — only for known/active users.
-    if (!(await userExists(userId))) {
-      return res.status(403).json({ error: 'Unknown user' });
-    }
-    try {
-      createWhatsAppClient(userId).catch(console.error); // fire & forget
-      return res.status(202).json({ status: 'initializing', message: 'Client starting, retry in 5s' });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
-  if (clientData.isReady) {
-    return res.json({ status: 'ready', message: 'Already connected' });
-  }
-
-  if (!clientData.qr) {
-    return res.status(202).json({ status: 'waiting', message: 'QR not yet generated, retry in 3s' });
-  }
-
-  try {
-    const png = await QRCode.toBuffer(clientData.qr);
-    res.setHeader('Content-Type', 'image/png');
-    res.send(png);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ── QR web page ───────────────────────────────────────────
 // Reached from the onboarding link the bot sends, i.e. a plain browser with no initData.
 // The user id lives in a short-lived Redis token instead of the path: the old
@@ -153,6 +114,45 @@ router.get('/qr/page', async (req, res) => {
   </script>
 </body>
 </html>`);
+});
+
+// ── Everything below requires an authenticated Telegram identity ──
+router.use(authenticate);
+
+// ── QR image ──────────────────────────────────────────────
+router.get('/qr/image/:userId', requireSelf, async (req, res) => {
+  const userId = parseInt(req.params.userId, 10);
+
+  const clientData = clients.get(userId);
+
+  if (!clientData) {
+    // Auto-create client and start QR generation — only for known/active users.
+    if (!(await userExists(userId))) {
+      return res.status(403).json({ error: 'Unknown user' });
+    }
+    try {
+      createWhatsAppClient(userId).catch(console.error); // fire & forget
+      return res.status(202).json({ status: 'initializing', message: 'Client starting, retry in 5s' });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  if (clientData.isReady) {
+    return res.json({ status: 'ready', message: 'Already connected' });
+  }
+
+  if (!clientData.qr) {
+    return res.status(202).json({ status: 'waiting', message: 'QR not yet generated, retry in 3s' });
+  }
+
+  try {
+    const png = await QRCode.toBuffer(clientData.qr);
+    res.setHeader('Content-Type', 'image/png');
+    res.send(png);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── Status ────────────────────────────────────────────────
