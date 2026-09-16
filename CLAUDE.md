@@ -126,7 +126,11 @@ processor и bot НЕ общаются — оба независимо → Postg
 | Key | Type | TTL | Use |
 |-----|------|-----|-----|
 | `messages:in` | List | — | WA→processor queue |
-| `messages:dlq` | List | — | Dead-letter queue |
+| `messages:processing` | List | — | In-flight: взято из messages:in, ещё не завершено |
+| `messages:dlq` | List | — | Dead-letter queue (авторазбор каждые 10 мин, до 5 попыток) |
+| `messages:dlq:dead` | List | — | Сдались после DLQ_MAX_ATTEMPTS |
+| `qr:token:{token}` | String | 15m | Одноразовый токен QR-страницы |
+| `analytics:health:*` | String/Hash | 1h | Дедуп алертов + прошлые значения метрик |
 | `dedup:msg:{wa_message_id}` | String | 5m | Message dedup (SET NX) |
 | `onboarding:qr_scanned:{userId}` | Pub/Sub | — | WA connected event |
 | `chat_pairs:user:{uid}:chat:{chatId}` | String | 1h | Chat pairs cache |
@@ -162,9 +166,14 @@ processor и bot НЕ общаются — оба независимо → Postg
 
 ## WA-SERVICE API
 
+**Все роуты кроме `/health` и `/miniapp` требуют авторизации** (`src/middleware/tg-auth.js`):
+подписанный `X-Tg-Init-Data` из Mini App, либо `X-Internal-Token` + `X-Internal-User-Id`
+(вызовы бота), либо `?t=<qr-токен>` для QR-страницы вне Telegram. `requireSelf` сверяет
+личность с `:userId` в пути. Новый роут ниже `router.use(authenticate)` защищён автоматически.
+
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | /health | Health + activeClients + redis status |
+| GET | /health | activeClients + readyClients + lastMessageAt + redis (без авторизации) |
 | GET | /chat-pairs/:userId | Pairs list + wa_connected |
 | PATCH | /chat-pairs/:pairId | Pause/resume |
 | DELETE | /chat-pairs/:pairId | Delete pair |
@@ -174,6 +183,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 | POST | /disconnect/:userId | Destroy WA client |
 | POST | /reconnect/:userId | Recreate WA client |
 | GET | /qr/image/:userId | PNG QR (202 if starting) |
+| GET | /qr/page?t= | QR-страница по одноразовому токену (не по userId) |
 
 ## FEATURE FLAGS
 
@@ -216,15 +226,32 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | chat-context-builder | 0 5 * * * | gpt-4.1 + web_search |
 | weekly-report | 0 5 * * 1 | o3 |
 | daily-chat-summary | */30 * * * * | gpt-4.1-mini |
+| nightly-backup | 30 2 * * * | — (pg_dump, 7 копий) |
 
 ## ONBOARDING FSM
 
 `idle → qr_pending → wa_connected → linking → done`
 Table: onboarding_sessions. /start always shows Mini App button.
 
+## RELIABILITY
+
+- `wa-health-check` алертит в Telegram: клиент отвалился, тишина >3ч днём, очередь растёт,
+  DLQ не разбирается, processor молчит, db_write_failed растёт, диск >85%, своп >75%.
+  Дедуп алертов — Redis, час.
+- Отказ OpenAI НЕ теряет сообщение: доставляется оригинал с пометкой (`TRANSLATION_UNAVAILABLE_NOTE`).
+- Очередь: `BLMOVE messages:in → messages:processing`, удаление после успеха, возврат
+  зависших при старте. DLQ разбирается автоматически.
+- Миграции: `./infra/migrate.sh` (журнал `schema_migrations`), запускать всегда.
+- Бэкапы: `nightly-backup` → `/home/deploy/backups/pg`, 7 копий, проверка `pg_restore --list`.
+- Python-зависимости: ставятся из `requirements.lock`, не из `.txt`.
+
 ## CONSTRAINTS
 
 - wa-service: 1 replica only (whatsapp-web.js). Sessions in `.wwebjs_auth/` volume. System Chromium `/usr/bin/chromium`. SingletonLock cleanup needed on container recreate.
+- Все сервисы работают под непривилегированным пользователем. Том `wa_sessions` принадлежит
+  uid 1000 — при пересоздании тома нужен `chown -R 1000:1000` (см. wa-service/Dockerfile).
+- `MINIO_ROOT_USER/PASSWORD` и `INTERNAL_API_TOKEN` обязательны в `.env` — compose падает без них.
+- Бакет медиа приватный; ссылки наружу только presigned (`processor/src/s3.py`), объекты живут 90 дней.
 - wa-service port 3000: expose-only, NOT published. Access via nginx.
 - Media format: `*Sender*\n\noriginal\n\ntranslated`. Media sent natively (sendPhoto/etc), NOT in formatted_text.
 - MinIO locally (9000/9001), bucket `bridge-media` auto-created via `infra/minio-init.sh`.
