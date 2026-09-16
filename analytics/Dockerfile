@@ -6,8 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements.lock ./
+# Install the lock, not the ranges — see requirements.lock for why.
+RUN pip install --no-cache-dir -r requirements.lock
 
 COPY flows/ ./flows/
 COPY serve_flows.py ./serve_flows.py
@@ -22,7 +23,8 @@ RUN useradd --create-home --uid 10001 appuser \
 USER appuser
 
 # Prefect writes its local state under $HOME.
-ENV PREFECT_HOME=/home/appuser/.prefect
+ENV PREFECT_HOME=/home/appuser/.prefect \
+    PREFECT_UI_STATIC_DIRECTORY=/home/appuser/.prefect/ui
 
 EXPOSE 4200
 

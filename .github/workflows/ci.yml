@@ -50,10 +50,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install processor deps
-        run: pip install -r processor/requirements.txt
+        run: pip install -r processor/requirements.lock
 
       - name: Install bot deps
-        run: pip install -r bot/requirements.txt
+        run: pip install -r bot/requirements.lock
 
       - name: Run processor tests
         env:
