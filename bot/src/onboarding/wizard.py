@@ -19,7 +19,6 @@ from telegram.ext import ContextTypes
 from ..db import (
     add_chat_pair,
     add_to_whitelist,
-    count_users,
     create_user,
     get_chat_pairs,
     get_onboarding_state,
@@ -38,15 +37,15 @@ MINIAPP_URL = os.getenv("WA_SERVICE_PUBLIC_URL", "http://localhost:3000") + "/mi
 
 
 async def _wa_connect(user_id: int) -> dict:
-    from ..utils.http_client import post
-    r = await post(f"{WA_SERVICE_URL}/connect/{user_id}", timeout=10)
+    from ..utils.http_client import internal_headers, post
+    r = await post(f"{WA_SERVICE_URL}/connect/{user_id}", timeout=10, headers=internal_headers(user_id))
     r.raise_for_status()
     return r.json()
 
 
 async def _wa_status(user_id: int) -> dict:
-    from ..utils.http_client import get
-    r = await get(f"{WA_SERVICE_URL}/status/{user_id}", timeout=10)
+    from ..utils.http_client import get, internal_headers
+    r = await get(f"{WA_SERVICE_URL}/status/{user_id}", timeout=10, headers=internal_headers(user_id))
     r.raise_for_status()
     return r.json()
 
@@ -57,14 +56,17 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     tg_id = user.id
 
-    # First user ever → auto-promote to admin
-    if await count_users() == 0:
+    # Bootstrap admins from ADMIN_TG_IDS. This used to promote whoever sent /start first
+    # while the users table was empty — so a stranger who found the bot right after a
+    # volume reset or a fresh deploy inherited /whitelist, /users and /broadcast.
+    admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+    if tg_id in admin_ids:
         await add_to_whitelist(tg_id, user.username)
         pool = await get_pool()
         await pool.execute(
             "update public.users set is_admin = true where tg_user_id = $1", tg_id
         )
-        logger.info("First user %s auto-promoted to admin", tg_id)
+        logger.info("Bootstrapped admin %s from ADMIN_TG_IDS", tg_id)
 
     whitelisted = await is_whitelisted(tg_id)
     if not whitelisted:
@@ -103,7 +105,7 @@ async def cb_connect_wa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         result = await _wa_connect(tg_id)
-        qr_url = f"{WA_SERVICE_URL}{result.get('qrPageUrl', f'/qr/page/{tg_id}')}"
+        qr_url = f"{WA_SERVICE_URL}{result['qrPageUrl']}"
         # Replace internal hostname with public URL if set
         public_wa = os.getenv("WA_SERVICE_PUBLIC_URL", "")
         if public_wa:

@@ -67,8 +67,8 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Fetch WA status + groups
     try:
-        from ..utils.http_client import get as http_get
-        r = await http_get(f"{WA_SERVICE_URL}/status/{tg_id}", timeout=10)
+        from ..utils.http_client import get as http_get, internal_headers
+        r = await http_get(f"{WA_SERVICE_URL}/status/{tg_id}", timeout=10, headers=internal_headers(tg_id))
         data = r.json()
     except Exception as exc:
         logger.error("WA status error: %s", exc)

@@ -22,7 +22,7 @@ Deploy Bridge-v2 services to production VPS via rsync + Docker Compose.
 
 3. Rsync project to VPS (no git repo on server). IMPORTANT: target is `/home/deploy/bridge-v2/`, NOT `~/bridge-v2/` (root home):
    ```
-   rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' --exclude '.venv' ./ bridge:/home/deploy/bridge-v2/
+   rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' --exclude '.venv' --exclude '*.tfvars' --exclude '*accessKeys*' ./ bridge:/home/deploy/bridge-v2/
    ```
 
 4. **Apply new migrations** (if any new SQL files in `infra/migrations/`). Pipe each new migration into postgres container:

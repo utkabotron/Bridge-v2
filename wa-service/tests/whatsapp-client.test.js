@@ -122,11 +122,13 @@ describe('createWhatsAppClient', () => {
   });
 
   test('throws when max clients reached', async () => {
-    // MAX_CONCURRENT_CLIENTS defaults to 10
-    for (let i = 1; i <= 10; i++) {
+    // MAX_CONCURRENT_CLIENTS defaults to 4: each client is a ~400 MB Chromium and the
+    // box has 3.8 GB, so the old default of 10 promised an OOM rather than a rejection.
+    const limit = require('../src/config').MAX_CONCURRENT_CLIENTS;
+    for (let i = 1; i <= limit; i++) {
       await createWhatsAppClient(i);
     }
-    await expect(createWhatsAppClient(11)).rejects.toThrow('Max clients reached');
+    await expect(createWhatsAppClient(limit + 1)).rejects.toThrow('Max clients reached');
   });
 
   test('cleans up on initialize failure', async () => {

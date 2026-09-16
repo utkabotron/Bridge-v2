@@ -39,18 +39,23 @@ async function setWaConnected(tgUserId, connected) {
   return rowCount > 0;
 }
 
-async function setChatPairStatus(pairId, status) {
+// Both mutations are scoped to the owner. Keyed by id alone (as they were), walking
+// pairId 1..N from the open internet paused or permanently deleted every user's bridges.
+// The bot has always scoped its equivalent (bot/src/db.py set_chat_pair_status_owned).
+async function setChatPairStatus(pairId, status, tgUserId) {
   const { rowCount } = await pool.query(
-    'UPDATE chat_pairs SET status = $1 WHERE id = $2',
-    [status, pairId]
+    `UPDATE chat_pairs SET status = $1
+     WHERE id = $2 AND user_id = (SELECT id FROM users WHERE tg_user_id = $3)`,
+    [status, pairId, tgUserId]
   );
   return rowCount > 0;
 }
 
-async function deleteChatPair(pairId) {
+async function deleteChatPair(pairId, tgUserId) {
   const { rowCount } = await pool.query(
-    'DELETE FROM chat_pairs WHERE id = $1',
-    [pairId]
+    `DELETE FROM chat_pairs
+     WHERE id = $1 AND user_id = (SELECT id FROM users WHERE tg_user_id = $2)`,
+    [pairId, tgUserId]
   );
   return rowCount > 0;
 }

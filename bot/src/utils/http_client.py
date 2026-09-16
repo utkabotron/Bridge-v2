@@ -7,11 +7,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# wa-service authenticates Mini App traffic with signed Telegram initData, which the bot
+# has no way to produce for its own server-to-server calls. It presents this shared secret
+# instead; without it /connect and /status answer 401.
+INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+
+
+def internal_headers(user_id: int | None = None) -> dict[str, str]:
+    """Auth headers for calls into wa-service.
+
+    `user_id` names the user the bot is acting for; wa-service scopes the request to them.
+    """
+    headers = {"X-Internal-Token": INTERNAL_API_TOKEN}
+    if user_id is not None:
+        headers["X-Internal-User-Id"] = str(user_id)
+    return headers
 
 _client: httpx.AsyncClient | None = None
 

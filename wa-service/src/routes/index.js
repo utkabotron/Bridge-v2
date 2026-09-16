@@ -5,6 +5,7 @@ const { clients, createWhatsAppClient, getGroups } = require('../whatsapp-client
 const config = require('../config');
 const { redis } = require('../redis-publisher');
 const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
+const { authenticate, requireSelf, createQrToken, resolveQrToken } = require('../middleware/tg-auth');
 
 const router = express.Router();
 
@@ -18,24 +19,39 @@ router.use((req, res, next) => {
   next();
 });
 
-// ── Mini App ─────────────────────────────────────────────
+// ── Public: Mini App shell and health ────────────────────
+// The shell carries no user data — it authenticates its own API calls with initData.
+
 router.get('/miniapp', (req, res) => {
   res.sendFile('miniapp.html', { root: path.join(__dirname, '..', '..', 'public') });
 });
 
-// ── Health ────────────────────────────────────────────────
+// Consumed by the analytics health-check flow, which has no Telegram identity.
+// Exposes counters and liveness only — never chat or user content.
 router.get('/health', (req, res) => {
+  const perClient = [];
+  for (const [userId, data] of clients.entries()) {
+    perClient.push({
+      userId,
+      isReady: !!data.isReady,
+      lastMessageAt: data.lastMessageAt || null,
+    });
+  }
   res.json({
     status: 'ok',
     activeClients: clients.size,
+    readyClients: perClient.filter((c) => c.isReady).length,
+    clients: perClient,
     redis: redis.status === 'ready' ? 'connected' : 'disconnected',
   });
 });
 
+// ── Everything below requires an authenticated Telegram identity ──
+router.use(authenticate);
+
 // ── QR image ──────────────────────────────────────────────
-router.get('/qr/image/:userId', async (req, res) => {
+router.get('/qr/image/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   const clientData = clients.get(userId);
 
@@ -70,9 +86,22 @@ router.get('/qr/image/:userId', async (req, res) => {
 });
 
 // ── QR web page ───────────────────────────────────────────
-router.get('/qr/page/:userId', (req, res) => {
-  const { userId } = req.params;
-  const host = req.get('host') || `localhost:${process.env.PORT || 3000}`;
+// Reached from the onboarding link the bot sends, i.e. a plain browser with no initData.
+// The user id lives in a short-lived Redis token instead of the path: the old
+// /qr/page/:userId both handed any passer-by another user's QR (account takeover) and
+// reflected the raw path segment into the HTML and two JS string literals (XSS on the
+// real domain, which is also the Mini App's origin).
+router.get('/qr/page', async (req, res) => {
+  const userId = await resolveQrToken(req.query.t);
+  if (userId === null) {
+    res.status(401).setHeader('Content-Type', 'text/html');
+    return res.send('<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding-top:80px">'
+      + '<h3>Link expired</h3><p>Open the bot in Telegram and tap Connect again.</p></body></html>');
+  }
+
+  // userId is an integer read back from Redis and the token is hex-validated, so nothing
+  // user-controlled reaches the markup below.
+  const token = String(req.query.t);
 
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!DOCTYPE html>
@@ -92,16 +121,18 @@ router.get('/qr/page/:userId', (req, res) => {
 <body>
   <h2>Scan QR code in WhatsApp</h2>
   <p>Settings → Linked Devices → Link a Device</p>
-  <img id="qr" src="/qr/image/${userId}" width="280" height="280" alt="QR Code">
+  <img id="qr" src="/qr/image/${userId}?t=${token}" width="280" height="280" alt="QR Code">
   <p id="status">Waiting for QR...</p>
   <script>
+    const USER_ID = ${userId};
+    const TOKEN = ${JSON.stringify(token)};
     const img = document.getElementById('qr');
     const status = document.getElementById('status');
     let connected = false;
 
     async function poll() {
       try {
-        const r = await fetch('/status/${userId}');
+        const r = await fetch('/status/' + USER_ID + '?t=' + TOKEN);
         const d = await r.json();
         if (d.isReady) {
           connected = true;
@@ -112,7 +143,7 @@ router.get('/qr/page/:userId', (req, res) => {
       } catch {}
 
       if (!connected) {
-        img.src = '/qr/image/${userId}?t=' + Date.now();
+        img.src = '/qr/image/' + USER_ID + '?t=' + TOKEN + '&ts=' + Date.now();
         status.textContent = 'Scan the QR code above';
         setTimeout(poll, 5000);
       }
@@ -125,9 +156,8 @@ router.get('/qr/page/:userId', (req, res) => {
 });
 
 // ── Status ────────────────────────────────────────────────
-router.get('/status/:userId', async (req, res) => {
+router.get('/status/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   const clientData = clients.get(userId);
   if (!clientData) {
@@ -153,9 +183,8 @@ router.get('/status/:userId', async (req, res) => {
 });
 
 // ── TG groups (from Redis, written by bot) ───────────────
-router.get('/tg-groups/:userId', async (req, res) => {
+router.get('/tg-groups/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   try {
     const raw = await redis.hgetall(`bot:user_groups:${userId}`);
@@ -167,9 +196,8 @@ router.get('/tg-groups/:userId', async (req, res) => {
 });
 
 // ── Connect (create new client) ───────────────────────────
-router.post('/connect/:userId', async (req, res) => {
+router.post('/connect/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   if (!(await userExists(userId))) {
     return res.status(403).json({ error: 'Unknown user' });
@@ -177,16 +205,16 @@ router.post('/connect/:userId', async (req, res) => {
 
   try {
     createWhatsAppClient(userId).catch(console.error); // fire & forget
-    res.json({ message: 'Client starting', qrPageUrl: `/qr/page/${userId}` });
+    const token = await createQrToken(userId);
+    res.json({ message: 'Client starting', qrPageUrl: `/qr/page?t=${token}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Disconnect ────────────────────────────────────────────
-router.post('/disconnect/:userId', async (req, res) => {
+router.post('/disconnect/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   const clientData = clients.get(userId);
   if (!clientData) return res.status(404).json({ error: 'Not found' });
@@ -204,9 +232,8 @@ router.post('/disconnect/:userId', async (req, res) => {
 });
 
 // ── Reconnect ─────────────────────────────────────────────
-router.post('/reconnect/:userId', async (req, res) => {
+router.post('/reconnect/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   if (!(await userExists(userId))) {
     return res.status(403).json({ error: 'Unknown user' });
@@ -223,7 +250,8 @@ router.post('/reconnect/:userId', async (req, res) => {
 
   try {
     createWhatsAppClient(userId).catch(console.error);
-    res.json({ message: 'Reconnecting', qrPageUrl: `/qr/page/${userId}` });
+    const token = await createQrToken(userId);
+    res.json({ message: 'Reconnecting', qrPageUrl: `/qr/page?t=${token}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -231,9 +259,8 @@ router.post('/reconnect/:userId', async (req, res) => {
 
 // ── Chat Pairs CRUD ──────────────────────────────────────
 
-router.get('/chat-pairs/:userId', async (req, res) => {
+router.get('/chat-pairs/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
-  if (isNaN(userId)) return res.status(400).json({ error: 'Invalid userId' });
 
   try {
     const [pairs, waConnected] = await Promise.all([
@@ -247,6 +274,8 @@ router.get('/chat-pairs/:userId', async (req, res) => {
   }
 });
 
+// These two are keyed by pairId, not userId, so requireSelf cannot guard them —
+// ownership is enforced in SQL against the authenticated user instead.
 router.patch('/chat-pairs/:pairId', async (req, res) => {
   const pairId = parseInt(req.params.pairId, 10);
   if (isNaN(pairId)) return res.status(400).json({ error: 'Invalid pairId' });
@@ -256,8 +285,11 @@ router.patch('/chat-pairs/:pairId', async (req, res) => {
     return res.status(400).json({ error: 'Status must be "active" or "paused"' });
   }
 
+  const owner = req.auth?.userId;
+  if (!Number.isFinite(owner)) return res.status(403).json({ error: 'Forbidden' });
+
   try {
-    const ok = await setChatPairStatus(pairId, status);
+    const ok = await setChatPairStatus(pairId, status, owner);
     if (!ok) return res.status(404).json({ error: 'Pair not found' });
     res.json({ ok: true });
   } catch (err) {
@@ -270,8 +302,11 @@ router.delete('/chat-pairs/:pairId', async (req, res) => {
   const pairId = parseInt(req.params.pairId, 10);
   if (isNaN(pairId)) return res.status(400).json({ error: 'Invalid pairId' });
 
+  const owner = req.auth?.userId;
+  if (!Number.isFinite(owner)) return res.status(403).json({ error: 'Forbidden' });
+
   try {
-    const ok = await deleteChatPair(pairId);
+    const ok = await deleteChatPair(pairId, owner);
     if (!ok) return res.status(404).json({ error: 'Pair not found' });
     res.json({ ok: true });
   } catch (err) {

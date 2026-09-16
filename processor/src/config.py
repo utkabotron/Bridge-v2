@@ -64,6 +64,9 @@ DOCUMENT_ANALYSIS_TIMEOUT = int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", 60))
 
 # ── S3/MinIO ────────────────────────────────────────────
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
+# Host Telegram (and the user) reach media on. The bucket is no longer world-readable,
+# so links built on this endpoint must be presigned — see src/s3.py.
+S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000")
 
 # ── LangSmith ───────────────────────────────────────────
 LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "bridge-v2")

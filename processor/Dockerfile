@@ -7,6 +7,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 
+# Drop root: the service needs no privileged operation at runtime, and a bug in a
+# dependency should not come with uid 0 inside the container.
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8000
 
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]

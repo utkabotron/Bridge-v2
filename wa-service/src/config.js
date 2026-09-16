@@ -12,13 +12,21 @@ module.exports = {
   REDIS_RETRY_DELAY_BASE: parseInt(process.env.REDIS_RETRY_DELAY_BASE) || 500,
   REDIS_RETRY_DELAY_MAX: parseInt(process.env.REDIS_RETRY_DELAY_MAX) || 5000,
 
+  // Auth
+  // Mini App requests are signed with the bot token; server-to-server calls from the bot
+  // carry INTERNAL_API_TOKEN. Both are required — without them every route is anonymous.
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+  INTERNAL_API_TOKEN: process.env.INTERNAL_API_TOKEN || '',
+  INIT_DATA_MAX_AGE: parseInt(process.env.INIT_DATA_MAX_AGE) || 86400,
+  QR_TOKEN_TTL: parseInt(process.env.QR_TOKEN_TTL) || 900,
+
   // Database
   DATABASE_URL: process.env.DATABASE_URL || 'postgresql://bridge:bridge@localhost:5432/bridge',
   DB_POOL_MAX: parseInt(process.env.DB_POOL_MAX) || 5,
   DB_STATEMENT_TIMEOUT: parseInt(process.env.DB_STATEMENT_TIMEOUT) || 10000,
 
   // WhatsApp client
-  MAX_CONCURRENT_CLIENTS: parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 10,
+  MAX_CONCURRENT_CLIENTS: parseInt(process.env.MAX_CONCURRENT_CLIENTS) || 4,
   MAX_PARALLEL_INIT: parseInt(process.env.MAX_PARALLEL_INIT) || 1,
   QR_TIMEOUT_MS: parseInt(process.env.QR_TIMEOUT_MS) || 60 * 60 * 1000,
   RECONNECT_DELAYS: [5000, 15000, 45000],

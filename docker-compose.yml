@@ -50,13 +50,18 @@ services:
     logging: *default-logging
     command: server /data --console-address ":9001"
     ports:
-      # 9000 (S3 API) stays public — Telegram fetches media via the URL fallback path.
+      # 9000 (S3 API) stays public — Telegram fetches media over presigned URLs. The
+      # bucket itself is private (infra/minio-init.sh), so this port no longer serves
+      # anyone without a signature.
       - "9000:9000"
       # Admin console is loopback only — no reason to expose it to the internet.
       - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER: bridge
-      MINIO_ROOT_PASSWORD: bridgeminio
+      # No defaults on purpose: these are the S3 API's admin credentials on a public port.
+      # The literals that used to sit here ("bridge"/"bridgeminio") handed anyone who read
+      # the repo full control of the media store.
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     volumes:
       - minio_data:/data
     healthcheck:
@@ -74,6 +79,8 @@ services:
     command: /init.sh
     environment:
       - S3_BUCKET=${S3_BUCKET:-bridge-media}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
     volumes:
       - ./infra/minio-init.sh:/init.sh:ro
 
@@ -103,13 +110,17 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-bridge}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-bridgeminio}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       - AWS_REGION=${AWS_REGION:-us-east-1}
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}
       - S3_BUCKET=${S3_BUCKET:-bridge-media}
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
+      # Needed to verify Mini App initData signatures, and to authenticate the bot's
+      # server-to-server calls. Without them every route here is anonymous.
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN in .env}
       - PORT=3000
       - TZ=Asia/Jerusalem
       # environment is an explicit allow-list: anything not named here never reaches the
@@ -154,6 +165,12 @@ services:
       - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Russian}
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
+      # Media reads are signed now that the bucket is private (src/s3.py).
+      - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
+      - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
       - TZ=Asia/Jerusalem
     depends_on:
       redis:
@@ -174,6 +191,7 @@ services:
       - WA_SERVICE_URL=http://wa-service:3000
       - WA_SERVICE_PUBLIC_URL=${WA_SERVICE_PUBLIC_URL:-http://localhost:3000}
       - PROCESSOR_URL=http://processor:8000
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:?set INTERNAL_API_TOKEN in .env}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
       - TZ=Asia/Jerusalem
     depends_on:

@@ -34,6 +34,11 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+# httpx logs every request at INFO, and every Telegram call carries the bot token in its
+# URL — which put a working token into docker logs, log shippers and any backup of them.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 
 def main() -> None:

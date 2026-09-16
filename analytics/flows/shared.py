@@ -1,10 +1,15 @@
 """Shared utilities for analytics flows."""
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
 from prefect import get_run_logger
+
+# Telegram calls put the bot token in the URL, and httpx logs request URLs at INFO.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]

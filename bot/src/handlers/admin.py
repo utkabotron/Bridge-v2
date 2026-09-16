@@ -17,7 +17,10 @@ def admin_only(handler):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         u = await get_user(update.effective_user.id)
         if not u or not u.get("is_admin"):
-            await update.message.reply_text("Access denied.")
+            # An edited_message or channel_post reaches here with update.message unset,
+            # and the denial itself would then raise AttributeError.
+            if update.message:
+                await update.message.reply_text("Access denied.")
             return
         return await handler(update, ctx)
     return wrapper

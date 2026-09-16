@@ -9,13 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
 
-from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_SEND_TIMEOUT, MAX_RETRY_AFTER, S3_ENDPOINT
+from .config import TELEGRAM_BOT_TOKEN, TELEGRAM_SEND_TIMEOUT, MAX_RETRY_AFTER
 
 logger = logging.getLogger(__name__)
 
@@ -129,13 +128,22 @@ def _parse_message_id(resp_text: str) -> Optional[int]:
 
 
 def _to_internal_url(url: str) -> str:
-    """Convert public MinIO URL to internal Docker URL.
+    """Rehost a media URL onto the internal MinIO endpoint and sign it.
 
-    e.g. http://83.217.222.126:9000/bridge-media/... → http://minio:9000/bridge-media/...
+    Only the object path is reused, so a hostile media_s3_key can never redirect this
+    request off the compose network. The signature is required now that the bucket
+    rejects anonymous reads.
     """
-    parsed = urlparse(url)
-    internal = urlparse(S3_ENDPOINT)
-    return parsed._replace(netloc=internal.netloc, scheme=internal.scheme).geturl()
+    from .s3 import presign_internal
+
+    return presign_internal(url)
+
+
+def _to_public_url(url: str) -> str:
+    """Presigned URL a third party can fetch (Telegram, or the user tapping the link)."""
+    from .s3 import presign_public
+
+    return presign_public(url)
 
 
 def _filename_from_url(url: str, media_filename: Optional[str] = None) -> str:
@@ -336,10 +344,12 @@ async def _do_send_media(
             return False, "401_UNAUTHORIZED", None
         logger.warning("%s multipart failed (%s): %s", endpoint, r.status_code, r.text)
 
-    # Fallback: try URL directly
+    # Fallback: hand Telegram a link and let it fetch the file itself. The bucket is
+    # private, so the link has to be presigned — it expires on its own.
+    public_url = _to_public_url(url)
     payload = {
         "chat_id": chat_id,
-        field_name: url,
+        field_name: public_url,
         "caption": caption,
         "parse_mode": "HTML",
     }
@@ -352,6 +362,6 @@ async def _do_send_media(
 
     # Final fallback: text with link
     logger.warning("%s URL fallback also failed: %s", endpoint, r.text)
-    return await _send_text(chat_id, f"{caption}\n[Media: {url}]")
+    return await _send_text(chat_id, f"{caption}\n[Media: {public_url}]")
 
 
