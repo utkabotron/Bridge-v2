@@ -1,7 +1,7 @@
 const express = require('express');
 const path = require('path');
 const QRCode = require('qrcode');
-const { clients, createWhatsAppClient, getGroups } = require('../whatsapp-client');
+const { clients, createWhatsAppClient, getGroups, getLastMessageAt } = require('../whatsapp-client');
 const config = require('../config');
 const { redis } = require('../redis-publisher');
 const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
@@ -42,6 +42,9 @@ router.get('/health', (req, res) => {
     activeClients: clients.size,
     readyClients: perClient.filter((c) => c.isReady).length,
     clients: perClient,
+    // When any client last received a message. The monitoring flow uses this as a
+    // dead-man switch: connected clients that stop delivering look healthy otherwise.
+    lastMessageAt: getLastMessageAt(),
     redis: redis.status === 'ready' ? 'connected' : 'disconnected',
   });
 });

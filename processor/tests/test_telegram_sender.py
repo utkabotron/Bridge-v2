@@ -324,3 +324,23 @@ def test_is_dead_chat_ignores_recoverable_errors():
     assert not is_dead_chat('{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 5"}')
     assert not is_dead_chat(None)
     assert not is_dead_chat("")
+
+
+# ── Transient Telegram failures ───────────────────────────
+
+def test_server_errors_are_recognised_as_transient():
+    from processor.src.telegram_sender import _is_server_error
+
+    assert _is_server_error('{"ok":false,"error_code":502,"description":"Bad Gateway"}')
+    assert _is_server_error('{"ok":false,"error_code":500,"description":"Internal Server Error"}')
+    assert _is_server_error("Connection reset by peer")
+    assert _is_server_error("read timeout")
+
+
+def test_client_errors_are_not_retried():
+    """A 400/403 will fail identically on retry; only 5xx and transport errors are worth it."""
+    from processor.src.telegram_sender import _is_server_error
+
+    assert not _is_server_error('{"ok":false,"error_code":403,"description":"Forbidden"}')
+    assert not _is_server_error('{"ok":false,"error_code":400,"description":"chat not found"}')
+    assert not _is_server_error(None)

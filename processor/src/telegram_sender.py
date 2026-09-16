@@ -105,6 +105,22 @@ def _parse_retry_after(resp_text: str) -> Optional[int]:
     return None
 
 
+# Telegram 5xx (502/503 during their deploys) and network blips are worth another try.
+SERVER_ERROR_BACKOFF = (2, 5)
+
+
+def _is_server_error(resp_text: Optional[str]) -> bool:
+    """True for transient Telegram-side failures."""
+    if not resp_text:
+        return False
+    try:
+        code = json.loads(resp_text).get("error_code")
+        return isinstance(code, int) and 500 <= code < 600
+    except (json.JSONDecodeError, AttributeError):
+        # Not JSON at all — a transport error string from httpx, also transient.
+        return "timeout" in resp_text.lower() or "connection" in resp_text.lower()
+
+
 def _is_unauthorized(resp_text: str) -> bool:
     """Check if Telegram response is 401 Unauthorized."""
     try:
@@ -203,7 +219,8 @@ async def send_message(
     migrate_to_chat_id is set when group was upgraded to supergroup.
     Retries once on 429 Too Many Requests after waiting retry_after seconds.
     """
-    for attempt in range(2):  # max 1 retry for 429
+    last_err: Optional[str] = None
+    for attempt in range(1 + len(SERVER_ERROR_BACKOFF)):
         try:
             media_type = _MEDIA_TYPE_MAP.get(message_type) if media_url else None
             if media_type:
@@ -214,6 +231,8 @@ async def send_message(
             else:
                 ok, err, msg_id = await _send_text(chat_id, text)
 
+            last_err = err
+
             # Handle 429 Too Many Requests — wait and retry once
             if not ok and err and attempt == 0:
                 retry_after = _parse_retry_after(err)
@@ -223,6 +242,14 @@ async def send_message(
                     await asyncio.sleep(wait)
                     continue
 
+            # Telegram 5xx is transient, but a single attempt marked the message failed
+            # for good — it never reached the DLQ either, since nothing raised.
+            if not ok and _is_server_error(err) and attempt < len(SERVER_ERROR_BACKOFF):
+                wait = SERVER_ERROR_BACKOFF[attempt]
+                logger.warning("Telegram server error, retrying in %ds (chat %s): %s", wait, chat_id, err)
+                await asyncio.sleep(wait)
+                continue
+
             migrate_id = _parse_migrate(err) if err else None
             if migrate_id:
                 logger.warning("Group %s migrated to supergroup %s", chat_id, migrate_id)
@@ -231,8 +258,8 @@ async def send_message(
             logger.error("Telegram send error: %s", exc)
             return False, str(exc), None, None
 
-    # Should not reach here, but just in case
-    return False, err, None, None
+    # Exhausted the retries above.
+    return False, last_err, None, None
 
 
 async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:

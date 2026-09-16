@@ -25,11 +25,12 @@ Deploy Bridge-v2 services to production VPS via rsync + Docker Compose.
    rsync -avz --exclude '.git' --exclude 'node_modules' --exclude '__pycache__' --exclude '.wwebjs_auth' --exclude '.env' --exclude '.venv' --exclude '*.tfvars' --exclude '*accessKeys*' ./ bridge:/home/deploy/bridge-v2/
    ```
 
-4. **Apply new migrations** (if any new SQL files in `infra/migrations/`). Pipe each new migration into postgres container:
+4. **Apply migrations.** Always run this — the script works out what is pending and does
+   nothing when the schema is current. Never decide by hand whether a migration is "new":
+   a missed one does not fail loudly, it silently stops message_events from recording.
    ```
-   ssh bridge "cd /home/deploy/bridge-v2 && cat infra/migrations/NEW_MIGRATION.sql | docker compose exec -T postgres psql -U bridge -d bridge"
+   ssh bridge "cd /home/deploy/bridge-v2 && ./infra/migrate.sh"
    ```
-   Skip this step if no new migrations were added.
 
 5. If specific service(s) requested — build and restart only those. Otherwise build and restart all:
    ```

@@ -8,7 +8,28 @@ const fs = require('fs');
 const path = require('path');
 const { publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
-const { setWaDisconnected } = require('./db');
+const { setWaConnected, setWaDisconnected } = require('./db');
+
+/** Reject with a labelled error if `promise` outlives `ms`. */
+function withTimeout(promise, label, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timeout (${ms / 1000}s)`)), ms)
+    ),
+  ]);
+}
+
+// When a message last arrived, globally and per client. Every health check until now
+// asked "is the socket connected?"; none asked "are messages still flowing?" — and the
+// failure that took the bridge down for 15 days looks healthy by the first question and
+// dead by the second (WA breaks the Store, `message` stops firing, getState() still says
+// CONNECTED). The analytics dead-man switch reads this.
+let lastMessageAt = null;
+
+function getLastMessageAt() {
+  return lastMessageAt;
+}
 const config = require('./config');
 
 // Map<userId:number, ClientData>
@@ -28,6 +49,8 @@ const HEALTH_CHECK_INTERVAL = config.HEALTH_CHECK_INTERVAL;
 const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
 const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
+const INIT_STUCK_TIMEOUT = config.INIT_STUCK_TIMEOUT;
+const DESTROY_TIMEOUT = config.DESTROY_TIMEOUT;
 
 // Persistent recovery: capped backoff that NEVER gives up (unlike RECONNECT_DELAYS,
 // which exhausts after 3 tries). A transient DNS/network glitch at startup or
@@ -321,6 +344,20 @@ async function checkClientHealth() {
         console.warn(`Health check: user ${userId} not ready and no QR timer — destroying idle client`);
         await destroyClient(clientData.client, userId);
         clients.delete(userId);
+        continue;
+      }
+
+      // Stuck in initialize(): no QR ever arrived and it never went ready, so the branch
+      // above (which needs a QR) never fires and the recovery loop skips it because the
+      // map still holds an entry. It sat there forever, counted as an active client,
+      // holding a slot and ~400 MB, delivering nothing. Drop it and let recovery retry.
+      const stuckFor = Date.now() - (clientData.initStartedAt || 0);
+      if (!clientData.qr && stuckFor > INIT_STUCK_TIMEOUT) {
+        console.warn(`Health check: user ${userId} stuck initializing for ${Math.round(stuckFor / 1000)}s — destroying`);
+        clientData.intentionalDestroy = true;
+        await destroyClient(clientData.client, userId);
+        clients.delete(userId);
+        cleanupSessionLock(userId);
       }
       continue;
     }
@@ -349,15 +386,24 @@ async function checkClientHealth() {
   }
 }
 
+let healthCheckRunning = false;
+
 function startHealthCheck() {
   if (healthCheckTimer) return;
-  healthCheckTimer = setInterval(() => {
-    checkClientHealth().catch((err) =>
-      console.error('Health check loop error:', err.message)
-    );
-    recoverLostSessions().catch((err) =>
-      console.error('Recovery loop error:', err.message)
-    );
+  healthCheckTimer = setInterval(async () => {
+    // Each pass can take longer than the interval when clients are hanging (getState and
+    // destroy are bounded at 10s each, per client), and two passes racing could both
+    // decide to destroy the same client.
+    if (healthCheckRunning) return;
+    healthCheckRunning = true;
+    try {
+      await checkClientHealth();
+      await recoverLostSessions();
+    } catch (err) {
+      console.error('Health check loop error:', err.message);
+    } finally {
+      healthCheckRunning = false;
+    }
   }, HEALTH_CHECK_INTERVAL);
   console.log(`Session health check started (every ${HEALTH_CHECK_INTERVAL / 1000}s)`);
 }
@@ -391,8 +437,22 @@ async function createWhatsAppClient(userId) {
   }
 
   connecting.add(userId);
+  try {
+    return await buildClient(userId);
+  } finally {
+    // Not just around initialize(): anything thrown while constructing the Client or
+    // wiring its handlers left `connecting` set, and from then on createWhatsAppClient
+    // returned null forever while the recovery loop logged "session restored".
+    connecting.delete(userId);
+  }
+}
 
-  const clientData = { client: null, qr: null, isReady: false, userId, qrTimer: null, errorCount: 0, intentionalDestroy: false };
+async function buildClient(userId) {
+  const clientData = {
+    client: null, qr: null, isReady: false, userId, qrTimer: null,
+    errorCount: 0, intentionalDestroy: false,
+    initStartedAt: Date.now(), lastMessageAt: null,
+  };
 
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: getClientId(userId) }),
@@ -437,6 +497,8 @@ async function createWhatsAppClient(userId) {
         await destroyClient(client, userId);
         clients.delete(userId);
 
+        recoveryState.delete(userId);
+
         const sessionDir = path.join('.wwebjs_auth', `session-${getClientId(userId)}`);
         if (fs.existsSync(sessionDir)) {
           try {
@@ -463,6 +525,13 @@ async function createWhatsAppClient(userId) {
     clientData.errorCount = 0;
     // Mark session as authenticated — used by restoreExistingSessions to skip dead sessions
     writeAuthMarker(userId);
+    // Write the flag here rather than leaving it to the bot's pub/sub listener. Pub/sub has
+    // no replay, so a bot that was restarting (every full deploy) missed the event and left
+    // users at wa_connected=false with a live WhatsApp — which the Mini App reads as "not
+    // connected" and bounces back to the QR screen forever.
+    setWaConnected(userId, true).catch((err) =>
+      console.error(`Failed to set wa_connected=true for user ${userId}: ${err.message}`)
+    );
     await publishQrScanned(userId, 'ready').catch(console.error);
   });
 
@@ -502,6 +571,7 @@ async function createWhatsAppClient(userId) {
     }
 
     console.error(`User ${userId}: session lost after auth_failure, new QR scan required`);
+    recoveryState.delete(userId);
 
     setWaDisconnected(userId).catch((err) =>
       console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
@@ -541,6 +611,8 @@ async function createWhatsAppClient(userId) {
   });
 
   client.on('message', async (message) => {
+    lastMessageAt = Date.now();
+    clientData.lastMessageAt = lastMessageAt;
     try {
       await handleIncomingMessage(userId, message, false);
       clientData.errorCount = 0;
@@ -559,6 +631,8 @@ async function createWhatsAppClient(userId) {
   });
 
   client.on('message_edit', async (message) => {
+    lastMessageAt = Date.now();
+    clientData.lastMessageAt = lastMessageAt;
     try {
       await handleIncomingMessage(userId, message, true);
       clientData.errorCount = 0;
@@ -591,8 +665,6 @@ async function createWhatsAppClient(userId) {
     await destroyClient(client, userId);
     cleanupSessionLock(userId);
     throw error;
-  } finally {
-    connecting.delete(userId);
   }
 
   return clientData;
@@ -625,7 +697,10 @@ async function handleIncomingMessage(userId, message, isEdited) {
     chatName = message._data?.subject || message._data?.notifyName || '';
   } else {
     try {
-      const chat = await message.getChat();
+      // Bounded: these reach into WA's Store, and when it degrades they hang until the
+      // 120s protocol timeout. Unbounded, parallel hangs pile up holding whole messages
+      // in memory while delivery stalls; the fallback below is cheap and correct.
+      const chat = await withTimeout(message.getChat(), 'getChat', config.GET_CHAT_TIMEOUT);
       chatId = chat.id._serialized;
       chatName = chat.name;
     } catch (err) {
@@ -647,7 +722,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
   // Sender info
   let senderName = 'Unknown';
   try {
-    const contact = await message.getContact();
+    const contact = await withTimeout(message.getContact(), 'getContact', config.GET_CHAT_TIMEOUT);
     senderName = contact.pushname || contact.name || contact.number || 'Unknown';
   } catch {
     const d = message._data || {};
@@ -796,9 +871,8 @@ async function destroyAllClients() {
     clientData.intentionalDestroy = true;
     console.log(`Destroying client for user ${userId}...`);
     destroyPromises.push(
-      clientData.client.destroy().catch((err) =>
-        console.error(`Error destroying client for user ${userId}: ${err.message}`)
-      )
+      withTimeout(clientData.client.destroy(), `destroy user ${userId}`, DESTROY_TIMEOUT)
+        .catch((err) => console.error(`Error destroying client for user ${userId}: ${err.message}`))
     );
   }
   await Promise.allSettled(destroyPromises);
@@ -807,12 +881,14 @@ async function destroyAllClients() {
 }
 
 module.exports = {
+  getLastMessageAt,
   clients,
   connecting,
   getGroups,
   createWhatsAppClient,
   restoreExistingSessions,
   destroyAllClients,
+  startHealthCheck,
   stopHealthCheck,
   recoverLostSessions,
   getAuthenticatedSessionUids,

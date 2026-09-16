@@ -34,6 +34,14 @@ module.exports = {
   HEALTH_CHECK_TIMEOUT: parseInt(process.env.HEALTH_CHECK_TIMEOUT) || 10000,
   MAX_MESSAGE_ERRORS: parseInt(process.env.MAX_MESSAGE_ERRORS) || 5,
   GET_CHATS_TIMEOUT: parseInt(process.env.GET_CHATS_TIMEOUT) || 15000,
+  // Per-message Store calls in the delivery path. Must stay well under
+  // PUPPETEER_PROTOCOL_TIMEOUT so a degraded Store degrades delivery instead of stalling it.
+  GET_CHAT_TIMEOUT: parseInt(process.env.GET_CHAT_TIMEOUT) || 15000,
+  // A client that never produced a QR and never went ready within this window is stuck
+  // in initialize() and will never recover on its own.
+  INIT_STUCK_TIMEOUT: parseInt(process.env.INIT_STUCK_TIMEOUT) || 5 * 60 * 1000,
+  // Upper bound per client during shutdown; Docker's default stop grace is 10s total.
+  DESTROY_TIMEOUT: parseInt(process.env.DESTROY_TIMEOUT) || 8000,
   OLD_MESSAGE_THRESHOLD: parseInt(process.env.OLD_MESSAGE_THRESHOLD) || 120,
   PUPPETEER_PROTOCOL_TIMEOUT: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT) || 120000,
   SESSION_RESTORE_BATCH_DELAY: parseInt(process.env.SESSION_RESTORE_BATCH_DELAY) || 1000,

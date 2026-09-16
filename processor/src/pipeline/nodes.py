@@ -15,6 +15,7 @@ from langdetect import detect, LangDetectException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from ..config import LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
 from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
@@ -36,6 +37,11 @@ def get_llm() -> ChatOpenAI:
             model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
             temperature=0,
             tags=["bridge-v2", f"prompt-{PROMPT_VERSION}"],
+            # Unbounded, the SDK waits 600s and langchain retries twice, so one sick
+            # request could hold the single-threaded consumer for half an hour while
+            # every user's messages queued behind it.
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
         )
     return _llm
 
@@ -141,7 +147,23 @@ async def translate_node(state: MessageState) -> MessageState:
         SystemMessage(content=get_translate_prompt(lang, chat_context)),
         HumanMessage(content=text),
     ]
-    response = await get_llm().ainvoke(messages)
+    try:
+        response = await get_llm().ainvoke(messages)
+    except Exception as exc:
+        # An OpenAI outage used to raise here, escape the graph and send the message to a
+        # dead-letter queue nobody drained — so the whole bridge went quiet and stayed
+        # quiet. The original text is still worth delivering; the reader can see it is
+        # untranslated and we keep the pipe flowing.
+        translation_ms = int((time.monotonic() - t0) * 1000)
+        logger.error("Translation failed (%s) — delivering the original untranslated", exc)
+        return {
+            **state,
+            "translated_text": "",
+            "translation_ms": translation_ms,
+            "cache_hit": False,
+            "translation_failed": True,
+        }
+
     translation_ms = int((time.monotonic() - t0) * 1000)
 
     translated = response.content.strip()
@@ -188,6 +210,10 @@ def format_node(state: MessageState) -> MessageState:
     if translated and translated.strip() != original.strip():
         parts.append("")
         parts.append(esc(translated))
+
+    if state.get("translation_failed"):
+        parts.append("")
+        parts.append(esc(TRANSLATION_UNAVAILABLE_NOTE))
 
     formatted = "\n".join(parts)
     return {**state, "formatted_text": formatted}

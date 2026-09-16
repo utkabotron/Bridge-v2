@@ -264,3 +264,66 @@ async def test_process_message_without_pairs_still_runs_once():
         await main._process_message(MagicMock(), json.dumps(payload))
 
     assert runs == [None]
+
+
+# ── Resilience: translation failures must not swallow the message ──
+
+@pytest.mark.asyncio
+async def test_translate_node_degrades_when_llm_fails():
+    """An OpenAI outage used to raise, escape the graph and dead-letter the message.
+
+    Nothing drained that queue, so the bridge simply went quiet. Delivering the original
+    untranslated keeps the pipe open.
+    """
+    from processor.src.pipeline.nodes import translate_node
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock(side_effect=RuntimeError("openai unavailable"))
+
+    with patch("processor.src.pipeline.nodes.get_llm", return_value=llm), \
+         patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value=None)):
+        result = await translate_node(_base_state(chat_pair_id=None))
+
+    assert result["translation_failed"] is True
+    assert result["translated_text"] == ""
+    assert result["original_text"] == _base_state()["original_text"]  # nothing lost
+
+
+def test_format_node_marks_an_untranslated_message():
+    """The reader should see why a message arrived without its translation."""
+    from processor.src.config import TRANSLATION_UNAVAILABLE_NOTE
+    from processor.src.pipeline.nodes import format_node
+
+    state = _base_state(translated_text="", translation_failed=True)
+    result = format_node(state)
+
+    assert TRANSLATION_UNAVAILABLE_NOTE in result["formatted_text"]
+    assert state["original_text"] in result["formatted_text"]
+
+
+@pytest.mark.asyncio
+async def test_failed_pipeline_counts_towards_the_failure_rate():
+    """The except branch never called _track_delivery, so an outage raised no alert.
+
+    An OpenAI or Telegram outage lands exactly here, and the failure-rate alert stayed
+    silent through the whole incident.
+    """
+    import processor.src.main as main
+
+    def exploding_astream(*args, **kwargs):
+        raise RuntimeError("pipeline exploded")
+
+    fake_pipeline = MagicMock()
+    fake_pipeline.astream = exploding_astream
+
+    tracked = []
+    dlq = AsyncMock()
+    with patch("processor.src.main.pipeline", fake_pipeline), \
+         patch("processor.src.main._dlq_push", new=dlq), \
+         patch("processor.src.main._track_delivery", side_effect=lambda failed: tracked.append(failed)):
+        await main._run_pipeline(MagicMock(), {"wa_message_id": "x"}, _base_state(), "x", "x")
+
+    assert tracked == [True]
+    dlq.assert_awaited()  # and the message is still kept for retry

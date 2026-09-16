@@ -4,6 +4,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    mem_limit: 256m
     logging: &default-logging
       driver: json-file
       options:
@@ -24,6 +25,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    mem_limit: 512m
     logging: *default-logging
     environment:
       POSTGRES_USER: bridge
@@ -47,6 +49,7 @@ services:
   minio:
     image: minio/minio
     restart: unless-stopped
+    mem_limit: 512m
     logging: *default-logging
     command: server /data --console-address ":9001"
     ports:
@@ -87,6 +90,7 @@ services:
   nginx:
     image: nginx:alpine
     restart: unless-stopped
+    mem_limit: 128m
     logging: *default-logging
     ports:
       - "80:80"
@@ -104,6 +108,12 @@ services:
   wa-service:
     build: ./wa-service
     restart: unless-stopped
+    # Four Chromium instances at ~400 MB. The limit is the point where we would rather
+    # lose this container than have the kernel choose a victim across the whole box.
+    mem_limit: 2400m
+    # Four browsers do not close in Docker's default 10s, and SIGKILL leaves SingletonLock
+    # files behind that block the next start.
+    stop_grace_period: 60s
     logging: *default-logging
     expose:
       - "3000"
@@ -147,6 +157,10 @@ services:
   processor:
     build: ./processor
     restart: unless-stopped
+    mem_limit: 512m
+    # The consumer drains for up to BRPOP_TIMEOUT + 30s; killing it sooner is what the
+    # in-flight queue now covers, but let it finish cleanly when it can.
+    stop_grace_period: 45s
     logging: *default-logging
     ports:
       # Loopback only — nginx reaches the dashboard/API over the compose network
@@ -172,6 +186,12 @@ services:
       - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       - AWS_REGION=${AWS_REGION:-us-east-1}
       - TZ=Asia/Jerusalem
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       redis:
         condition: service_healthy
@@ -181,6 +201,7 @@ services:
   bot:
     build: ./bot
     restart: unless-stopped
+    mem_limit: 256m
     logging: *default-logging
     # No published port: the bot runs on polling and serves nothing over HTTP.
     environment:
@@ -203,9 +224,16 @@ services:
   analytics:
     build: ./analytics
     restart: unless-stopped
+    mem_limit: 900m
     logging: *default-logging
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
+      # Monitoring targets. These were absent, so the health flow silently fell back to
+      # its defaults and watched nothing but its own assumptions.
+      - WA_SERVICE_URL=http://wa-service:3000
+      - PROCESSOR_URL=http://processor:8000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - BIGQUERY_PROJECT=${BIGQUERY_PROJECT}
       - BIGQUERY_DATASET=${BIGQUERY_DATASET:-bridge_analytics}
       - PREFECT_API_URL=${PREFECT_API_URL}
@@ -221,6 +249,8 @@ services:
     volumes:
       # Mount only if file exists locally — skip for local dev without BigQuery
       - ${GCP_SA_PATH:-/dev/null}:/app/gcp-sa.json:ro
+      # Nightly pg_dump lands on the host, outside the Docker volume it backs up.
+      - ${BACKUP_HOST_DIR:-./backups}:/backups
     depends_on:
       postgres:
         condition: service_healthy

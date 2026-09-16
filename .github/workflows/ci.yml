@@ -64,6 +64,18 @@ jobs:
       - name: Run bot tests
         run: pytest bot/tests/ -v --tb=short
 
+      # wa-service holds the WhatsApp session logic and, since the security pass, the
+      # authentication middleware — it was the only suite CI never ran.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install wa-service deps
+        run: npm ci --prefix wa-service
+
+      - name: Run wa-service tests
+        run: npm test --prefix wa-service
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest

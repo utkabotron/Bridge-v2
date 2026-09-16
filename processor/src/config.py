@@ -51,6 +51,27 @@ FAILURE_RATE_WINDOW = int(os.getenv("FAILURE_RATE_WINDOW", 900))
 FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", 0.05))
 FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", 5))
 
+# ── Dead-letter queue ───────────────────────────────────
+# Nothing drained the DLQ before; messages that failed during a brief OpenAI or Telegram
+# outage stayed there until someone clicked retry in the dashboard.
+DLQ_RETRY_INTERVAL = int(os.getenv("DLQ_RETRY_INTERVAL", 600))
+DLQ_RETRY_BATCH = int(os.getenv("DLQ_RETRY_BATCH", 50))
+DLQ_MAX_ATTEMPTS = int(os.getenv("DLQ_MAX_ATTEMPTS", 5))
+DLQ_ALERT_THRESHOLD = int(os.getenv("DLQ_ALERT_THRESHOLD", 20))
+DLQ_ALERT_COOLDOWN = int(os.getenv("DLQ_ALERT_COOLDOWN", 3600))
+# Messages taken off messages:in but not yet finished. BRPOP deleted them outright, so a
+# process killed mid-message lost it; the consumer returns anything stranded here on start.
+PROCESSING_QUEUE = os.getenv("PROCESSING_QUEUE", "messages:processing")
+
+# ── LLM ─────────────────────────────────────────────────
+# The consumer processes one message at a time, so a slow LLM call is head-of-line
+# blocking for every user. Fail fast and deliver the original instead.
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", 30))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", 2))
+TRANSLATION_UNAVAILABLE_NOTE = os.getenv(
+    "TRANSLATION_UNAVAILABLE_NOTE", "⚠️ Перевод временно недоступен",
+)
+
 # ── Cache TTLs ───────────────────────────────────────────
 TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))

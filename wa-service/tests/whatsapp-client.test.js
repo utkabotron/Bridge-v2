@@ -636,3 +636,97 @@ describe('getGroups', () => {
     await expect(getGroups(client, 5000)).rejects.toThrow('Store missing');
   });
 });
+
+// ── Reliability: liveness, stuck clients, lock hygiene ────
+
+describe('liveness tracking', () => {
+  test('a delivered message stamps lastMessageAt', async () => {
+    const { createWhatsAppClient, clients, getLastMessageAt } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    expect(getLastMessageAt()).toBeNull();
+
+    await createWhatsAppClient(42);
+    const client = clients.get(42).client;
+    client.emit('message', {
+      id: { _serialized: 'm1' },
+      from: '123@g.us',
+      timestamp: Math.floor(Date.now() / 1000),
+      type: 'chat',
+      body: 'hi',
+      getChat: jest.fn().mockResolvedValue({ id: { _serialized: '123@g.us' }, name: 'G' }),
+      getContact: jest.fn().mockResolvedValue({ pushname: 'A' }),
+      _data: {},
+    });
+    await new Promise((r) => setImmediate(r));
+
+    // This is what separates "the socket is up" from "messages are flowing" — the
+    // distinction the 15-day outage turned on.
+    expect(getLastMessageAt()).not.toBeNull();
+    expect(clients.get(42).lastMessageAt).toBe(getLastMessageAt());
+  });
+});
+
+describe('connecting lock', () => {
+  test('is released when building the client throws', async () => {
+    const { createWhatsAppClient, connecting, clients } = require('../src/whatsapp-client');
+    const { LocalAuth } = require('whatsapp-web.js');
+
+    LocalAuth.mockImplementationOnce(() => { throw new Error('auth dir unreadable'); });
+
+    await expect(createWhatsAppClient(77)).rejects.toThrow('auth dir unreadable');
+
+    // A stranded lock meant createWhatsAppClient returned null forever after, while the
+    // recovery loop cheerfully logged "session restored" for a user receiving nothing.
+    expect(connecting.has(77)).toBe(false);
+    expect(clients.has(77)).toBe(false);
+
+    LocalAuth.mockImplementation(() => ({}));
+    await expect(createWhatsAppClient(77)).resolves.toBeTruthy();
+  });
+});
+
+describe('clients stuck initializing', () => {
+  test('are destroyed once past INIT_STUCK_TIMEOUT', async () => {
+    jest.useFakeTimers();
+    const { createWhatsAppClient, clients, startHealthCheck, stopHealthCheck } = require('../src/whatsapp-client');
+    const config = require('../src/config');
+
+    await createWhatsAppClient(55);
+    const data = clients.get(55);
+    data.isReady = false;
+    data.qr = null;          // never produced a QR
+    data.qrTimer = null;
+    data.initStartedAt = Date.now() - (config.INIT_STUCK_TIMEOUT + 1000);
+
+    startHealthCheck();
+    await jest.advanceTimersByTimeAsync(config.HEALTH_CHECK_INTERVAL + 100);
+    stopHealthCheck();
+
+    // Previously: the QR branch needed a QR, and the recovery loop skipped anything
+    // already in the map — so this client sat there forever holding a slot.
+    expect(clients.has(55)).toBe(false);
+    jest.useRealTimers();
+  });
+
+  test('a freshly created one is left alone', async () => {
+    jest.useFakeTimers();
+    const { createWhatsAppClient, clients, startHealthCheck, stopHealthCheck } = require('../src/whatsapp-client');
+    const config = require('../src/config');
+
+    await createWhatsAppClient(56);
+    const data = clients.get(56);
+    data.isReady = false;
+    data.qr = null;
+    data.qrTimer = null;
+    data.initStartedAt = Date.now();
+
+    startHealthCheck();
+    await jest.advanceTimersByTimeAsync(config.HEALTH_CHECK_INTERVAL + 100);
+    stopHealthCheck();
+
+    expect(clients.has(56)).toBe(true);
+    jest.useRealTimers();
+  });
+});

@@ -23,6 +23,7 @@ jest.mock('../src/whatsapp-client', () => ({
   clients: mockClients,
   createWhatsAppClient: jest.fn(),
   getGroups: jest.fn(),
+  getLastMessageAt: jest.fn(() => null),
 }));
 
 jest.mock('../src/redis-publisher', () => ({
@@ -74,6 +75,16 @@ describe('GET /health', () => {
     expect(res.body.status).toBe('ok');
     expect(res.body).toHaveProperty('activeClients');
     expect(res.body).toHaveProperty('redis');
+  });
+
+  test('reports liveness for the monitoring dead-man switch', async () => {
+    const { getLastMessageAt } = require('../src/whatsapp-client');
+    getLastMessageAt.mockReturnValueOnce(1700000000000);
+
+    const res = await request(app).get('/health').set(AUTH);
+
+    expect(res.body.lastMessageAt).toBe(1700000000000);
+    expect(res.body).toHaveProperty('readyClients');
   });
 
   test('reflects connected redis status', async () => {

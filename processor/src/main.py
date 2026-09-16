@@ -25,6 +25,8 @@ from pydantic import BaseModel
 
 from .config import (
     BRPOP_TIMEOUT, redis_kwargs,
+    DLQ_RETRY_INTERVAL, DLQ_RETRY_BATCH, DLQ_MAX_ATTEMPTS, PROCESSING_QUEUE,
+    DLQ_ALERT_THRESHOLD, DLQ_ALERT_COOLDOWN,
     ADMIN_TG_IDS as _CFG_ADMIN_TG_IDS,
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
     FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
@@ -78,12 +80,14 @@ async def lifespan(app: FastAPI):
     logger.info("Translation prompt registered in DB")
     await _validate_bot_token()
     task = asyncio.create_task(consume_loop())
+    dlq_task = asyncio.create_task(_dlq_retry_loop())
     logger.info("Processor started")
     yield
     # Graceful drain: ask the loop to stop after the current message, and give it time to
     # finish an in-flight one (which runs under asyncio.shield). Only hard-cancel if it
     # overruns, so a redeploy doesn't drop a message that was mid-pipeline.
     _shutting_down.set()
+    dlq_task.cancel()
     try:
         await asyncio.wait_for(task, timeout=BRPOP_TIMEOUT + 30)
     except asyncio.TimeoutError:
@@ -228,6 +232,42 @@ async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> No
                 )
             except Exception as exc:
                 logger.error("Failed to send failure rate alert to admin %s: %s", admin_id, exc)
+
+
+# Suppress repeat DLQ alerts: the loop runs every few minutes and a backlog clears slowly.
+_last_dlq_alert = 0.0
+
+
+async def _alert_admins_dlq(depth: int) -> None:
+    """Warn admins that dead-lettered messages are piling up."""
+    global _last_dlq_alert
+    from .feature_flags import is_enabled
+    if not await is_enabled("admin_alerts_enabled"):
+        return
+    if time.time() - _last_dlq_alert < DLQ_ALERT_COOLDOWN:
+        return
+
+    import httpx as _httpx
+    from .telegram_sender import BOT_TOKEN
+    if not BOT_TOKEN or not ADMIN_TG_IDS:
+        return
+
+    _last_dlq_alert = time.time()
+    text = (
+        "\U0001F4EC <b>Dead-letter queue is filling up</b>\n\n"
+        f"Messages waiting: <b>{depth}</b>\n"
+        "They are retried automatically; this means the retries keep failing.\n"
+        "Check: <code>docker compose logs processor --tail 100</code>"
+    )
+    async with _httpx.AsyncClient(timeout=10) as client:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
+                )
+            except Exception as exc:
+                logger.error("Failed to send DLQ alert to admin %s: %s", admin_id, exc)
 
 
 def _track_delivery(failed: bool) -> None:
@@ -860,18 +900,78 @@ def _surrogate_id(payload: dict) -> str:
     return "noid:" + hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
-async def _dlq_push(r, payload, error: str) -> None:
-    """Envelope a message into the DLQ ({"payload": ...}) matching /api/dlq/retry."""
+async def _dlq_push(r, payload, error: str, attempts: int = 0) -> None:
+    """Envelope a message into the DLQ ({"payload": ...}) matching /api/dlq/retry.
+
+    `attempts` rides along so the auto-retry task can give up on a message that keeps
+    failing instead of cycling it between the queues forever.
+    """
     try:
         entry = json.dumps({
             "payload": payload,
             "error": error,
+            "attempts": attempts,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }, default=str)
         await r.lpush("messages:dlq", entry)
         _counter["dlq"] += 1
     except Exception as dlq_exc:
         logger.error("Failed to push to DLQ: %s", dlq_exc)
+
+
+async def _dlq_retry_loop():
+    """Re-queue dead-lettered messages with a bounded number of attempts.
+
+    Nothing drained the DLQ before: a message that failed — most often because OpenAI or
+    Telegram was briefly unavailable — sat there until someone noticed and clicked retry
+    in the dashboard. In practice nobody did.
+    """
+    r = aioredis.Redis(**redis_kwargs())
+    while not _shutting_down.is_set():
+        try:
+            await asyncio.wait_for(_shutting_down.wait(), timeout=DLQ_RETRY_INTERVAL)
+            break  # shutting down
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            depth = await r.llen("messages:dlq")
+            if depth == 0:
+                continue
+
+            if depth >= DLQ_ALERT_THRESHOLD:
+                await _alert_admins_dlq(depth)
+
+            # One pass over what is there now; anything re-queued that fails again comes
+            # back with a higher attempt count on the next pass.
+            for _ in range(min(depth, DLQ_RETRY_BATCH)):
+                raw = await r.rpop("messages:dlq")
+                if raw is None:
+                    break
+                try:
+                    entry = json.loads(raw)
+                    payload = entry.get("payload")
+                    attempts = int(entry.get("attempts", 0)) + 1
+                except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                    await r.lpush("messages:dlq:dead", raw)
+                    continue
+
+                if payload is None:
+                    await r.lpush("messages:dlq:dead", raw)
+                    continue
+
+                if attempts > DLQ_MAX_ATTEMPTS:
+                    logger.warning("DLQ: giving up on %s after %d attempts",
+                                   payload.get("wa_message_id"), attempts - 1)
+                    entry["attempts"] = attempts - 1
+                    await r.lpush("messages:dlq:dead", json.dumps(entry, default=str))
+                    continue
+
+                payload["_dlq_attempts"] = attempts
+                await r.lpush("messages:in", json.dumps(payload, default=str))
+                logger.info("DLQ: re-queued %s (attempt %d)", payload.get("wa_message_id"), attempts)
+        except Exception as exc:
+            logger.error("DLQ retry loop error: %s", exc)
 
 
 async def _process_message(r, raw: str) -> None:
@@ -940,7 +1040,7 @@ async def _process_message(r, raw: str) -> None:
         # Failure in parse/build/lookup/emit — the popped message would otherwise vanish.
         _counter["failed"] += 1
         logger.error("Pre-pipeline error for %s: %s", payload.get("wa_message_id"), exc)
-        await _dlq_push(r, payload, str(exc))
+        await _dlq_push(r, payload, str(exc), attempts=payload.get("_dlq_attempts", 0))
         return
 
     # No pair → a single pair-less run, so validate_node still decides between the
@@ -1063,24 +1163,48 @@ async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_i
         _counter["failed"] += 1
         emit("message_failed", {"msg_id": msg_id, "error": str(exc)})
         logger.error("Pipeline error for %s: %s", wa_message_id, exc)
-        await _dlq_push(r, payload, str(exc))
+        # Count it as a delivery failure: an OpenAI or Telegram outage lands here, and
+        # without this the failure-rate alert stayed silent through the whole incident.
+        _track_delivery(failed=True)
+        await _dlq_push(r, payload, str(exc), attempts=payload.get("_dlq_attempts", 0))
+
+
+async def _requeue_inflight(r) -> None:
+    """Return messages a previous process never finished to the head of the queue."""
+    try:
+        stranded = await r.lrange(PROCESSING_QUEUE, 0, -1)
+        if not stranded:
+            return
+        for raw in stranded:
+            await r.rpush("messages:in", raw)
+            await r.lrem(PROCESSING_QUEUE, 1, raw)
+        logger.warning("Recovered %d in-flight message(s) from a previous run", len(stranded))
+    except Exception as exc:
+        logger.error("Failed to recover in-flight messages: %s", exc)
 
 
 async def consume_loop():
     r = aioredis.Redis(**redis_kwargs())
+
+    # Anything left in the in-flight list belongs to a previous process that died between
+    # taking a message and finishing it (OOM kill, SIGKILL past the stop grace period).
+    # BRPOP alone deleted the message the instant it was read, so those were simply lost.
+    await _requeue_inflight(r)
 
     logger.info("Consumer loop started — waiting for messages:in")
 
     while not _shutting_down.is_set():
         raw = None
         try:
-            result = await r.brpop("messages:in", timeout=BRPOP_TIMEOUT)
-            if result is None:
+            # Atomically move to an in-flight list instead of popping into thin air, and
+            # delete it only once the message is done.
+            raw = await r.blmove("messages:in", PROCESSING_QUEUE, BRPOP_TIMEOUT, "RIGHT", "LEFT")
+            if raw is None:
                 continue  # timeout — loop again
-            _, raw = result
             # Shield so a shutdown cancel can't interrupt a message we've already popped
             # from Redis — it finishes (or DLQs) before the loop exits.
             await asyncio.shield(_process_message(r, raw))
+            await r.lrem(PROCESSING_QUEUE, 1, raw)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1090,6 +1214,7 @@ async def consume_loop():
             if raw is not None:
                 try:
                     await r.lpush("messages:dlq", json.dumps({"raw": raw, "error": str(exc)}))
+                    await r.lrem(PROCESSING_QUEUE, 1, raw)
                 except Exception:
                     pass
             await asyncio.sleep(1)

@@ -100,7 +100,9 @@ def main() -> None:
 
     logger.info("Bot starting (polling)")
     app.run_polling(
-        drop_pending_updates=True,
+        # Keep what arrived while the bot was restarting. Dropping it meant a /add or an
+        # Analyze tap sent during a deploy vanished with no feedback to the user.
+        drop_pending_updates=False,
         allowed_updates=["message", "callback_query", "my_chat_member"],
     )
 
