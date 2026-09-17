@@ -182,8 +182,15 @@ processor и bot НЕ общаются — оба независимо → Postg
 | GET | /status/:userId | WA status + groups (15s timeout) |
 | POST | /disconnect/:userId | Destroy WA client |
 | POST | /reconnect/:userId | Recreate WA client |
+| POST | /chat-pairs | Создать мост (тело: wa_chat_id, wa_chat_name, tg_chat_id, tg_chat_title) |
 | GET | /qr/image/:userId | PNG QR (202 if starting) |
 | GET | /qr/page?t= | QR-страница по одноразовому токену (не по userId) |
+| GET | /miniapp, /miniapp-assets/* | Mini App: оболочка + CSS/JS |
+
+`GET /chat-pairs` отдаёт `target_language`, `language_inherited`, `summary_enabled`,
+`created_at`; `wa_connected` — живое состояние клиента, а не только флаг в БД.
+`PATCH /chat-pairs/:pairId` принимает `{status?, target_language?, summary_enabled?}`
+(`target_language: null` = наследовать аккаунт) и возвращает обновлённую пару.
 
 ## FEATURE FLAGS
 
@@ -228,10 +235,35 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | daily-chat-summary | */30 * * * * | gpt-4.1-mini |
 | nightly-backup | 30 2 * * * | — (pg_dump, 7 копий) |
 
-## ONBOARDING FSM
+## ONBOARDING
 
-`idle → qr_pending → wa_connected → linking → done`
-Table: onboarding_sessions. /start always shows Mini App button.
+`/start` — единственный вход, показывает кнопку Mini App. Дальше всё в приложении:
+QR → выбор WA-чата → выбор TG-группы → `POST /chat-pairs`. Inline-визард
+(`onboarding:*`, `/done`, `handle_webapp_data`) удалён — он был недостижим.
+
+Список TG-групп — таблица `tg_groups` (одна строка на пару группа+админ), заполняется
+`handlers/groups.py:sync_group` из трёх мест: событие `my_chat_member`, любое сообщение
+в группе (троттлинг час на чат — единственный способ узнать о группах, где бот уже был),
+и `/add`. Раньше это был Redis-хеш с TTL час, видимый только добавившему.
+
+## MINI APP
+
+`wa-service/public/miniapp.html` — только разметка экранов; логика в
+`public/assets/miniapp.js`, стили в `public/assets/miniapp.css` (их же использует
+браузерная `/qr/page`). Язык интерфейса — английский.
+
+- Один автомат состояний: `navigate()` + стек истории, `BackButton`/`MainButton`
+  регистрируются РОВНО ОДИН раз при старте (регистрация на каждом экране раньше давала
+  N срабатываний на один тап). Экраны: loading → home → connect → pick-wa → pick-tg →
+  done, плюс expired/denied и bottom-sheet настроек пары.
+- Поллинг — `poll()` с номером поколения: смена экрана обесценивает ответы в полёте.
+  Всегда ограничен числом попыток и заканчивается кнопкой Retry.
+- Пара создаётся через `POST /chat-pairs`. **Не использовать `tg.sendData()`** — Telegram
+  доставляет его только из reply-клавиатуры, а приложение открывается inline-кнопкой.
+- Тема берётся у Telegram (`colorScheme`, `themeChanged`, `--tg-viewport-stable-height`,
+  `safe-area`). Свои цвета только два: `--wa` и `--tg` — «берега моста».
+- Проверки целостности — `wa-service/tests/miniapp.test.js` (id в разметке против
+  `getElementById`, экран против обработчика, класс против CSS, экранирование).
 
 ## MESSAGE PRESENTATION
 
