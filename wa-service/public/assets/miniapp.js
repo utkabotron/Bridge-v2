@@ -43,6 +43,7 @@ const T = {
 
   done_open: 'Open bridges',
 
+  pair_settings: 'Settings',
   pair_pause: 'Pause',
   pair_resume: 'Resume',
   pair_language: 'Translate into',
@@ -454,7 +455,8 @@ function statusLine(live) {
 function bridgeCard(pair) {
   const paused = pair.status !== 'active';
   return `
-    <div class="card bridge" data-pair="${pair.id}" role="button" tabindex="0">
+    <button type="button" class="card bridge" data-pair="${pair.id}"
+            aria-label="${esc(pair.wa_chat_name)} — ${T.pair_settings}">
       <div class="bridge-ends">
         <div class="bridge-end">
           <div class="bridge-name">${esc(pair.wa_chat_name)}</div>
@@ -471,8 +473,9 @@ function bridgeCard(pair) {
           <span class="dot"></span>${paused ? T.paused : T.active}
         </span>
         <span class="pill">${esc(pair.target_language)}</span>
+        <span class="bridge-more">${T.pair_settings}${ICONS.chevron}</span>
       </div>
-    </div>`;
+    </button>`;
 }
 
 function fromLine(chat) {

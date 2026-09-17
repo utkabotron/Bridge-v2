@@ -229,6 +229,17 @@ body {
   margin-top: var(--s-3);
 }
 
+/* The card is the only way into a bridge's settings, so it has to look like a way in. */
+.bridge-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  font-size: var(--t-xs);
+  color: var(--hint);
+}
+.bridge-more svg { width: 16px; height: 16px; }
+
 /* ── Pills ───────────────────────────────────────────────── */
 
 .pill {
