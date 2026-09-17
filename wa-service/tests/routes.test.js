@@ -33,6 +33,12 @@ jest.mock('../src/redis-publisher', () => ({
 
 jest.mock('../src/db', () => ({
   getChatPairs: jest.fn(),
+  getChatPairOwned: jest.fn(),
+  addChatPair: jest.fn(),
+  getTgGroups: jest.fn(),
+  ownsTgGroup: jest.fn(),
+  setPairLanguage: jest.fn(),
+  setPairSummary: jest.fn(),
   getWaConnected: jest.fn(),
   setChatPairStatus: jest.fn(),
   deleteChatPair: jest.fn(),
@@ -44,7 +50,11 @@ jest.mock('qrcode', () => ({
   toBuffer: jest.fn().mockResolvedValue(Buffer.from('fake-png')),
 }));
 
-const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../src/db');
+const {
+  getChatPairs, getChatPairOwned, addChatPair, getTgGroups, ownsTgGroup,
+  setPairLanguage, setPairSummary, getWaConnected, setChatPairStatus,
+  deleteChatPair, userExists,
+} = require('../src/db');
 const { createWhatsAppClient, getGroups } = require('../src/whatsapp-client');
 const router = require('../src/routes/index');
 
@@ -338,20 +348,24 @@ describe('DELETE /chat-pairs/:pairId', () => {
 });
 
 // ── GET /tg-groups/:userId ────────────────────────────────
+// Groups come from Postgres now. The old Redis hash was keyed by whoever added the bot
+// and expired after an hour, so a group the bot was already in never appeared and the
+// picker went blank on its own.
 
 describe('GET /tg-groups/:userId', () => {
-  test('returns groups parsed from Redis hash', async () => {
-    const group = { id: '-100123', name: 'Test Group' };
-    mockRedis.hgetall.mockResolvedValue({ g1: JSON.stringify(group) });
+  test('returns the groups this user administers', async () => {
+    const groups = [{ chat_id: '-100123', title: 'Work RU' }];
+    getTgGroups.mockResolvedValue(groups);
 
     const res = await request(app).get('/tg-groups/42').set(AUTH);
+
     expect(res.status).toBe(200);
-    expect(res.body.groups).toEqual([group]);
-    expect(mockRedis.hgetall).toHaveBeenCalledWith('bot:user_groups:42');
+    expect(res.body.groups).toEqual(groups);
+    expect(getTgGroups).toHaveBeenCalledWith(42);
   });
 
-  test('empty Redis hash returns empty array', async () => {
-    mockRedis.hgetall.mockResolvedValue(null);
+  test('no groups returns an empty array', async () => {
+    getTgGroups.mockResolvedValue([]);
     const res = await request(app).get('/tg-groups/42').set(AUTH);
     expect(res.status).toBe(200);
     expect(res.body.groups).toEqual([]);
@@ -362,8 +376,8 @@ describe('GET /tg-groups/:userId', () => {
     expect(res.status).toBe(400);
   });
 
-  test('redis error returns 500', async () => {
-    mockRedis.hgetall.mockRejectedValue(new Error('redis down'));
+  test('database error returns 500', async () => {
+    getTgGroups.mockRejectedValue(new Error('db down'));
     const res = await request(app).get('/tg-groups/42').set(AUTH);
     expect(res.status).toBe(500);
   });
@@ -415,5 +429,168 @@ describe('authentication', () => {
     mockRedis.get.mockResolvedValueOnce(null);
     const res = await request(app).get('/qr/page?t=' + 'a'.repeat(32));
     expect(res.status).toBe(401);
+  });
+});
+
+// ── POST /chat-pairs ──────────────────────────────────────
+// The step the Mini App could never complete: it finished onboarding with tg.sendData(),
+// which Telegram delivers only from reply-keyboard buttons, while the app opens from an
+// inline one. The final tap did nothing and no bridge was ever created through it.
+
+describe('POST /chat-pairs', () => {
+  const body = {
+    wa_chat_id: '120363@g.us',
+    wa_chat_name: 'School',
+    tg_chat_id: -100123,
+    tg_chat_title: 'School RU',
+  };
+
+  beforeEach(() => {
+    userExists.mockResolvedValue(true);
+    ownsTgGroup.mockResolvedValue(true);
+  });
+
+  test('creates the bridge and returns it', async () => {
+    const pair = { id: 7, ...body, status: 'active', target_language: 'Russian' };
+    addChatPair.mockResolvedValue(pair);
+
+    const res = await request(app).post('/chat-pairs').set(AUTH).send(body);
+
+    expect(res.status).toBe(201);
+    expect(res.body.pair).toEqual(pair);
+    expect(addChatPair).toHaveBeenCalledWith(42, '120363@g.us', 'School', -100123, 'School RU');
+  });
+
+  test('accepts a private WhatsApp chat', async () => {
+    addChatPair.mockResolvedValue({ id: 8 });
+    const res = await request(app)
+      .post('/chat-pairs').set(AUTH)
+      .send({ ...body, wa_chat_id: '972500@c.us' });
+    expect(res.status).toBe(201);
+  });
+
+  test('refuses a Telegram group the caller does not administer', async () => {
+    // Otherwise knowing a chat id would be enough to pipe someone's WhatsApp into it.
+    ownsTgGroup.mockResolvedValue(false);
+
+    const res = await request(app).post('/chat-pairs').set(AUTH).send(body);
+
+    expect(res.status).toBe(403);
+    expect(addChatPair).not.toHaveBeenCalled();
+  });
+
+  test('refuses a user who is not whitelisted', async () => {
+    userExists.mockResolvedValue(false);
+    const res = await request(app).post('/chat-pairs').set(AUTH).send(body);
+    expect(res.status).toBe(403);
+  });
+
+  test('rejects a malformed WhatsApp chat id', async () => {
+    const res = await request(app)
+      .post('/chat-pairs').set(AUTH)
+      .send({ ...body, wa_chat_id: 'status@broadcast' });
+    expect(res.status).toBe(400);
+    expect(addChatPair).not.toHaveBeenCalled();
+  });
+
+  test('rejects a non-numeric Telegram chat id', async () => {
+    const res = await request(app)
+      .post('/chat-pairs').set(AUTH)
+      .send({ ...body, tg_chat_id: 'not-a-number' });
+    expect(res.status).toBe(400);
+  });
+
+  test('requires authentication', async () => {
+    const res = await request(app).post('/chat-pairs').send(body);
+    expect(res.status).toBe(401);
+  });
+});
+
+// ── PATCH /chat-pairs/:pairId — language and summary ──────
+
+describe('PATCH /chat-pairs/:pairId settings', () => {
+  beforeEach(() => {
+    getChatPairOwned.mockResolvedValue({ id: 1, target_language: 'Hebrew' });
+  });
+
+  test('sets a per-bridge language', async () => {
+    setPairLanguage.mockResolvedValue(true);
+
+    const res = await request(app)
+      .patch('/chat-pairs/1').set(AUTH)
+      .send({ target_language: 'Hebrew' });
+
+    expect(res.status).toBe(200);
+    expect(setPairLanguage).toHaveBeenCalledWith(1, 'Hebrew', 42);
+    expect(res.body.pair.target_language).toBe('Hebrew');
+  });
+
+  test('null clears the override so the bridge follows the account', async () => {
+    setPairLanguage.mockResolvedValue(true);
+
+    const res = await request(app)
+      .patch('/chat-pairs/1').set(AUTH)
+      .send({ target_language: null });
+
+    expect(res.status).toBe(200);
+    expect(setPairLanguage).toHaveBeenCalledWith(1, null, 42);
+  });
+
+  test('toggles the daily summary', async () => {
+    setPairSummary.mockResolvedValue(true);
+
+    const res = await request(app)
+      .patch('/chat-pairs/1').set(AUTH)
+      .send({ summary_enabled: false });
+
+    expect(res.status).toBe(200);
+    expect(setPairSummary).toHaveBeenCalledWith(1, false, 42);
+  });
+
+  test('rejects a non-boolean summary flag', async () => {
+    const res = await request(app)
+      .patch('/chat-pairs/1').set(AUTH)
+      .send({ summary_enabled: 'yes' });
+    expect(res.status).toBe(400);
+  });
+
+  test('rejects an empty body', async () => {
+    const res = await request(app).patch('/chat-pairs/1').set(AUTH).send({});
+    expect(res.status).toBe(400);
+  });
+
+  test("404 when the bridge is not the caller's", async () => {
+    setPairLanguage.mockResolvedValue(false);
+    const res = await request(app)
+      .patch('/chat-pairs/1').set(AUTH)
+      .send({ target_language: 'Hebrew' });
+    expect(res.status).toBe(404);
+  });
+});
+
+// ── GET /chat-pairs/:userId — live WhatsApp state ─────────
+
+describe('GET /chat-pairs — wa_connected', () => {
+  test('a live ready client outranks a stale stored flag', async () => {
+    // Disagreement between the two used to bounce the app between its home screen and
+    // the QR screen indefinitely, two requests per lap.
+    getChatPairs.mockResolvedValue([]);
+    getWaConnected.mockResolvedValue(false);
+    mockClients.set(42, { isReady: true });
+
+    const res = await request(app).get('/chat-pairs/42').set(AUTH);
+
+    expect(res.body.wa_connected).toBe(true);
+    expect(res.body.wa_live).toBe(true);
+  });
+
+  test('falls back to the stored flag when no client is running', async () => {
+    getChatPairs.mockResolvedValue([]);
+    getWaConnected.mockResolvedValue(true);
+
+    const res = await request(app).get('/chat-pairs/42').set(AUTH);
+
+    expect(res.body.wa_connected).toBe(true);
+    expect(res.body.wa_live).toBe(false);
   });
 });

@@ -4,7 +4,11 @@ const QRCode = require('qrcode');
 const { clients, createWhatsAppClient, getGroups, getLastMessageAt, getHealthPasses } = require('../whatsapp-client');
 const config = require('../config');
 const { redis } = require('../redis-publisher');
-const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
+const {
+  getChatPairs, getChatPairOwned, addChatPair, getTgGroups, ownsTgGroup,
+  setPairLanguage, setPairSummary, getWaConnected, setChatPairStatus,
+  deleteChatPair, userExists,
+} = require('../db');
 const { authenticate, requireSelf, createQrToken, resolveQrToken } = require('../middleware/tg-auth');
 
 const router = express.Router();
@@ -22,9 +26,19 @@ router.use((req, res, next) => {
 // ── Public: Mini App shell and health ────────────────────
 // The shell carries no user data — it authenticates its own API calls with initData.
 
+const PUBLIC_DIR = path.join(__dirname, '..', '..', 'public');
+
 router.get('/miniapp', (req, res) => {
-  res.sendFile('miniapp.html', { root: path.join(__dirname, '..', '..', 'public') });
+  res.sendFile('miniapp.html', { root: PUBLIC_DIR });
 });
+
+// Stylesheet and script for the Mini App and the standalone QR page. Immutable names are
+// not worth the machinery here; a short max-age keeps Telegram's WebView from serving a
+// stale bundle after a deploy while still avoiding a fetch per screen.
+router.use('/miniapp-assets', express.static(path.join(PUBLIC_DIR, 'assets'), {
+  maxAge: '5m',
+  fallthrough: false,
+}));
 
 // Consumed by the analytics health-check flow, which has no Telegram identity.
 // Exposes counters and liveness only — never chat or user content.
@@ -62,68 +76,77 @@ router.get('/health', (req, res) => {
 // reflected the raw path segment into the HTML and two JS string literals (XSS on the
 // real domain, which is also the Mini App's origin).
 router.get('/qr/page', async (req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+
   const userId = await resolveQrToken(req.query.t);
   if (userId === null) {
-    res.status(401).setHeader('Content-Type', 'text/html');
-    return res.send('<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding-top:80px">'
-      + '<h3>Link expired</h3><p>Open the bot in Telegram and tap Connect again.</p></body></html>');
+    return res.status(401).send(qrPage(null, null));
   }
 
   // userId is an integer read back from Redis and the token is hex-validated, so nothing
-  // user-controlled reaches the markup below.
-  const token = String(req.query.t);
+  // user-controlled reaches the markup.
+  res.send(qrPage(userId, String(req.query.t)));
+});
 
-  res.setHeader('Content-Type', 'text/html');
-  res.send(`<!DOCTYPE html>
-<html>
+/**
+ * Standalone QR page, for scanning outside Telegram.
+ *
+ * Shares the Mini App's stylesheet rather than carrying its own — the two used to drift,
+ * with separate colours and a different poll interval.
+ */
+function qrPage(userId, token) {
+  const expired = userId === null;
+  return `<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Connect WhatsApp — Bridge v2</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f0f2f5; }
-    h2 { color: #128C7E; }
-    img { border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,.15); }
-    p { color: #555; }
-    #status { margin-top: 12px; font-weight: bold; }
-  </style>
+  <title>Connect WhatsApp — Bridge</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/miniapp-assets/miniapp.css">
 </head>
 <body>
-  <h2>Scan QR code in WhatsApp</h2>
-  <p>Settings → Linked Devices → Link a Device</p>
-  <img id="qr" src="/qr/image/${userId}?t=${token}" width="280" height="280" alt="QR Code">
-  <p id="status">Waiting for QR...</p>
-  <script>
-    const USER_ID = ${userId};
-    const TOKEN = ${JSON.stringify(token)};
-    const img = document.getElementById('qr');
-    const status = document.getElementById('status');
-    let connected = false;
+  <div class="screen active">
+    ${expired ? `
+      <div class="state">
+        <div class="state-title">Link expired</div>
+        <div class="state-text">Open the bot in Telegram and tap Connect again.</div>
+      </div>` : `
+      <div class="head" style="text-align:center">
+        <div class="title">Connect WhatsApp</div>
+        <div class="sub">Settings &rarr; Linked devices &rarr; Link a device</div>
+      </div>
+      <div class="qr-wrap">
+        <img id="qr" width="232" height="232" alt="QR code"
+             src="/qr/image/${userId}?t=${token}">
+      </div>
+      <div class="sub" id="status" style="text-align:center">Preparing the code…</div>
+      <script>
+        const USER_ID = ${userId};
+        const TOKEN = ${JSON.stringify(token)};
+        const img = document.getElementById('qr');
+        const status = document.getElementById('status');
 
-    async function poll() {
-      try {
-        const r = await fetch('/status/' + USER_ID + '?t=' + TOKEN);
-        const d = await r.json();
-        if (d.isReady) {
-          connected = true;
-          status.textContent = '✅ Connected! You can close this page.';
-          img.style.display = 'none';
-          return;
+        async function poll() {
+          try {
+            const r = await fetch('/status/' + USER_ID + '?t=' + TOKEN);
+            const d = await r.json();
+            if (d.isReady) {
+              status.textContent = 'Connected. You can close this page.';
+              img.style.display = 'none';
+              return;
+            }
+          } catch {}
+          img.src = '/qr/image/' + USER_ID + '?t=' + TOKEN + '&ts=' + Date.now();
+          status.textContent = 'Scan the code above';
+          setTimeout(poll, 3000);
         }
-      } catch {}
-
-      if (!connected) {
-        img.src = '/qr/image/' + USER_ID + '?t=' + TOKEN + '&ts=' + Date.now();
-        status.textContent = 'Scan the QR code above';
-        setTimeout(poll, 5000);
-      }
-    }
-
-    poll();
-  </script>
+        poll();
+      <\/script>`}
+  </div>
 </body>
-</html>`);
-});
+</html>`;
+}
 
 // ── Everything below requires an authenticated Telegram identity ──
 router.use(authenticate);
@@ -196,10 +219,11 @@ router.get('/tg-groups/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
 
   try {
-    const raw = await redis.hgetall(`bot:user_groups:${userId}`);
-    const groups = Object.values(raw || {}).map((v) => JSON.parse(v));
-    res.json({ groups });
+    // Read from tg_groups (written by the bot). This used to be a Redis hash keyed by
+    // whoever added the bot and expiring after an hour, so the picker was usually blank.
+    res.json({ groups: await getTgGroups(userId) });
   } catch (err) {
+    console.error('getTgGroups error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -272,37 +296,102 @@ router.get('/chat-pairs/:userId', requireSelf, async (req, res) => {
   const userId = parseInt(req.params.userId, 10);
 
   try {
-    const [pairs, waConnected] = await Promise.all([
+    const [pairs, waConnectedFlag] = await Promise.all([
       getChatPairs(userId),
       getWaConnected(userId),
     ]);
-    res.json({ pairs, wa_connected: waConnected });
+    // Trust a live, ready client over the stored flag. The two disagree whenever the
+    // flag write was missed, and the app used to bounce between its home screen and the
+    // QR screen forever when that happened.
+    const live = clients.get(userId)?.isReady === true;
+    res.json({ pairs, wa_connected: live || waConnectedFlag, wa_live: live });
   } catch (err) {
     console.error('getChatPairs error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// These two are keyed by pairId, not userId, so requireSelf cannot guard them —
+/**
+ * Create a bridge.
+ *
+ * The Mini App used to finish onboarding with tg.sendData(), which Telegram delivers only
+ * from reply-keyboard buttons — the app opens from an inline one, so the final tap did
+ * nothing at all and no pair was ever created through it.
+ */
+router.post('/chat-pairs', async (req, res) => {
+  const owner = req.auth?.userId;
+  if (!Number.isFinite(owner)) return res.status(403).json({ error: 'Forbidden' });
+
+  const { wa_chat_id: waChatId, wa_chat_name: waChatName,
+          tg_chat_id: tgChatIdRaw, tg_chat_title: tgChatTitle } = req.body || {};
+
+  if (typeof waChatId !== 'string' || !/@(g\.us|c\.us)$/.test(waChatId)) {
+    return res.status(400).json({ error: 'Invalid wa_chat_id' });
+  }
+  const tgChatId = parseInt(tgChatIdRaw, 10);
+  if (!Number.isFinite(tgChatId)) {
+    return res.status(400).json({ error: 'Invalid tg_chat_id' });
+  }
+
+  if (!(await userExists(owner))) {
+    return res.status(403).json({ error: 'Unknown user' });
+  }
+  // The group must be one this user administers, or anyone could bridge a WhatsApp chat
+  // into a Telegram group they merely know the id of.
+  if (!(await ownsTgGroup(owner, tgChatId))) {
+    return res.status(403).json({ error: 'You are not an admin of that Telegram group' });
+  }
+
+  try {
+    const pair = await addChatPair(
+      owner, waChatId, String(waChatName || '').slice(0, 200),
+      tgChatId, String(tgChatTitle || '').slice(0, 200),
+    );
+    res.status(201).json({ pair });
+  } catch (err) {
+    console.error('addChatPair error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// These are keyed by pairId, not userId, so requireSelf cannot guard them —
 // ownership is enforced in SQL against the authenticated user instead.
 router.patch('/chat-pairs/:pairId', async (req, res) => {
   const pairId = parseInt(req.params.pairId, 10);
   if (isNaN(pairId)) return res.status(400).json({ error: 'Invalid pairId' });
 
-  const { status } = req.body || {};
-  if (!['active', 'paused'].includes(status)) {
-    return res.status(400).json({ error: 'Status must be "active" or "paused"' });
-  }
-
   const owner = req.auth?.userId;
   if (!Number.isFinite(owner)) return res.status(403).json({ error: 'Forbidden' });
 
+  const body = req.body || {};
+  const hasStatus = body.status !== undefined;
+  const hasLanguage = body.target_language !== undefined;
+  const hasSummary = body.summary_enabled !== undefined;
+
+  if (!hasStatus && !hasLanguage && !hasSummary) {
+    return res.status(400).json({ error: 'Nothing to update' });
+  }
+  if (hasStatus && !['active', 'paused'].includes(body.status)) {
+    return res.status(400).json({ error: 'Status must be "active" or "paused"' });
+  }
+  // null is meaningful: it clears the override so the bridge follows the account setting.
+  if (hasLanguage && body.target_language !== null && typeof body.target_language !== 'string') {
+    return res.status(400).json({ error: 'target_language must be a string or null' });
+  }
+  if (hasSummary && typeof body.summary_enabled !== 'boolean') {
+    return res.status(400).json({ error: 'summary_enabled must be a boolean' });
+  }
+
   try {
-    const ok = await setChatPairStatus(pairId, status, owner);
-    if (!ok) return res.status(404).json({ error: 'Pair not found' });
-    res.json({ ok: true });
+    let found = false;
+    if (hasStatus) found = await setChatPairStatus(pairId, body.status, owner) || found;
+    if (hasLanguage) found = await setPairLanguage(pairId, body.target_language, owner) || found;
+    if (hasSummary) found = await setPairSummary(pairId, body.summary_enabled, owner) || found;
+
+    if (!found) return res.status(404).json({ error: 'Pair not found' });
+    res.json({ ok: true, pair: await getChatPairOwned(pairId, owner) });
   } catch (err) {
-    console.error('setChatPairStatus error:', err);
+    console.error('updateChatPair error:', err);
     res.status(500).json({ error: err.message });
   }
 });

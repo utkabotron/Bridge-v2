@@ -1,0 +1,490 @@
+/* Bridge — Mini App
+ *
+ * One idea carries the whole interface: a bridge between two banks. WhatsApp green on the
+ * left, Telegram blue on the right, and a single hairline running between them. That line
+ * is the only decoration in the app — it appears in a bridge card, fills across the top
+ * during setup, and draws itself once when a bridge is created. Everything else is type
+ * and space.
+ *
+ * Colours come from the host: Telegram hands the app its theme, so the app must not fight
+ * it. Only the two bank colours are ours, and they shift for dark mode.
+ */
+
+:root {
+  /* Two banks. The only colours this app owns. */
+  --wa: #25d366;
+  --tg: #2aabee;
+
+  /* Host theme, with fallbacks that work standalone (a browser, a stale client). */
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --surface: var(--tg-theme-secondary-bg-color, #f4f4f5);
+  --section: var(--tg-theme-section-bg-color, var(--surface));
+  --text: var(--tg-theme-text-color, #0f0f0f);
+  --hint: var(--tg-theme-hint-color, #8b8b90);
+  --subtitle: var(--tg-theme-subtitle-text-color, var(--hint));
+  --accent: var(--tg-theme-button-color, #2aabee);
+  --on-accent: var(--tg-theme-button-text-color, #ffffff);
+  --danger: var(--tg-theme-destructive-text-color, #e5484d);
+  --divider: color-mix(in srgb, var(--hint) 22%, transparent);
+
+  /* Type: four steps, nothing in between. */
+  --t-xs: 13px;
+  --t-sm: 15px;
+  --t-md: 17px;
+  --t-lg: 22px;
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-6: 24px;
+  --s-8: 32px;
+
+  --r-sm: 12px;
+  --r-md: 16px;
+  --r-lg: 20px;
+
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Dark mode: the bank colours are lowered so they sit on a dark surface without glowing.
+ * Set from JS off tg.colorScheme, because Telegram's dark theme is not the OS's. */
+:root[data-scheme='dark'] {
+  --wa: #1fb85a;
+  --tg: #3aa6db;
+  --bg: var(--tg-theme-bg-color, #17212b);
+  --surface: var(--tg-theme-secondary-bg-color, #232e3c);
+  --text: var(--tg-theme-text-color, #f5f5f5);
+  --hint: var(--tg-theme-hint-color, #7d8b99);
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  font-family: 'Rubik', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: var(--t-sm);
+  line-height: 1.45;
+  background: var(--bg);
+  color: var(--text);
+  /* Telegram's viewport is not the window's; 100vh overshoots and adds a phantom scroll. */
+  min-height: var(--tg-viewport-stable-height, 100vh);
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Screens ─────────────────────────────────────────────── */
+
+.screen { display: none; }
+.screen.active {
+  display: flex;
+  flex-direction: column;
+  min-height: var(--tg-viewport-stable-height, 100vh);
+  padding: var(--s-4) var(--s-4) calc(var(--s-8) + env(safe-area-inset-bottom));
+  animation: rise 0.2s var(--ease);
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+
+.head { margin-bottom: var(--s-4); }
+.title { font-size: var(--t-lg); font-weight: 600; letter-spacing: -0.02em; }
+.sub { color: var(--subtitle); font-size: var(--t-sm); margin-top: var(--s-1); }
+
+/* ── The bridge line ─────────────────────────────────────── */
+/* Drawn as a gradient rule capped by a dot at each end. Used at three scales: inside a
+ * bridge card, as the setup progress bar, and full width on the success screen. */
+
+.span {
+  position: relative;
+  height: 2px;
+  border-radius: 1px;
+  background: linear-gradient(90deg, var(--wa), var(--tg));
+  flex: 1;
+}
+.span::before,
+.span::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  transform: translateY(-50%);
+}
+.span::before { left: -1px; background: var(--wa); }
+.span::after { right: -1px; background: var(--tg); }
+
+/* Setup progress: the same line, revealed a step at a time. */
+.progress {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-bottom: var(--s-6);
+}
+.progress-track {
+  position: relative;
+  height: 2px;
+  flex: 1;
+  border-radius: 1px;
+  background: var(--divider);
+  overflow: hidden;
+}
+.progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 1px;
+  background: linear-gradient(90deg, var(--wa), var(--tg));
+  transition: width 0.4s var(--ease);
+}
+.progress-step { font-size: var(--t-xs); color: var(--hint); font-variant-numeric: tabular-nums; }
+
+/* ── Cards ───────────────────────────────────────────────── */
+/* One card for everything selectable: a WhatsApp chat, a Telegram group, a bridge. */
+
+.card {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: var(--s-3) var(--s-4);
+  background: var(--surface);
+  border: none;
+  border-radius: var(--r-md);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.12s var(--ease), opacity 0.12s var(--ease);
+}
+.card + .card { margin-top: var(--s-2); }
+.card:active { transform: scale(0.985); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card[disabled] { opacity: 0.5; cursor: default; }
+.card.selected { box-shadow: inset 0 0 0 2px var(--accent); }
+
+.card-body { flex: 1; min-width: 0; }
+.card-title {
+  font-size: var(--t-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-meta {
+  font-size: var(--t-xs);
+  color: var(--hint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 1px;
+}
+
+/* Avatar: a monogram, tinted by which side of the bridge it belongs to. */
+.mono {
+  flex-shrink: 0;
+  width: 38px; height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: var(--t-sm);
+  font-weight: 500;
+  text-transform: uppercase;
+  color: #fff;
+}
+.mono.wa { background: var(--wa); }
+.mono.tg { background: var(--tg); }
+
+/* ── Bridge card ─────────────────────────────────────────── */
+/* Reads left to right as the message does: WhatsApp chat, the span, Telegram group. */
+
+.bridge { display: block; padding: var(--s-4); }
+.bridge-ends {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+.bridge-end { min-width: 0; flex: 1; }
+.bridge-end.right { text-align: right; }
+.bridge-name {
+  font-size: var(--t-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bridge-side {
+  font-size: var(--t-xs);
+  color: var(--hint);
+  margin-top: 1px;
+}
+.bridge-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+
+/* ── Pills ───────────────────────────────────────────────── */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 2px var(--s-2);
+  border-radius: 999px;
+  font-size: var(--t-xs);
+  font-weight: 500;
+  background: color-mix(in srgb, var(--hint) 16%, transparent);
+  color: var(--hint);
+}
+.pill.on { background: color-mix(in srgb, var(--wa) 16%, transparent); color: var(--wa); }
+.pill.off { background: color-mix(in srgb, var(--hint) 16%, transparent); color: var(--hint); }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+/* ── Connection status line ──────────────────────────────── */
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-size: var(--t-xs);
+  color: var(--hint);
+  margin-bottom: var(--s-3);
+}
+.status .dot { background: var(--wa); }
+.status.down .dot { background: var(--danger); }
+.status.down { color: var(--danger); }
+.status button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* ── Lists and sections ──────────────────────────────────── */
+
+.list { display: flex; flex-direction: column; }
+.list > * { animation: rise 0.2s var(--ease) backwards; }
+/* A short stagger makes a list feel assembled rather than dumped. */
+.list > *:nth-child(1) { animation-delay: 0ms; }
+.list > *:nth-child(2) { animation-delay: 30ms; }
+.list > *:nth-child(3) { animation-delay: 60ms; }
+.list > *:nth-child(4) { animation-delay: 90ms; }
+.list > *:nth-child(5) { animation-delay: 120ms; }
+.list > *:nth-child(n + 6) { animation-delay: 150ms; }
+
+.section-label {
+  font-size: var(--t-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--hint);
+  margin: var(--s-4) 0 var(--s-2);
+}
+.section-label:first-child { margin-top: 0; }
+
+.search {
+  width: 100%;
+  padding: var(--s-3) var(--s-4);
+  margin-bottom: var(--s-3);
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+.search::placeholder { color: var(--hint); }
+.search:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* ── States: empty, error, loading ───────────────────────── */
+
+.state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: var(--s-8) var(--s-4);
+  gap: var(--s-3);
+}
+.state-art { width: 96px; height: 24px; }
+.state-title { font-size: var(--t-md); font-weight: 500; }
+.state-text { font-size: var(--t-sm); color: var(--hint); max-width: 32ch; }
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  padding: var(--s-2);
+}
+
+.skeleton {
+  height: 62px;
+  border-radius: var(--r-md);
+  background: linear-gradient(90deg, var(--surface) 25%, color-mix(in srgb, var(--hint) 12%, var(--surface)) 37%, var(--surface) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.4s ease infinite;
+}
+.skeleton + .skeleton { margin-top: var(--s-2); }
+@keyframes shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: 0 0; }
+}
+
+/* ── QR ──────────────────────────────────────────────────── */
+
+.qr-wrap {
+  align-self: center;
+  /* A QR must stay dark-on-white to scan, in either theme. */
+  background: #fff;
+  padding: var(--s-3);
+  border-radius: var(--r-lg);
+  line-height: 0;
+  margin: var(--s-4) 0;
+}
+.qr-wrap img { width: 232px; height: 232px; display: block; }
+.qr-placeholder {
+  width: 232px; height: 232px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: #f4f4f5;
+}
+
+.spinner {
+  width: 22px; height: 22px;
+  border: 2px solid var(--divider);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.steps {
+  counter-reset: step;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin-top: var(--s-2);
+}
+.steps li {
+  counter-increment: step;
+  display: flex;
+  gap: var(--s-3);
+  font-size: var(--t-sm);
+  color: var(--subtitle);
+}
+.steps li::before {
+  content: counter(step);
+  flex-shrink: 0;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--hint);
+  font-size: var(--t-xs);
+  display: grid;
+  place-items: center;
+}
+
+/* ── Bottom sheet ────────────────────────────────────────── */
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.24s var(--ease);
+  z-index: 10;
+}
+.sheet-backdrop.open { opacity: 1; pointer-events: auto; }
+
+.sheet {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 11;
+  background: var(--bg);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  padding: var(--s-3) var(--s-4) calc(var(--s-4) + env(safe-area-inset-bottom));
+  transform: translateY(100%);
+  transition: transform 0.24s var(--ease);
+  max-height: 88%;
+  overflow-y: auto;
+}
+.sheet.open { transform: none; }
+.sheet-grip {
+  width: 36px; height: 4px;
+  border-radius: 2px;
+  background: var(--divider);
+  margin: 0 auto var(--s-3);
+}
+.sheet-title {
+  font-size: var(--t-md);
+  font-weight: 600;
+  margin-bottom: var(--s-3);
+  text-align: center;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: var(--s-3) 0;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--divider);
+  color: inherit;
+  font: inherit;
+  font-size: var(--t-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.row:first-of-type { border-top: none; }
+.row-label { flex: 1; }
+.row-value { color: var(--hint); font-size: var(--t-xs); }
+.row.danger { color: var(--danger); }
+.row[disabled] { opacity: 0.5; cursor: default; }
+.row svg { flex-shrink: 0; }
+
+/* ── Success ─────────────────────────────────────────────── */
+
+.done-art {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  margin: var(--s-6) 0;
+}
+.done-art .span { transform-origin: left center; animation: draw 0.6s var(--ease); }
+@keyframes draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+/* ── Motion off ──────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
