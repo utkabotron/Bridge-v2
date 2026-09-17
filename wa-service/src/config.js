@@ -40,6 +40,10 @@ module.exports = {
   // A client that never produced a QR and never went ready within this window is stuck
   // in initialize() and will never recover on its own.
   INIT_STUCK_TIMEOUT: parseInt(process.env.INIT_STUCK_TIMEOUT) || 5 * 60 * 1000,
+  // A client that authenticated is syncing chat history, which is slow for a busy
+  // account. Restarting it on the INIT_STUCK_TIMEOUT clock would restart the sync too,
+  // forever; this is the point past which the sync is genuinely wedged.
+  SYNC_STUCK_TIMEOUT: parseInt(process.env.SYNC_STUCK_TIMEOUT) || 20 * 60 * 1000,
   // Upper bound per client during shutdown; Docker's default stop grace is 10s total.
   DESTROY_TIMEOUT: parseInt(process.env.DESTROY_TIMEOUT) || 8000,
   OLD_MESSAGE_THRESHOLD: parseInt(process.env.OLD_MESSAGE_THRESHOLD) || 120,

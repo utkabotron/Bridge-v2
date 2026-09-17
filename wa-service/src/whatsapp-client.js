@@ -50,6 +50,7 @@ const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
 const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
 const INIT_STUCK_TIMEOUT = config.INIT_STUCK_TIMEOUT;
+const SYNC_STUCK_TIMEOUT = config.SYNC_STUCK_TIMEOUT;
 const DESTROY_TIMEOUT = config.DESTROY_TIMEOUT;
 const MEDIA_DOWNLOAD_ATTEMPTS = config.MEDIA_DOWNLOAD_ATTEMPTS;
 const MEDIA_RETRY_DELAY = config.MEDIA_RETRY_DELAY;
@@ -372,9 +373,18 @@ async function checkClientHealth() {
       // above (which needs a QR) never fires and the recovery loop skips it because the
       // map still holds an entry. It sat there forever, counted as an active client,
       // holding a slot and ~400 MB, delivering nothing. Drop it and let recovery retry.
-      const stuckFor = Date.now() - (clientData.initStartedAt || 0);
-      if (!clientData.qr && stuckFor > INIT_STUCK_TIMEOUT) {
-        console.warn(`Health check: user ${userId} stuck initializing for ${Math.round(stuckFor / 1000)}s — destroying`);
+      //
+      // A client that has authenticated is a different case: its session is valid and
+      // WhatsApp is syncing history, which is genuinely slow for a busy account. Killing
+      // it at the same five-minute mark would restart the sync from scratch every five
+      // minutes and it would never finish — the same destroy/reconnect loop the
+      // 'authenticated' handler warns about, arrived at from the other side. Give it a
+      // far longer ceiling, past which the sync really is wedged.
+      const authenticated = !!clientData.authenticatedAt;
+      const limit = authenticated ? SYNC_STUCK_TIMEOUT : INIT_STUCK_TIMEOUT;
+      const stuckFor = Date.now() - (authenticated ? clientData.authenticatedAt : (clientData.initStartedAt || 0));
+      if (!clientData.qr && stuckFor > limit) {
+        console.warn(`Health check: user ${userId} stuck ${authenticated ? 'syncing' : 'initializing'} for ${Math.round(stuckFor / 1000)}s — destroying`);
         clientData.intentionalDestroy = true;
         await destroyClient(clientData.client, userId);
         clients.delete(userId);
@@ -480,7 +490,7 @@ async function buildClient(userId) {
   const clientData = {
     client: null, qr: null, isReady: false, userId, qrTimer: null,
     errorCount: 0, intentionalDestroy: false,
-    initStartedAt: Date.now(), lastMessageAt: null,
+    initStartedAt: Date.now(), authenticatedAt: null, lastMessageAt: null,
   };
 
   const client = new Client({
@@ -568,6 +578,10 @@ async function buildClient(userId) {
     console.log(`WhatsApp authenticated for user ${userId}`);
     clearTimeout(clientData.qrTimer);
     clientData.qrTimer = null;
+    // The session is valid from here; what remains is WhatsApp syncing chat history,
+    // which can legitimately take many minutes. The watchdog reads this to tell "slow
+    // sync" apart from "wedged in initialize()" — see checkClientHealth.
+    clientData.authenticatedAt = Date.now();
     // NOTE: do NOT set isReady here. 'authenticated' fires before chat sync completes;
     // marking ready now makes the health check call getState() mid-sync, see a
     // non-CONNECTED state, and destroy+reconnect in a loop. isReady is set only on 'ready'.

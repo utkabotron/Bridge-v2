@@ -727,6 +727,49 @@ describe('clients stuck initializing', () => {
     jest.useRealTimers();
   });
 
+  test('an authenticated client syncing history is left alone past the init timeout', async () => {
+    // Its session is valid; what is slow is WhatsApp syncing chat history. Killing it on
+    // the init clock would restart the sync every five minutes and it would never finish.
+    jest.useFakeTimers();
+    const { createWhatsAppClient, clients, startHealthCheck, stopHealthCheck } = require('../src/whatsapp-client');
+    const config = require('../src/config');
+
+    await createWhatsAppClient(57);
+    const data = clients.get(57);
+    data.isReady = false;
+    data.qr = null;
+    data.qrTimer = null;
+    data.initStartedAt = Date.now() - (config.INIT_STUCK_TIMEOUT + 60000);
+    data.authenticatedAt = Date.now() - 60000; // authenticated a minute ago
+
+    startHealthCheck();
+    await jest.advanceTimersByTimeAsync(config.HEALTH_CHECK_INTERVAL + 100);
+    stopHealthCheck();
+
+    expect(clients.has(57)).toBe(true);
+    jest.useRealTimers();
+  });
+
+  test('a sync that never completes is eventually destroyed', async () => {
+    jest.useFakeTimers();
+    const { createWhatsAppClient, clients, startHealthCheck, stopHealthCheck } = require('../src/whatsapp-client');
+    const config = require('../src/config');
+
+    await createWhatsAppClient(58);
+    const data = clients.get(58);
+    data.isReady = false;
+    data.qr = null;
+    data.qrTimer = null;
+    data.authenticatedAt = Date.now() - (config.SYNC_STUCK_TIMEOUT + 60000);
+
+    startHealthCheck();
+    await jest.advanceTimersByTimeAsync(config.HEALTH_CHECK_INTERVAL + 100);
+    stopHealthCheck();
+
+    expect(clients.has(58)).toBe(false);
+    jest.useRealTimers();
+  });
+
   test('a freshly created one is left alone', async () => {
     jest.useFakeTimers();
     const { createWhatsAppClient, clients, startHealthCheck, stopHealthCheck } = require('../src/whatsapp-client');
