@@ -13,6 +13,7 @@ const s3 = new S3Client({
 });
 
 const config = require('./config');
+const { serializedMsgId } = require('./message-id');
 
 const S3_PUBLIC_URL = config.S3_PUBLIC_URL;
 
@@ -57,6 +58,96 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 /**
+ * Download media without going through window.Store.
+ *
+ * whatsapp-web.js's Message.downloadMedia() reads window.Store.Msg and
+ * window.Store.DownloadManager. WhatsApp periodically renames the modules those aliases
+ * are built from, and when that happens window.Store is never populated at all — every
+ * download then fails with a bare 'r' and two months of photos and voice notes arrived
+ * as "не удалось получить файл". The same rename also drops message.id._serialized,
+ * so the message cannot even be looked up in the page by id any more.
+ *
+ * Everything the download manager needs is already on message._data, so hand it those
+ * fields directly and skip both the Store alias and the id lookup. mimetype is required:
+ * without it the manager defaults to application/octet-stream and rejects the response
+ * ("Unexpected mimetype application/octet-stream for media type image").
+ */
+async function downloadMediaDirect(message) {
+  const page = message.client?.pupPage;
+  if (!page) throw new Error('pupPage unavailable');
+
+  const d = message._data || {};
+  const meta = {
+    directPath: d.directPath,
+    encFilehash: d.encFilehash,
+    filehash: d.filehash,
+    mediaKey: d.mediaKey,
+    mediaKeyTimestamp: d.mediaKeyTimestamp,
+    type: d.type || message.type,
+    // Stickers occasionally arrive without a MIME type; webp is the only format WA uses.
+    mimetype: d.mimetype || (message.type === 'sticker' ? 'image/webp' : undefined),
+    filename: d.filename || null,
+    size: d.size ?? null,
+  };
+  if (!meta.directPath || !meta.mediaKey) {
+    throw new Error('media metadata missing on message (no directPath/mediaKey)');
+  }
+
+  const data = await page.evaluate(async (m) => {
+    const tryRequire = (name) => {
+      try {
+        return window.require(name);
+      } catch {
+        return null;
+      }
+    };
+
+    const dm =
+      window.Store?.DownloadManager ||
+      tryRequire('WAWebDownloadManager')?.downloadManager;
+    if (!dm?.downloadAndMaybeDecrypt) {
+      throw new Error(
+        `download manager unavailable (store=${typeof window.Store}, require=${typeof window.require})`
+      );
+    }
+
+    const buffer = await dm.downloadAndMaybeDecrypt({
+      directPath: m.directPath,
+      encFilehash: m.encFilehash,
+      filehash: m.filehash,
+      mediaKey: m.mediaKey,
+      mediaKeyTimestamp: m.mediaKeyTimestamp,
+      type: m.type,
+      mimetype: m.mimetype,
+      signal: new AbortController().signal,
+      // The real QPL logger lives behind another Store alias; the manager only calls
+      // these two methods on it.
+      downloadQpl: {
+        addAnnotations() {
+          return this;
+        },
+        addPoint() {
+          return this;
+        },
+      },
+    });
+
+    return window.WWebJS.arrayBufferToBase64Async
+      ? await window.WWebJS.arrayBufferToBase64Async(buffer)
+      : btoa(String.fromCharCode(...new Uint8Array(buffer)));
+  }, meta);
+
+  if (!data) throw new Error('direct download returned no data');
+
+  return {
+    data,
+    mimetype: meta.mimetype,
+    filename: meta.filename,
+    filesize: meta.size,
+  };
+}
+
+/**
  * Download media from a WhatsApp message, validate, upload to S3.
  * Returns { s3Key, s3Url, mimeType, filename } or null if no media / sticker.
  */
@@ -73,20 +164,32 @@ async function handleMedia(message, userId) {
   await acquireMediaSlot();
   try {
     let media;
+    let libError = null;
     try {
       media = await message.downloadMedia();
     } catch (err) {
-      throw new Error(`downloadMedia failed: ${err.message}`);
+      libError = err;
     }
 
-    if (!media) {
-      if (message.type === 'sticker') return null; // sticker download failed — treat as text
-      throw new Error(`downloadMedia returned null for type=${message.type}`);
+    // The library path is dead whenever WhatsApp has renamed the Store modules; fall
+    // back to the download manager directly rather than dropping the attachment.
+    if (!media?.data) {
+      try {
+        media = await downloadMediaDirect(message);
+      } catch (err) {
+        if (message.type === 'sticker') return null; // treat an unfetchable sticker as text
+        const why = libError ? `${libError.message} / direct: ${err.message}` : err.message;
+        throw new Error(`downloadMedia failed for type=${message.type}: ${why}`);
+      }
     }
 
     // Stickers: force webp MIME if missing (whatsapp-web.js sometimes omits it)
     if (message.type === 'sticker' && !media.mimetype) {
       media.mimetype = 'image/webp';
+    }
+
+    if (!media.mimetype) {
+      throw new Error(`downloadMedia returned no mimetype for type=${message.type}`);
     }
 
     const buffer = Buffer.from(media.data, 'base64');
@@ -124,10 +227,10 @@ async function handleMedia(message, userId) {
 }
 
 function safeIdPart(message) {
-  const id = message.id?._serialized;
+  const id = serializedMsgId(message);
   if (id) return id;
   const { randomBytes } = require('crypto');
   return `noid_${randomBytes(6).toString('hex')}`;
 }
 
-module.exports = { handleMedia };
+module.exports = { handleMedia, downloadMediaDirect };

@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { publishMessage, publishQrScanned, publishRevoke, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
+const { serializedMsgId } = require('./message-id');
 const { setWaConnected, setWaDisconnected } = require('./db');
 
 /** Reject with a labelled error if `promise` outlives `ms`. */
@@ -69,7 +70,7 @@ function getClientId(userId) {
 }
 
 function safeMessageId(message) {
-  return message?.id?._serialized || '(no-id)';
+  return serializedMsgId(message) || '(no-id)';
 }
 
 // ── SingletonLock cleanup ─────────────────────────────────
@@ -889,7 +890,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
     try {
       const q = await withTimeout(message.getQuotedMessage(), 'getQuotedMessage', config.GET_CHAT_TIMEOUT);
       quoted = {
-        wa_message_id: q?.id?._serialized || null,
+        wa_message_id: serializedMsgId(q),
         body: (q?.body || '').slice(0, 120),
         sender: q?._data?.notifyName || null,
       };
@@ -899,7 +900,7 @@ async function handleIncomingMessage(userId, message, isEdited) {
   }
 
   const payload = {
-    wa_message_id: message.id?._serialized, // may be undefined → redis-publisher assigns a stable fallback id
+    wa_message_id: serializedMsgId(message), // may be null → redis-publisher assigns a stable fallback id
     wa_chat_id: chatId,
     wa_chat_name: chatName,
     user_id: userId,

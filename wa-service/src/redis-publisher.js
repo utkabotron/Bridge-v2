@@ -1,5 +1,6 @@
 const Redis = require('ioredis');
 const crypto = require('crypto');
+const { serializedMsgId } = require('./message-id');
 const {
   REDIS_HOST, REDIS_PORT, REDIS_DB,
   REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
@@ -116,7 +117,7 @@ async function publishMessage(payload) {
  * the message it refers to and cannot be lost while the processor restarts.
  */
 async function publishRevoke(userId, before) {
-  const waMessageId = normalizeMessageId(before?.id?._serialized);
+  const waMessageId = normalizeMessageId(serializedMsgId(before));
   if (!waMessageId) return;
 
   const payload = {
