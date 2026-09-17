@@ -75,6 +75,11 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(render("not_authorized"), parse_mode="Markdown")
         return
 
+    # Someone running /add here is telling us this group is linkable — record it (and its
+    # admins) so it also shows up in the Mini App's picker.
+    from .groups import sync_group
+    await sync_group(ctx.bot, chat)
+
     # Fetch WA status + groups
     try:
         from ..utils.http_client import get as http_get, internal_headers
@@ -169,18 +174,18 @@ async def _render_settings(query, tg_id: int, pair_id: int) -> None:
 
     summary_on = pair["summary_enabled"]
     rows = [[InlineKeyboardButton(
-        f"{'🔔' if summary_on else '🔕'} Сводка дня: {'вкл' if summary_on else 'выкл'}",
+        f"{'🔔' if summary_on else '🔕'} Daily summary: {'on' if summary_on else 'off'}",
         callback_data=f"chat:summary:{pair_id}",
     )]]
     for code, label in _LANGUAGES:
         mark = "✅ " if pair["effective_language"] == code else ""
         rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"chat:lang:{pair_id}:{code}")])
-    rows.append([InlineKeyboardButton("⬅️ Закрыть", callback_data=f"chat:close:{pair_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Close", callback_data=f"chat:close:{pair_id}")])
 
-    inherited = "" if pair.get("target_language") else " — по умолчанию аккаунта"
+    inherited = "" if pair.get("target_language") else " — account default"
     text = (
         f"*{pair['wa_chat_name']}* → {pair['tg_chat_title']}\n\n"
-        f"Язык перевода: *{pair['effective_language']}*{inherited}"
+        f"Translate into: *{pair['effective_language']}*{inherited}"
     )
     await query.edit_message_text(text, parse_mode="Markdown",
                                   reply_markup=InlineKeyboardMarkup(rows))
@@ -228,40 +233,3 @@ async def cb_chat_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     msg = render("chat_paused") if new_status == "paused" else render("chat_resumed")
     await query.edit_message_text(msg, parse_mode="Markdown")
-
-
-# ── /done (link pending WA group to this TG group) ───────
-
-async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    tg_id = update.effective_user.id
-
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text(
-            render("onboarding_done_group_only"), parse_mode="Markdown"
-        )
-        return
-
-    if not await is_whitelisted(tg_id):
-        await update.message.reply_text(render("not_authorized"), parse_mode="Markdown")
-        return
-
-    pending = ctx.user_data.get("pending_wa_chat")
-    if not pending:
-        await update.message.reply_text(
-            render("onboarding_done_no_pending"), parse_mode="Markdown"
-        )
-        return
-
-    wa_chat_id = pending["wa_chat_id"]
-    wa_chat_name = pending["wa_chat_name"]
-
-    await finish_onboarding(tg_id, wa_chat_id, wa_chat_name, chat.id, chat.title or str(chat.id))
-
-    # Clear pending data
-    ctx.user_data.pop("pending_wa_chat", None)
-
-    await update.message.reply_text(
-        render("onboarding_done_success", escape=True, wa_name=wa_chat_name, tg_title=chat.title or str(chat.id)),
-        parse_mode="Markdown",
-    )

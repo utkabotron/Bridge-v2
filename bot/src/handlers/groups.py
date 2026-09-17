@@ -1,54 +1,83 @@
-"""Track groups where the bot is added/removed via my_chat_member events.
+"""Track the Telegram groups the bot belongs to, so the Mini App can offer them.
 
-Stores group info in Redis so wa-service can serve it to the Mini App.
-Key pattern: bot:user_groups:{user_id} → HASH { chat_id: JSON({chat_id, title}) }
-TTL: 1 hour (reset on each add).
+This used to live in a Redis hash keyed by whoever added the bot, with a one-hour TTL,
+written only on the my_chat_member event. A group the bot was already in never produced
+that event and so never appeared; a group added by another admin landed under that admin's
+key; and an hour later the list emptied on its own. The picker was blank for most users.
+
+Now it is a table (tg_groups), one row per (group, admin), refreshed from three places:
+the membership event, a throttled peek at ordinary group messages — which is what finally
+picks up groups the bot joined long ago — and /add.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
+import time
 
-import redis.asyncio as aioredis
-from telegram import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Chat, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from ..db import delete_tg_group, replace_tg_group_admins
 from ..templates.messages import render
 
 logger = logging.getLogger(__name__)
 
-TTL_SECONDS = 3600  # 1 hour
-
-_redis: aioredis.Redis | None = None
-
-
-def _redis_url() -> str:
-    """Build the Redis URL. Prefer REDIS_URL, else compose from REDIS_HOST/PORT/DB — the
-    vars actually set in docker-compose. (A hardcoded localhost default made every group
-    Redis write fail inside the container, killing the my_chat_member tracking.)"""
-    url = os.getenv("REDIS_URL")
-    if url:
-        return url
-    host = os.getenv("REDIS_HOST", "localhost")
-    port = os.getenv("REDIS_PORT", "6379")
-    db = os.getenv("REDIS_DB", "0")
-    return f"redis://{host}:{port}/{db}"
+# A busy group must not trigger getChatAdministrators on every message.
+SYNC_INTERVAL_SECONDS = 3600
+_last_sync: dict[int, float] = {}
 
 
-async def _get_redis() -> aioredis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = aioredis.from_url(_redis_url(), decode_responses=True)
-    return _redis
+async def sync_group(bot, chat: Chat, force: bool = False) -> None:
+    """Record this group against every human admin who may link it.
+
+    Best-effort: a Telegram or database hiccup here must never block the message or
+    command that triggered it.
+    """
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    now = time.monotonic()
+    if not force and now - _last_sync.get(chat.id, 0) < SYNC_INTERVAL_SECONDS:
+        return
+    _last_sync[chat.id] = now
+
+    try:
+        admins = await bot.get_chat_administrators(chat.id)
+    except Exception as exc:
+        # Most often "not enough rights" — the bot can still bridge, it just cannot
+        # enumerate admins, so we leave whatever rows already exist alone.
+        logger.warning("Could not list admins of %s: %s", chat.id, exc)
+        _last_sync.pop(chat.id, None)
+        return
+
+    rows = [
+        (member.user.id, "creator" if member.status == "creator" else "administrator")
+        for member in admins
+        if member.user and not member.user.is_bot
+    ]
+
+    try:
+        await replace_tg_group_admins(chat.id, chat.title or "", rows)
+    except Exception as exc:
+        logger.warning("Could not store group %s: %s", chat.id, exc)
+        _last_sync.pop(chat.id, None)
 
 
-def _key(user_id: int) -> str:
-    return f"bot:user_groups:{user_id}"
+async def handle_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh membership from ordinary traffic in a group.
+
+    Without this, a group the bot joined before any of this existed would stay invisible
+    to the picker forever — there is no event to replay and no API to list the bot's own
+    chats. Throttled to once an hour per group.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    await sync_group(ctx.bot, chat)
 
 
 async def handle_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle my_chat_member updates: bot added/removed from a group."""
+    """Handle my_chat_member updates: bot added to / removed from a group."""
     event: ChatMemberUpdated = update.my_chat_member
     if event is None:
         return
@@ -57,35 +86,20 @@ async def handle_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     if chat.type not in ("group", "supergroup"):
         return
 
-    from_user = event.from_user
-    if from_user is None:
-        return
-
     new_status = event.new_chat_member.status
     old_status = event.old_chat_member.status
 
-    key = _key(from_user.id)
+    if new_status in ("member", "administrator"):
+        # force: the whole point of this event is that membership just changed.
+        await sync_group(ctx.bot, chat, force=True)
+        logger.info("Bot is now %s in group %s (%s)", new_status, chat.id, chat.title)
 
-    async def _redis_op(coro_factory):
-        """Run a Redis op but never let a Redis failure abort the handler (and thus the
-        admin greeting). Group tracking is best-effort."""
-        try:
-            r = await _get_redis()
-            await coro_factory(r)
-        except Exception as exc:
-            logger.warning("Redis group-tracking op failed: %s", exc)
-
-    if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
-        # Bot was added to a group
-        value = json.dumps({"chat_id": chat.id, "title": chat.title or ""})
-        await _redis_op(lambda r: r.hset(key, str(chat.id), value))
-        await _redis_op(lambda r: r.expire(key, TTL_SECONDS))
-        logger.info("Bot added to group %s (%s) by user %s", chat.id, chat.title, from_user.id)
-
-        # If added as admin → send ready message with /add hint
-        if new_status == "administrator":
+        # Only greet on a transition into the group or into admin — not on every event.
+        became_member = old_status in ("left", "kicked")
+        became_admin = new_status == "administrator" and old_status == "member"
+        if became_member or became_admin:
             try:
-                kb = [[InlineKeyboardButton("➕ Link WhatsApp group", callback_data="cmd:add")]]
+                kb = [[InlineKeyboardButton("➕ Link WhatsApp chat", callback_data="cmd:add")]]
                 await ctx.bot.send_message(
                     chat_id=chat.id,
                     text=render("bot_added_as_admin"),
@@ -93,30 +107,19 @@ async def handle_my_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
                     reply_markup=InlineKeyboardMarkup(kb),
                 )
             except Exception as exc:
-                logger.warning("Could not send admin message to %s: %s", chat.id, exc)
-
-    elif new_status == "administrator" and old_status == "member":
-        # Bot promoted to admin in existing group
-        logger.info("Bot promoted to admin in group %s (%s) by user %s", chat.id, chat.title, from_user.id)
-        try:
-            kb = [[InlineKeyboardButton("➕ Link WhatsApp group", callback_data="cmd:add")]]
-            await ctx.bot.send_message(
-                chat_id=chat.id,
-                text=render("bot_added_as_admin"),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
-        except Exception as exc:
-            logger.warning("Could not send admin message to %s: %s", chat.id, exc)
+                logger.warning("Could not send greeting to %s: %s", chat.id, exc)
 
     elif new_status in ("left", "kicked") and old_status in ("member", "administrator"):
-        # Bot was removed from a group
-        await _redis_op(lambda r: r.hdel(key, str(chat.id)))
-        logger.info("Bot removed from group %s (%s) by user %s", chat.id, chat.title, from_user.id)
+        _last_sync.pop(chat.id, None)
+        try:
+            await delete_tg_group(chat.id)
+        except Exception as exc:
+            logger.warning("Could not forget group %s: %s", chat.id, exc)
+        logger.info("Bot removed from group %s (%s)", chat.id, chat.title)
 
 
 async def cb_cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the 'Link WhatsApp group' button (callback_data='cmd:add'). Without a
+    """Handle the 'Link WhatsApp chat' button (callback_data='cmd:add'). Without a
     registered handler this button spun forever. Delegates to the /add flow in-place."""
     query = update.callback_query
     if not query:

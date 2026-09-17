@@ -24,9 +24,9 @@ from telegram.ext import (
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
 from .handlers.analyze import cb_analyze_media, cb_noop
 from .handlers.translate import handle_direct_media, handle_direct_text
-from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats, cmd_done
-from .handlers.groups import handle_my_chat_member, cb_cmd_add
-from .onboarding.wizard import cb_bot_added, cb_connect_wa, cb_group_created, cmd_start, handle_webapp_data
+from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats
+from .handlers.groups import cb_cmd_add, handle_group_message, handle_my_chat_member
+from .onboarding.wizard import cmd_start
 from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop
 
 logging.basicConfig(
@@ -61,24 +61,26 @@ def main() -> None:
     set_bot_app(app)
 
     # ── Onboarding ────────────────────────────────────────
+    # /start is the only entry: it hands over the Mini App, which does the rest over HTTP.
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(cb_connect_wa, pattern="^onboarding:connect_wa$"))
-    app.add_handler(CallbackQueryHandler(cb_group_created, pattern="^onboarding:group_created$"))
-    app.add_handler(CallbackQueryHandler(cb_bot_added, pattern="^onboarding:bot_added$"))
-
-    # ── WebApp data (Mini App sends WA group selection) ──
-    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
 
     # ── Chat management ───────────────────────────────────
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CallbackQueryHandler(cb_link_chat, pattern=r"^link:"))
     app.add_handler(CallbackQueryHandler(cb_chat_action, pattern=r"^chat:(pause|resume|settings|lang|summary|close):"))
 
-    # ── Group tracking (my_chat_member) ───────────────────
+    # ── Group tracking ────────────────────────────────────
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(cb_cmd_add, pattern="^cmd:add$"))
+    # Ordinary group traffic refreshes membership. Without it a group the bot joined
+    # before this existed would never reach the picker: there is no event to replay and
+    # no API to list the bot's own chats. group=1 and block=False keep it out of the way
+    # of the real handlers; sync_group itself is throttled to once an hour per chat.
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS, handle_group_message, block=False),
+        group=1,
+    )
 
     # ── Media analysis ─────────────────────────────────────
     app.add_handler(CallbackQueryHandler(cb_analyze_media, pattern=r"^analyze:\d+$"))

@@ -81,31 +81,29 @@ async def handle_qr_event(data: dict) -> None:
         _pending_events.append(data)
         return
 
-    from .db import get_onboarding_state, set_onboarding_state, set_wa_connected
+    from .db import set_wa_connected
 
-    # Always mark WA as connected in users table
+    # wa-service writes this flag itself when a client goes ready; doing it here too costs
+    # one statement and covers the case where that write failed.
     await set_wa_connected(int(user_id), str(user_id))
 
-    state = await get_onboarding_state(int(user_id))
-    if state != "qr_pending":
+    # Only the terminal event is worth telling the user about: 'authenticated' fires
+    # before the chat sync finishes, and the Mini App is already showing live status.
+    if event != "ready":
         return
 
-    await set_onboarding_state(int(user_id), "wa_connected")
     logger.info("User %s WA connected (event=%s)", user_id, event)
 
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from .templates.messages import render
 
-    me = await _bot_app.bot.get_me()
-    text = render("onboarding_wa_connected", bot_username=me.username)
-    kb = [[InlineKeyboardButton("✅ Done — bot is in the group", callback_data="onboarding:group_created")]]
-
+    # The old code gated this on onboarding_state == 'qr_pending' and then advanced the
+    # state machine — but nothing ever set qr_pending (its only setter was an unreachable
+    # callback), so this notification never fired at all.
     try:
         await _bot_app.bot.send_message(
             chat_id=user_id,
-            text=text,
+            text=render("wa_connected_notice"),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
         )
     except Exception as exc:
         logger.error("Failed to notify user %s: %s", user_id, exc)

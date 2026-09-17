@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Optional
 
 import asyncpg
 
@@ -170,13 +170,6 @@ async def add_chat_pair(
     return dict(row) if row else None
 
 
-async def set_chat_pair_status(pair_id: int, status: str) -> None:
-    pool = await get_pool()
-    await pool.execute(
-        "update public.chat_pairs set status = $1 where id = $2", status, pair_id
-    )
-
-
 async def set_pair_language_owned(pair_id: int, tg_user_id: int, language: str | None) -> bool:
     """Set this bridge's target language, or clear it to follow the account setting.
 
@@ -280,3 +273,39 @@ async def get_all_users() -> list[dict]:
     pool = await get_pool()
     rows = await pool.fetch("select * from public.users order by created_at")
     return [dict(r) for r in rows]
+
+
+# ── Telegram groups the bot belongs to ───────────────────
+
+async def replace_tg_group_admins(tg_chat_id: int, title: str, admins: list[tuple[int, str]]) -> None:
+    """Make tg_groups match the group's current admin list, in one transaction.
+
+    Rows are (group, admin) pairs: every admin may link the group, and the Mini App shows
+    a user exactly the groups they are entitled to link. Admins who lost the role lose the
+    row, so a stale entry cannot grant someone a group they no longer administer.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if admins:
+                await conn.executemany(
+                    """
+                    insert into public.tg_groups (tg_chat_id, tg_user_id, title, role, updated_at)
+                    values ($1, $2, $3, $4, now())
+                    on conflict (tg_chat_id, tg_user_id) do update
+                      set title = excluded.title,
+                          role = excluded.role,
+                          updated_at = now()
+                    """,
+                    [(tg_chat_id, uid, title, role) for uid, role in admins],
+                )
+            await conn.execute(
+                "delete from public.tg_groups where tg_chat_id = $1 and tg_user_id <> all($2::bigint[])",
+                tg_chat_id, [uid for uid, _ in admins],
+            )
+
+
+async def delete_tg_group(tg_chat_id: int) -> None:
+    """Forget a group entirely — the bot is no longer in it."""
+    pool = await get_pool()
+    await pool.execute("delete from public.tg_groups where tg_chat_id = $1", tg_chat_id)
