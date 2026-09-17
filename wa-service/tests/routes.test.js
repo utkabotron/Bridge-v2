@@ -24,6 +24,7 @@ jest.mock('../src/whatsapp-client', () => ({
   createWhatsAppClient: jest.fn(),
   getGroups: jest.fn(),
   getLastMessageAt: jest.fn(() => null),
+  getHealthPasses: jest.fn(() => 0),
 }));
 
 jest.mock('../src/redis-publisher', () => ({

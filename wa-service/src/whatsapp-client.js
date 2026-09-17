@@ -408,22 +408,30 @@ async function checkClientHealth() {
 }
 
 let healthCheckRunning = false;
+let recoveryRunning = false;
+let healthPasses = 0;
 
 function startHealthCheck() {
   if (healthCheckTimer) return;
-  healthCheckTimer = setInterval(async () => {
-    // Each pass can take longer than the interval when clients are hanging (getState and
-    // destroy are bounded at 10s each, per client), and two passes racing could both
-    // decide to destroy the same client.
-    if (healthCheckRunning) return;
-    healthCheckRunning = true;
-    try {
-      await checkClientHealth();
-      await recoverLostSessions();
-    } catch (err) {
-      console.error('Health check loop error:', err.message);
-    } finally {
-      healthCheckRunning = false;
+  healthCheckTimer = setInterval(() => {
+    // Two independent guards, and neither awaits the other. Running them in sequence
+    // under one guard coupled them: recoverLostSessions awaits createWhatsAppClient,
+    // which awaits client.initialize() — unbounded, minutes on a slow session — and
+    // while that sat there the health check never ran again, so the very clients it
+    // exists to clean up were left alone indefinitely.
+    if (!healthCheckRunning) {
+      healthCheckRunning = true;
+      checkClientHealth()
+        .then(() => { healthPasses += 1; })
+        .catch((err) => console.error('Health check error:', err.message))
+        .finally(() => { healthCheckRunning = false; });
+    }
+
+    if (!recoveryRunning) {
+      recoveryRunning = true;
+      recoverLostSessions()
+        .catch((err) => console.error('Recovery loop error:', err.message))
+        .finally(() => { recoveryRunning = false; });
     }
   }, HEALTH_CHECK_INTERVAL);
   console.log(`Session health check started (every ${HEALTH_CHECK_INTERVAL / 1000}s)`);
@@ -1008,6 +1016,7 @@ async function destroyAllClients() {
 
 module.exports = {
   getLastMessageAt,
+  getHealthPasses: () => healthPasses,
   clients,
   connecting,
   getGroups,

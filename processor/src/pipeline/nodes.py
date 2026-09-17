@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -332,7 +333,9 @@ def format_node(state: MessageState) -> MessageState:
         parts.append("")
         parts.append(esc(MEDIA_FAILED_NOTE.format(kind=kind)))
 
-    formatted = "\n".join(parts).strip()
+    # Sections are separated by a single blank line. Joining blindly left doubled gaps
+    # whenever a section was empty (e.g. media that failed to download, which has no text).
+    formatted = re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()
     return {**state, "formatted_text": formatted}
 
 

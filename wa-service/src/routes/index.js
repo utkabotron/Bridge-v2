@@ -1,7 +1,7 @@
 const express = require('express');
 const path = require('path');
 const QRCode = require('qrcode');
-const { clients, createWhatsAppClient, getGroups, getLastMessageAt } = require('../whatsapp-client');
+const { clients, createWhatsAppClient, getGroups, getLastMessageAt, getHealthPasses } = require('../whatsapp-client');
 const config = require('../config');
 const { redis } = require('../redis-publisher');
 const { getChatPairs, getWaConnected, setChatPairStatus, deleteChatPair, userExists } = require('../db');
@@ -35,6 +35,10 @@ router.get('/health', (req, res) => {
       userId,
       isReady: !!data.isReady,
       lastMessageAt: data.lastMessageAt || null,
+      // How long this client has been initialising, so a session that never reaches
+      // "ready" is distinguishable from one that is merely slow to sync.
+      initAgeSec: data.initStartedAt ? Math.round((Date.now() - data.initStartedAt) / 1000) : null,
+      hasQR: !!data.qr,
     });
   }
   res.json({
@@ -45,6 +49,8 @@ router.get('/health', (req, res) => {
     // When any client last received a message. The monitoring flow uses this as a
     // dead-man switch: connected clients that stop delivering look healthy otherwise.
     lastMessageAt: getLastMessageAt(),
+    // Proves the watchdog is actually ticking; a frozen counter is itself a symptom.
+    healthPasses: getHealthPasses(),
     redis: redis.status === 'ready' ? 'connected' : 'disconnected',
   });
 });
