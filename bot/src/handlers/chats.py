@@ -7,7 +7,14 @@ import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from ..db import get_chat_pairs, set_chat_pair_status_owned, add_chat_pair, is_whitelisted
+from ..db import (
+    get_chat_pairs,
+    get_pair_owned,
+    is_whitelisted,
+    set_chat_pair_status_owned,
+    set_pair_language_owned,
+    toggle_pair_summary_owned,
+)
 from ..onboarding.wizard import finish_onboarding
 from ..templates.messages import render
 
@@ -37,9 +44,12 @@ async def cmd_chats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         action = "pause" if p["status"] == "active" else "resume"
         buttons.append([
             InlineKeyboardButton(
-                f"{'⏸' if action == 'pause' else '▶️'} {p['wa_chat_name'][:30]}",
+                f"{'⏸' if action == 'pause' else '▶️'} {p['wa_chat_name'][:24]}",
                 callback_data=f"chat:{action}:{p['id']}",
-            )
+            ),
+            # Per-bridge settings: language and daily summary. Until now both were
+            # reachable only by editing the database by hand.
+            InlineKeyboardButton("⚙️", callback_data=f"chat:settings:{p['id']}"),
         ])
 
     await update.message.reply_text(
@@ -139,13 +149,75 @@ async def cb_link_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Callback: pause / resume chat ─────────────────────────
 
+# Offered per bridge; picking one clears nothing else. The account-wide language stays
+# the fallback for bridges that never set their own.
+_LANGUAGES = [
+    ("Russian", "Русский"),
+    ("Hebrew", "עברית"),
+    ("English", "English"),
+    ("Ukrainian", "Українська"),
+    ("Spanish", "Español"),
+]
+
+
+async def _render_settings(query, tg_id: int, pair_id: int) -> None:
+    """Show one bridge's settings: translation language and the daily summary switch."""
+    pair = await get_pair_owned(pair_id, tg_id)
+    if not pair:
+        await query.answer(render("not_authorized"), show_alert=True)
+        return
+
+    summary_on = pair["summary_enabled"]
+    rows = [[InlineKeyboardButton(
+        f"{'🔔' if summary_on else '🔕'} Сводка дня: {'вкл' if summary_on else 'выкл'}",
+        callback_data=f"chat:summary:{pair_id}",
+    )]]
+    for code, label in _LANGUAGES:
+        mark = "✅ " if pair["effective_language"] == code else ""
+        rows.append([InlineKeyboardButton(f"{mark}{label}", callback_data=f"chat:lang:{pair_id}:{code}")])
+    rows.append([InlineKeyboardButton("⬅️ Закрыть", callback_data=f"chat:close:{pair_id}")])
+
+    inherited = "" if pair.get("target_language") else " — по умолчанию аккаунта"
+    text = (
+        f"*{pair['wa_chat_name']}* → {pair['tg_chat_title']}\n\n"
+        f"Язык перевода: *{pair['effective_language']}*{inherited}"
+    )
+    await query.edit_message_text(text, parse_mode="Markdown",
+                                  reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def cb_chat_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     tg_id = query.from_user.id
-    _, action, pair_id_str = query.data.split(":", 2)
-    pair_id = int(pair_id_str)
+    parts = query.data.split(":")
+    action = parts[1]
+    pair_id = int(parts[2])
+
+    if action == "settings":
+        await _render_settings(query, tg_id, pair_id)
+        return
+
+    if action == "lang":
+        language = parts[3]
+        if not await set_pair_language_owned(pair_id, tg_id, language):
+            await query.answer(render("not_authorized"), show_alert=True)
+            return
+        await _render_settings(query, tg_id, pair_id)
+        return
+
+    if action == "summary":
+        new_state = await toggle_pair_summary_owned(pair_id, tg_id)
+        if new_state is None:
+            await query.answer(render("not_authorized"), show_alert=True)
+            return
+        await _render_settings(query, tg_id, pair_id)
+        return
+
+    if action == "close":
+        await query.edit_message_text(render("chat_settings_closed"), parse_mode="Markdown")
+        return
 
     new_status = "paused" if action == "pause" else "active"
     # Ownership-scoped: a forged chat:pause:<id> for someone else's pair updates nothing.

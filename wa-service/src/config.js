@@ -65,6 +65,16 @@ module.exports = {
   // Media
   MAX_FILE_SIZE: parseInt(process.env.MAX_FILE_SIZE) || 50 * 1024 * 1024,
   MAX_CONCURRENT_MEDIA: parseInt(process.env.MAX_CONCURRENT_MEDIA) || 2,
+  // downloadMedia fails transiently while WA's Store is degrading; a single attempt was
+  // dropping ~43 media a day silently.
+  MEDIA_DOWNLOAD_ATTEMPTS: parseInt(process.env.MEDIA_DOWNLOAD_ATTEMPTS) || 2,
+  MEDIA_RETRY_DELAY: parseInt(process.env.MEDIA_RETRY_DELAY) || 1500,
+
+  // Bridge the user's own outgoing WhatsApp messages too, so the Telegram copy reads as a
+  // conversation rather than one side of it.
+  BRIDGE_OWN_MESSAGES: (process.env.BRIDGE_OWN_MESSAGES || 'true') === 'true',
+  // Post a note when a message is deleted for everyone in WhatsApp.
+  REVOKE_NOTICES: (process.env.REVOKE_NOTICES || 'true') === 'true',
 
   // S3/MinIO
   S3_BUCKET: process.env.S3_BUCKET || 'bridge-media',

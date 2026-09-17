@@ -6,7 +6,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
-const { publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
+const { publishMessage, publishQrScanned, publishRevoke, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
 const { setWaConnected, setWaDisconnected } = require('./db');
 
@@ -51,6 +51,10 @@ const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
 const INIT_STUCK_TIMEOUT = config.INIT_STUCK_TIMEOUT;
 const DESTROY_TIMEOUT = config.DESTROY_TIMEOUT;
+const MEDIA_DOWNLOAD_ATTEMPTS = config.MEDIA_DOWNLOAD_ATTEMPTS;
+const MEDIA_RETRY_DELAY = config.MEDIA_RETRY_DELAY;
+const BRIDGE_OWN_MESSAGES = config.BRIDGE_OWN_MESSAGES;
+const REVOKE_NOTICES = config.REVOKE_NOTICES;
 
 // Persistent recovery: capped backoff that NEVER gives up (unlike RECONNECT_DELAYS,
 // which exhausts after 3 tries). A transient DNS/network glitch at startup or
@@ -239,13 +243,22 @@ async function getGroupsLite(client) {
       throw new Error(`chat collection unavailable (${diag})`);
     }
 
+    // Groups and 1:1 chats both. The UI only ever offered @g.us, so a private chat could
+    // not be bridged at all through /add or the Mini App — even though the processor has
+    // always supported it.
     return Chat.getModelsArray()
-      .filter((c) => c.id?._serialized?.endsWith('@g.us'))
+      .filter((c) => {
+        const id = c.id?._serialized || '';
+        return id.endsWith('@g.us') || id.endsWith('@c.us');
+      })
       .map((c) => ({
         id: c.id._serialized,
         name: c.name || c.formattedTitle || c.id.user,
+        isGroup: (c.id._serialized || '').endsWith('@g.us'),
         participants: c.groupMetadata?.participants?._models?.length || 0,
-      }));
+        lastActivity: c.t || 0,
+      }))
+      .sort((a, b) => b.lastActivity - a.lastActivity);
   });
 }
 
@@ -262,11 +275,19 @@ async function getGroups(client, timeoutMs) {
 
   try {
     const chats = await withTimeout(client.getChats(), 'getChats');
-    return chats.filter((c) => c.isGroup).map((c) => ({
-      id: c.id._serialized,
-      name: c.name,
-      participants: c.participants?.length || 0,
-    }));
+    return chats
+      .filter((c) => {
+        const id = c.id?._serialized || '';
+        return id.endsWith('@g.us') || id.endsWith('@c.us');
+      })
+      .map((c) => ({
+        id: c.id._serialized,
+        name: c.name || c.id.user,
+        isGroup: !!c.isGroup,
+        participants: c.participants?.length || 0,
+        lastActivity: c.timestamp || 0,
+      }))
+      .sort((a, b) => b.lastActivity - a.lastActivity);
   } catch (err) {
     console.warn(`getChats failed (${err.message}) — falling back to lightweight group read`);
     return withTimeout(getGroupsLite(client), 'getGroupsLite');
@@ -630,6 +651,30 @@ async function buildClient(userId) {
     }
   });
 
+  // Own outgoing messages. WhatsApp never fires 'message' for them, so the Telegram side
+  // showed only the other half of every conversation — a reader could not tell whether a
+  // question had already been answered.
+  client.on('message_create', async (message) => {
+    if (!message.fromMe || !BRIDGE_OWN_MESSAGES) return;
+    lastMessageAt = Date.now();
+    clientData.lastMessageAt = lastMessageAt;
+    try {
+      await handleIncomingMessage(userId, message, false);
+    } catch (err) {
+      console.error(`Own-message handler error for user ${userId}:`, err.message);
+    }
+  });
+
+  // Deletions: leaving a revoked message in Telegram misrepresents the conversation.
+  client.on('message_revoke_everyone', async (_after, before) => {
+    if (!REVOKE_NOTICES || !before) return;
+    try {
+      await publishRevoke(userId, before);
+    } catch (err) {
+      console.error(`Revoke handler error for user ${userId}:`, err.message);
+    }
+  });
+
   client.on('message_edit', async (message) => {
     lastMessageAt = Date.now();
     clientData.lastMessageAt = lastMessageAt;
@@ -668,6 +713,28 @@ async function buildClient(userId) {
   }
 
   return clientData;
+}
+
+
+/**
+ * Pull name and phone numbers out of one or more vCards.
+ * WhatsApp puts the raw vCard text in `body`, which used to be forwarded verbatim and
+ * translated line by line — the reader got BEGIN:VCARD and a wall of field names.
+ */
+function parseVCards(body, vcardList) {
+  const cards = [];
+  const raw = Array.isArray(vcardList) && vcardList.length
+    ? vcardList.map((v) => v?.vcard || v).filter((v) => typeof v === 'string')
+    : (typeof body === 'string' && body.includes('BEGIN:VCARD') ? [body] : []);
+
+  for (const card of raw) {
+    const name = /^FN[^:]*:(.+)$/m.exec(card)?.[1]?.trim() || null;
+    const phones = [...card.matchAll(/^TEL[^:]*:(.+)$/gm)]
+      .map((m) => m[1].trim())
+      .filter(Boolean);
+    if (name || phones.length) cards.push({ name, phones });
+  }
+  return cards;
 }
 
 // ── Incoming message handler ──────────────────────────────
@@ -729,9 +796,36 @@ async function handleIncomingMessage(userId, message, isEdited) {
     senderName = d.notifyName || d.pushname || message.author?.split('@')[0] || chatName || 'Unknown';
   }
 
-  // Handle special types
+  // Handle special types that carry their content outside `body`.
+  let location = null;
+  let contacts = null;
+
   if (message.type === 'poll_creation') {
-    message.body = '[Poll — open WhatsApp to view]';
+    // The question and options are already on the message; replacing the body with
+    // "[Poll — open WhatsApp to view]" threw away the only part worth reading.
+    const name = message.pollName || message._data?.pollName || message.body || '';
+    const options = (message.pollOptions || message._data?.pollOptions || [])
+      .map((o) => (typeof o === 'string' ? o : o?.name))
+      .filter(Boolean);
+    message.body = [name, ...options.map((o) => `• ${o}`)].filter(Boolean).join('\n');
+  } else if (message.type === 'location') {
+    // Locations have no body worth translating; WhatsApp puts a base64 thumbnail there,
+    // which used to be sent to the LLM and billed as if it were text.
+    const loc = message.location || message._data?.lat ? message.location : null;
+    location = {
+      latitude: parseFloat(loc?.latitude ?? message._data?.lat),
+      longitude: parseFloat(loc?.longitude ?? message._data?.lng),
+      name: loc?.name || loc?.description || message._data?.loc || null,
+    };
+    if (!Number.isFinite(location.latitude) || !Number.isFinite(location.longitude)) {
+      location = null;
+    } else {
+      message.body = '';
+    }
+  } else if (message.type === 'vcard' || message.type === 'multi_vcard') {
+    // A raw vCard used to be forwarded as message text and translated line by line.
+    contacts = parseVCards(message.body, message._data?.vcardList);
+    if (contacts.length) message.body = '';
   }
 
   // Media upload to S3
@@ -739,19 +833,47 @@ async function handleIncomingMessage(userId, message, isEdited) {
   let mediaFailed = false;
 
   if (message.hasMedia && message.type !== 'poll_creation') {
-    try {
-      mediaInfo = await handleMedia(message, userId);
-      if (!mediaInfo && message.type === 'sticker') {
-        message.body = '[Sticker]'; // fallback when sticker media download fails
+    // One retry: downloadMedia fails transiently when WA's Store is mid-degradation, and
+    // ~43 media a day were being dropped on a first failure.
+    for (let attempt = 1; attempt <= MEDIA_DOWNLOAD_ATTEMPTS; attempt++) {
+      try {
+        mediaInfo = await handleMedia(message, userId);
+        mediaFailed = false;
+        break;
+      } catch (err) {
+        mediaFailed = true;
+        console.error(`Media error for user ${userId} (attempt ${attempt}/${MEDIA_DOWNLOAD_ATTEMPTS}):`, err.message);
+        if (attempt < MEDIA_DOWNLOAD_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, MEDIA_RETRY_DELAY));
+        }
       }
-    } catch (err) {
-      console.error(`Media error for user ${userId}:`, err.message);
-      mediaFailed = true;
+    }
+    if (!mediaInfo && message.type === 'sticker') {
+      message.body = '[Sticker]'; // fallback when sticker media download fails
     }
   }
 
   if (mediaFailed) {
-    console.warn(`Media failed for ${safeId} — sending without media`);
+    // The recipient used to get a bare sender name with no hint that a photo or voice
+    // note had been sent at all. The processor turns this flag into a visible note.
+    console.warn(`Media failed for ${safeId} (${message.type}) — forwarding without it`);
+  }
+
+  // Replies: carry enough to rebuild the thread on the Telegram side. Without this an
+  // answer arrived as a standalone message and the reader could not tell what it was
+  // responding to.
+  let quoted = null;
+  if (message.hasQuotedMsg) {
+    try {
+      const q = await withTimeout(message.getQuotedMessage(), 'getQuotedMessage', config.GET_CHAT_TIMEOUT);
+      quoted = {
+        wa_message_id: q?.id?._serialized || null,
+        body: (q?.body || '').slice(0, 120),
+        sender: q?._data?.notifyName || null,
+      };
+    } catch (err) {
+      console.warn(`getQuotedMessage failed for ${safeId}: ${err.message}`);
+    }
   }
 
   const payload = {
@@ -768,6 +890,10 @@ async function handleIncomingMessage(userId, message, isEdited) {
     media_s3_url: mediaInfo?.s3Url || null,
     media_mime: mediaInfo?.mimeType || null,
     media_filename: mediaInfo?.filename || null,
+    media_failed: mediaFailed && !mediaInfo,
+    quoted,
+    location,
+    contacts,
   };
 
   // publishMessage assigns payload.wa_message_id (real or content-fallback) and enqueues

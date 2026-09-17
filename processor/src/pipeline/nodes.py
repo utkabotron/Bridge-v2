@@ -5,6 +5,8 @@ LangSmith traces every node automatically via LANGCHAIN_TRACING_V2=true.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -15,7 +17,11 @@ from langdetect import detect, LangDetectException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-from ..config import LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE
+from ..config import (
+    LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE,
+    VOICE_AUTO_TRANSCRIBE, VOICE_TRANSCRIPT_TITLE,
+    MEDIA_FAILED_NOTE, EDITED_MARK, OWN_MESSAGE_PREFIX,
+)
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
 from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
@@ -27,7 +33,7 @@ logger = logging.getLogger(__name__)
 _llm: Any = None
 
 # Media types eligible for the Analyze button (no video in v1)
-_ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "document"}
+_ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "ptt", "document"}
 
 
 def get_llm() -> ChatOpenAI:
@@ -186,6 +192,79 @@ async def translate_node(state: MessageState) -> MessageState:
     return {**state, "translated_text": translated, "translation_ms": translation_ms, "cache_hit": False}
 
 
+
+# ── Voice transcription ───────────────────────────────────
+
+_VOICE_TYPES = {"ptt", "voice"}
+
+# Used when media could not be fetched, so the note names what was lost.
+_MEDIA_KIND_NAMES = {
+    "image": "фото", "photo": "фото", "sticker": "стикер", "video": "видео",
+    "audio": "аудио", "ptt": "голосовое сообщение", "voice": "голосовое сообщение",
+    "document": "документ",
+}
+
+# Detached tasks are kept referenced; without this the event loop may garbage-collect a
+# running task mid-flight.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _transcribe_voice_note(
+    state: MessageState, tg_chat_id: int, reply_to: int | None, event_id: int | None,
+) -> None:
+    """Transcribe a delivered voice note and post the text as a reply to it."""
+    from ..db import insert_media_analysis
+    from ..feature_flags import is_enabled
+    from ..media_analyzer import transcribe_audio
+    from ..pipeline.cache import get_cached_media, set_cached_media
+    from ..telegram_sender import download_media, send_message
+
+    if not await is_enabled("voice_transcribe_enabled"):
+        return
+
+    url = state.get("media_s3_url")
+    if not url:
+        return
+
+    lang = state.get("target_language") or "Russian"
+    t0 = time.monotonic()
+    try:
+        downloaded = await download_media(url, state.get("media_filename"), state.get("media_mime"))
+        if not downloaded:
+            logger.warning("Voice transcript: could not fetch %s", state.get("wa_message_id"))
+            return
+        content, filename, _ = downloaded
+
+        # Same cache the Analyze button uses, keyed by file content — a forwarded or
+        # repeated recording is transcribed once.
+        digest = hashlib.sha256(content).hexdigest()
+        text = await get_cached_media(digest, lang)
+        if not text:
+            text = await transcribe_audio(content, filename or "voice.ogg", lang)
+            await set_cached_media(digest, lang, text)
+
+        elapsed = int((time.monotonic() - t0) * 1000)
+        await send_message(
+            chat_id=tg_chat_id,
+            text=f"{bold('🎤 ' + esc(VOICE_TRANSCRIPT_TITLE))}\n\n{esc(text)}",
+            reply_to_message_id=reply_to,
+        )
+
+        # Record it so tapping Analyze on the same message returns this result instead of
+        # paying for a second transcription.
+        if event_id:
+            await insert_media_analysis(event_id, "audio", text, "completed", elapsed, 0)
+    except Exception as exc:
+        # Best-effort: the voice note itself is already delivered.
+        logger.warning("Voice transcript failed for %s: %s", state.get("wa_message_id"), exc)
+
+
 # ── Node: format ──────────────────────────────────────────
 
 def format_node(state: MessageState) -> MessageState:
@@ -202,20 +281,58 @@ def format_node(state: MessageState) -> MessageState:
     sender = state.get("sender_name", "")
 
     parts = []
+    header = []
+    if state.get("from_me"):
+        # Own outgoing messages are bridged too; mark them so the Telegram copy reads as
+        # a conversation instead of an unattributed stream.
+        header.append(esc(OWN_MESSAGE_PREFIX))
     if sender:
-        parts.append(bold(sender))
+        header.append(bold(sender))
+    if state.get("is_edited"):
+        # This used to arrive as a second, near-identical message with no explanation.
+        header.append(esc(EDITED_MARK))
+    if header:
+        parts.append(" ".join(header))
         parts.append("")
-    parts.append(esc(original))
-    # Add translated only if it exists and differs from original
-    if translated and translated.strip() != original.strip():
+
+    # Quoted message: Telegram's own reply threading does the work when we know the
+    # original's message_id; this preview is the fallback when we don't.
+    quoted = state.get("quoted") or {}
+    if quoted.get("body") and not state.get("reply_to_message_id"):
+        preview = quoted["body"].strip().replace("\n", " ")[:120]
+        who = quoted.get("sender")
+        prefix = f"{who}: " if who else ""
+        parts.append(f"<blockquote>↩︎ {esc(prefix + preview)}</blockquote>")
         parts.append("")
-        parts.append(esc(translated))
+
+    contacts = state.get("contacts") or []
+    if contacts:
+        # A raw vCard used to be forwarded verbatim and translated field by field.
+        for c in contacts:
+            name = esc(c.get("name") or "—")
+            phones = ", ".join(esc(p) for p in (c.get("phones") or []))
+            parts.append(f"👤 {bold(name)}" + (f"\n{phones}" if phones else ""))
+        parts.append("")
+
+    if original:
+        parts.append(esc(original))
+        # Add translated only if it exists and differs from original
+        if translated and translated.strip() != original.strip():
+            parts.append("")
+            parts.append(esc(translated))
 
     if state.get("translation_failed"):
         parts.append("")
         parts.append(esc(TRANSLATION_UNAVAILABLE_NOTE))
 
-    formatted = "\n".join(parts)
+    if state.get("media_failed"):
+        # The recipient previously got a bare sender name with no sign that a photo or
+        # voice note had been sent at all.
+        kind = _MEDIA_KIND_NAMES.get(state.get("message_type", ""), "файл")
+        parts.append("")
+        parts.append(esc(MEDIA_FAILED_NOTE.format(kind=kind)))
+
+    formatted = "\n".join(parts).strip()
     return {**state, "formatted_text": formatted}
 
 
@@ -238,6 +355,13 @@ async def deliver_node(state: MessageState) -> MessageState:
         await _persist_event(result)  # record the failure — otherwise it vanishes from the DB
         return result
 
+    # Resolve the Telegram message this one answers, so replies keep their thread.
+    state = {**state, "reply_to_message_id": await _resolve_reply_target(state)}
+
+    # A location has no text worth translating; send it as a real map pin.
+    if state.get("location"):
+        return await _deliver_location(state, tg_chat_id)
+
     has_media = bool(state.get("media_s3_url"))
     msg_type = state.get("message_type", "text")
     is_analyzable = has_media and msg_type in _ANALYZABLE_TYPES
@@ -246,6 +370,56 @@ async def deliver_node(state: MessageState) -> MessageState:
         return await _deliver_media_with_button(state, tg_chat_id)
 
     return await _deliver_simple(state, tg_chat_id)
+
+
+async def _resolve_reply_target(state: MessageState) -> int | None:
+    """Telegram message_id of the message this one quotes, if we delivered it."""
+    from ..db import find_tg_message_id
+
+    chat_pair_id = state.get("chat_pair_id")
+    if not chat_pair_id:
+        return None
+
+    # An edit should attach to the message it revises; a reply, to the message it quotes.
+    target_wa_id = None
+    if state.get("is_edited"):
+        # Edits are stored under "<original>:edit:<hash>" — strip back to the original.
+        target_wa_id = (state.get("wa_message_id") or "").split(":edit:")[0] or None
+    elif (state.get("quoted") or {}).get("wa_message_id"):
+        target_wa_id = state["quoted"]["wa_message_id"]
+
+    if not target_wa_id:
+        return None
+    return await find_tg_message_id(target_wa_id, chat_pair_id)
+
+
+async def _deliver_location(state: MessageState, tg_chat_id: int) -> MessageState:
+    """Send a WhatsApp location as a Telegram map pin.
+
+    Locations used to fall through the text path: `body` holds a base64 thumbnail, so the
+    recipient saw either nothing or a wall of encoded data — which was also billed as a
+    translation.
+    """
+    from ..telegram_sender import send_location
+
+    loc = state["location"]
+    ok, error, tg_msg_id = await send_location(
+        chat_id=tg_chat_id,
+        latitude=loc["latitude"],
+        longitude=loc["longitude"],
+        title=loc.get("name"),
+        sender=state.get("sender_name"),
+        reply_to_message_id=state.get("reply_to_message_id"),
+    )
+
+    if not ok:
+        await _pause_dead_chat(state, error)
+
+    result = {**state, "tg_chat_id": tg_chat_id,
+              "delivery_status": "delivered" if ok else "failed",
+              "error": error, "tg_message_id": tg_msg_id}
+    await _persist_event(result)
+    return result
 
 
 async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
@@ -258,6 +432,7 @@ async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
         message_type=state.get("message_type", "text"),
         media_filename=state.get("media_filename"),
         media_mime=state.get("media_mime"),
+        reply_to_message_id=state.get("reply_to_message_id"),
     )
 
     # Auto-migrate supergroup: update chat_pairs and retry
@@ -315,6 +490,7 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
         media_filename=state.get("media_filename"),
         media_mime=state.get("media_mime"),
         reply_markup=reply_markup,
+        reply_to_message_id=state.get("reply_to_message_id"),
     )
 
     # Auto-migrate supergroup
@@ -338,6 +514,13 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
     # Phase 3: UPDATE event with delivery status + tg_message_id
     new_status = "delivered" if ok else "failed"
     await update_event_after_send(event_id, new_status, error, tg_msg_id)
+
+    # A voice note is unreadable to someone who does not speak the language, which is the
+    # whole point of this bridge — so transcribe and translate it without making the
+    # reader tap anything. Runs detached: Whisper takes seconds and the consumer handles
+    # one message at a time, so awaiting it here would stall everyone else's messages.
+    if ok and VOICE_AUTO_TRANSCRIBE and state.get("message_type") in _VOICE_TYPES:
+        _spawn(_transcribe_voice_note(state, tg_chat_id, tg_msg_id, event_id))
 
     return {**state, "tg_chat_id": tg_chat_id, "delivery_status": new_status,
             "error": error, "tg_message_id": tg_msg_id}

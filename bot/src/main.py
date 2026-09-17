@@ -74,7 +74,7 @@ def main() -> None:
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CallbackQueryHandler(cb_link_chat, pattern=r"^link:"))
-    app.add_handler(CallbackQueryHandler(cb_chat_action, pattern=r"^chat:(pause|resume):"))
+    app.add_handler(CallbackQueryHandler(cb_chat_action, pattern=r"^chat:(pause|resume|settings|lang|summary|close):"))
 
     # ── Group tracking (my_chat_member) ───────────────────
     app.add_handler(ChatMemberHandler(handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))

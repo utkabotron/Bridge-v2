@@ -177,6 +177,71 @@ async def set_chat_pair_status(pair_id: int, status: str) -> None:
     )
 
 
+async def set_pair_language_owned(pair_id: int, tg_user_id: int, language: str | None) -> bool:
+    """Set this bridge's target language, or clear it to follow the account setting.
+
+    The column did not exist before: one person bridging a Hebrew school group and a
+    Spanish work chat had to choose a single language for both.
+    """
+    pool = await get_pool()
+    tag = await pool.execute(
+        """
+        update public.chat_pairs
+        set target_language = $1
+        where id = $2
+          and user_id = (select id from public.users where tg_user_id = $3)
+        """,
+        language, pair_id, tg_user_id,
+    )
+    return bool(tag) and tag.rsplit(" ", 1)[-1] != "0"
+
+
+async def get_pair_owned(pair_id: int, tg_user_id: int) -> Optional[dict]:
+    """A single pair, only if the caller owns it."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        select cp.*, coalesce(cp.target_language, u.target_language) as effective_language,
+               coalesce(css.enabled, true) as summary_enabled
+        from public.chat_pairs cp
+        join public.users u on u.id = cp.user_id
+        left join public.chat_summary_schedule css on css.chat_pair_id = cp.id
+        where cp.id = $1 and u.tg_user_id = $2
+        """,
+        pair_id, tg_user_id,
+    )
+    return dict(row) if row else None
+
+
+async def toggle_pair_summary_owned(pair_id: int, tg_user_id: int) -> Optional[bool]:
+    """Flip daily summaries for a pair. Returns the new state, or None if not owned.
+
+    Creates the schedule row when absent so the preference sticks even before the
+    scheduling flow has computed an hour for this chat.
+    """
+    pool = await get_pool()
+    owned = await pool.fetchval(
+        """
+        select cp.id from public.chat_pairs cp
+        join public.users u on u.id = cp.user_id
+        where cp.id = $1 and u.tg_user_id = $2
+        """,
+        pair_id, tg_user_id,
+    )
+    if not owned:
+        return None
+
+    return await pool.fetchval(
+        """
+        insert into public.chat_summary_schedule (chat_pair_id, enabled)
+        values ($1, false)
+        on conflict (chat_pair_id) do update set enabled = not public.chat_summary_schedule.enabled
+        returning enabled
+        """,
+        pair_id,
+    )
+
+
 async def set_chat_pair_status_owned(pair_id: int, tg_user_id: int, status: str) -> bool:
     """Update a pair's status only if it belongs to tg_user_id. Prevents a forged
     `chat:pause:<id>` callback from pausing/resuming another user's bridge.

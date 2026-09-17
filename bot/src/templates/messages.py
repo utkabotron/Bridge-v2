@@ -117,6 +117,7 @@ TEMPLATES = {
 
     # ── /pause / /resume ──────────────────────────────────
     "chat_paused": "⏸ Chat paused.",
+    "chat_settings_closed": "Настройки закрыты. Откройте /chats, чтобы вернуться.",
     "chat_resumed": "▶️ Chat resumed.",
 
     # ── Admin ─────────────────────────────────────────────

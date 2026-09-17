@@ -15,13 +15,21 @@ class MessageState(TypedDict):
     user_id: int
     sender_name: str
     original_text: str
-    message_type: str          # text | image | video | audio | document
+    message_type: str          # text | image | video | audio | ptt | document | location | vcard
     media_s3_url: Optional[str]
     media_mime: Optional[str]
     media_filename: Optional[str]
     timestamp: int
     from_me: bool
     is_edited: bool
+    # Media that WhatsApp would not hand over; the reader is told what was lost.
+    media_failed: bool
+    # {wa_message_id, body, sender} of the quoted message, when this is a reply.
+    quoted: Optional[dict]
+    # {latitude, longitude, name} — delivered as a Telegram map pin, never translated.
+    location: Optional[dict]
+    # [{name, phones}] parsed from a shared vCard.
+    contacts: Optional[list]
 
     # Resolved by validate node
     chat_pair_id: Optional[int]
@@ -32,6 +40,8 @@ class MessageState(TypedDict):
     translated_text: Optional[str]
     translation_ms: Optional[int]
     cache_hit: bool
+    # True when the LLM was unreachable and the original was delivered untranslated.
+    translation_failed: bool
 
     # Set by format node
     formatted_text: Optional[str]
@@ -40,6 +50,8 @@ class MessageState(TypedDict):
     fallback_to_admins: bool
 
     # Set by deliver node
+    # Telegram message this one replies to (a quote, or the message an edit revises).
+    reply_to_message_id: Optional[int]
     tg_message_id: Optional[int]
     delivery_status: str       # pending | delivered | failed | skipped
     error: Optional[str]

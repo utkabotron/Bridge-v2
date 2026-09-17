@@ -604,15 +604,32 @@ describe('getGroups', () => {
   test('uses getChats when it works, keeping participant counts', async () => {
     const client = {
       getChats: jest.fn().mockResolvedValue([
-        { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [1, 2, 3] },
-        { isGroup: false, id: { _serialized: 'p1@c.us' }, name: 'Bob' },
+        { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [1, 2, 3], timestamp: 200 },
+        { isGroup: false, id: { _serialized: 'p1@c.us', user: '972500' }, name: 'Bob', timestamp: 300 },
       ]),
       pupPage: { evaluate: jest.fn() },
     };
+
+    // Private chats are listed too: the processor has always supported bridging them,
+    // but the UI filtered to @g.us so they could never be selected. Most recent first.
     await expect(getGroups(client, 5000)).resolves.toEqual([
-      { id: 'g1@g.us', name: 'Team', participants: 3 },
+      { id: 'p1@c.us', name: 'Bob', isGroup: false, participants: 0, lastActivity: 300 },
+      { id: 'g1@g.us', name: 'Team', isGroup: true, participants: 3, lastActivity: 200 },
     ]);
     expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+  });
+
+  test('skips statuses and newsletters, which are not bridgeable', async () => {
+    const client = {
+      getChats: jest.fn().mockResolvedValue([
+        { isGroup: false, id: { _serialized: 'status@broadcast' }, name: 'Status' },
+        { isGroup: false, id: { _serialized: '123@newsletter' }, name: 'Channel' },
+        { isGroup: true, id: { _serialized: 'g1@g.us' }, name: 'Team', participants: [], timestamp: 1 },
+      ]),
+      pupPage: { evaluate: jest.fn() },
+    };
+    const result = await getGroups(client, 5000);
+    expect(result.map((c) => c.id)).toEqual(['g1@g.us']);
   });
 
   test("falls back to the lightweight read when getChats throws 'r'", async () => {

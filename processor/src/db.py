@@ -55,7 +55,8 @@ async def fetch_active_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
     if wa_chat_id.endswith("@g.us"):
         rows = await pool.fetch(
             """
-            select cp.id, cp.tg_chat_id, u.target_language
+            select cp.id, cp.tg_chat_id,
+                   coalesce(cp.target_language, u.target_language) as target_language
             from public.chat_pairs cp
             join public.users u on u.id = cp.user_id
             where cp.wa_chat_id = $1
@@ -67,7 +68,9 @@ async def fetch_active_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
     else:
         rows = await pool.fetch(
             """
-            select cp.id, cp.tg_chat_id, u.target_language
+            select cp.id, cp.tg_chat_id,
+                   -- A per-pair language overrides the account-wide one; NULL inherits it.
+                   coalesce(cp.target_language, u.target_language) as target_language
             from public.chat_pairs cp
             join public.users u on u.id = cp.user_id
             where cp.user_id = (select id from public.users where tg_user_id = $1)
@@ -164,6 +167,27 @@ async def fetch_chat_profile(chat_pair_id: int) -> Optional[dict]:
     return data
 
 
+async def find_tg_message_id(wa_message_id: str, chat_pair_id: int) -> Optional[int]:
+    """Telegram message_id of an already-delivered WhatsApp message in this pair.
+
+    Lets a reply or an edit attach to the message it refers to, instead of arriving as a
+    standalone message the reader has to match up by hand.
+    """
+    pool = await get_pool()
+    try:
+        return await pool.fetchval(
+            """
+            select tg_message_id from public.message_events
+            where wa_message_id = $1 and chat_pair_id = $2
+              and delivery_status = 'delivered' and tg_message_id is not null
+            """,
+            wa_message_id, chat_pair_id,
+        )
+    except Exception as exc:
+        logger.warning("Reply target lookup failed for %s: %s", wa_message_id, exc)
+        return None
+
+
 async def insert_message_event(state: dict[str, Any], return_id: bool = False) -> Optional[int]:
     """Persist a processed message_event row.
 
@@ -252,7 +276,7 @@ async def get_event_for_analysis(event_id: int) -> Optional[dict]:
         select me.id, me.media_s3_key, me.message_type,
                me.tg_message_id,
                cp.tg_chat_id,
-               u.target_language
+               coalesce(cp.target_language, u.target_language) as target_language
         from public.message_events me
         left join public.chat_pairs cp on cp.id = me.chat_pair_id
         left join public.users u on u.id = cp.user_id

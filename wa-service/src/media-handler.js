@@ -42,14 +42,18 @@ function releaseMediaSlot() {
 }
 
 const ALLOWED_MIME_TYPES = new Set([
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-  'video/mp4', 'video/quicktime', 'video/mpeg',
-  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/mp4',
-  'application/pdf',
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif',
+  'video/mp4', 'video/quicktime', 'video/mpeg', 'video/3gpp', 'video/webm',
+  // Voice notes arrive as audio/ogg; iPhone voice memos and forwarded audio show up as
+  // m4a/aac/opus, which were rejected outright and silently lost.
+  'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/mp4', 'audio/x-m4a', 'audio/aac',
+  'audio/opus', 'audio/webm', 'audio/amr', 'audio/3gpp',
+  'application/pdf', 'application/zip', 'application/rtf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  'text/plain', 'text/csv',
+  'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+  'text/plain', 'text/csv', 'text/html',
 ]);
 
 /**

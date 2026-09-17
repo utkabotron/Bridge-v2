@@ -72,6 +72,19 @@ TRANSLATION_UNAVAILABLE_NOTE = os.getenv(
     "TRANSLATION_UNAVAILABLE_NOTE", "⚠️ Перевод временно недоступен",
 )
 
+# ── Voice notes ─────────────────────────────────────────
+# A voice note is opaque to someone who does not speak the language — transcribe and
+# translate it automatically rather than hiding it behind a button. Runtime toggle lives
+# in the feature_flags table as voice_transcribe_enabled.
+VOICE_AUTO_TRANSCRIBE = os.getenv("VOICE_AUTO_TRANSCRIBE", "true").lower() == "true"
+VOICE_TRANSCRIPT_TITLE = os.getenv("VOICE_TRANSCRIPT_TITLE", "Расшифровка")
+
+# ── Message presentation ────────────────────────────────
+MEDIA_FAILED_NOTE = os.getenv("MEDIA_FAILED_NOTE", "📎 Не удалось получить {kind}")
+EDITED_MARK = os.getenv("EDITED_MARK", "✏️ изменено")
+OWN_MESSAGE_PREFIX = os.getenv("OWN_MESSAGE_PREFIX", "➡️")
+REVOKE_NOTE = os.getenv("REVOKE_NOTE", "🗑 Сообщение удалено в WhatsApp")
+
 # ── Cache TTLs ───────────────────────────────────────────
 TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))

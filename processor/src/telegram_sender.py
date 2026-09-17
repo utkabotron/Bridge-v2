@@ -199,7 +199,12 @@ _MEDIA_TYPE_MAP = {
     "sticker": ("sendPhoto", "photo"),  # WA stickers (webp) → Telegram photo with caption
     "video": ("sendVideo", "video"),
     "audio": ("sendAudio", "audio"),
-    "voice": ("sendAudio", "audio"),
+    # A WhatsApp voice note arrives as type "ptt" — the library never emits "voice".
+    # Missing from this map, it fell through to the text branch, which ignores media_url
+    # entirely: the recipient got a message containing nothing but the sender's name while
+    # the recording sat in S3. sendVoice renders it as a native voice bubble (ogg/opus).
+    "ptt": ("sendVoice", "voice"),
+    "voice": ("sendVoice", "voice"),
     "document": ("sendDocument", "document"),
 }
 
@@ -212,6 +217,7 @@ async def send_message(
     media_filename: Optional[str] = None,
     media_mime: Optional[str] = None,
     reply_markup: Optional[dict] = None,
+    reply_to_message_id: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[int], Optional[int]]:
     """Send a message to Telegram.
 
@@ -226,10 +232,11 @@ async def send_message(
             if media_type:
                 endpoint, field = media_type
                 ok, err, msg_id = await _send_media_multipart(
-                    endpoint, field, chat_id, text, media_url, media_filename, media_mime, reply_markup,
+                    endpoint, field, chat_id, text, media_url, media_filename, media_mime,
+                    reply_markup, reply_to_message_id,
                 )
             else:
-                ok, err, msg_id = await _send_text(chat_id, text)
+                ok, err, msg_id = await _send_text(chat_id, text, reply_to_message_id)
 
             last_err = err
 
@@ -262,25 +269,43 @@ async def send_message(
     return False, last_err, None, None
 
 
-async def _send_text(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:
+def _reply_params(reply_to_message_id: Optional[int]) -> dict:
+    """Quote an earlier message, tolerating one that has since been deleted.
+
+    allow_sending_without_reply keeps delivery working when the quoted message is gone
+    from the Telegram side — the bridge should never drop a message because the thing it
+    was answering disappeared.
+    """
+    if not reply_to_message_id:
+        return {}
+    return {"reply_parameters": {
+        "message_id": reply_to_message_id,
+        "allow_sending_without_reply": True,
+    }}
+
+
+async def _send_text(
+    chat_id: int, text: str, reply_to_message_id: Optional[int] = None,
+) -> Tuple[bool, Optional[str], Optional[int]]:
     """Send text, splitting into <=4096-char chunks. Returns the last chunk's result;
     stops and reports the first failing chunk."""
     if len(text) <= TG_MAX_TEXT:
-        return await _send_text_single(chat_id, text)
+        return await _send_text_single(chat_id, text, reply_to_message_id)
 
     result: Tuple[bool, Optional[str], Optional[int]] = (True, None, None)
-    for chunk in _split_text(text, TG_MAX_TEXT):
-        result = await _send_text_single(chat_id, chunk)
+    for i, chunk in enumerate(_split_text(text, TG_MAX_TEXT)):
+        # Only the first chunk quotes; the rest follow it in the chat anyway.
+        result = await _send_text_single(chat_id, chunk, reply_to_message_id if i == 0 else None)
         if not result[0]:
             return result  # abort on first failure
     return result
 
 
-async def _send_text_single(chat_id: int, text: str) -> Tuple[bool, Optional[str], Optional[int]]:
-    r = await get_client().post(
-        f"{BASE_URL}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-    )
+async def _send_text_single(
+    chat_id: int, text: str, reply_to_message_id: Optional[int] = None,
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", **_reply_params(reply_to_message_id)}
+    r = await get_client().post(f"{BASE_URL}/sendMessage", json=payload)
     if r.status_code == 200:
         return True, None, _parse_message_id(r.text)
     # Fallback: retry without parse_mode on parse errors
@@ -288,7 +313,7 @@ async def _send_text_single(chat_id: int, text: str) -> Tuple[bool, Optional[str
         logger.warning("HTML parse failed for chat %s, retrying without parse_mode", chat_id)
         r2 = await get_client().post(
             f"{BASE_URL}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={k: v for k, v in payload.items() if k != "parse_mode"},
         )
         if r2.status_code == 200:
             return True, None, _parse_message_id(r2.text)
@@ -296,6 +321,41 @@ async def _send_text_single(chat_id: int, text: str) -> Tuple[bool, Optional[str
     if r.status_code == 401 or _is_unauthorized(r.text):
         logger.critical("401 Unauthorized for chat %s — bot removed from chat or token invalid", chat_id)
         return False, "401_UNAUTHORIZED", None
+    return False, r.text, None
+
+
+async def send_location(
+    chat_id: int,
+    latitude: float,
+    longitude: float,
+    title: Optional[str] = None,
+    sender: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+) -> Tuple[bool, Optional[str], Optional[int]]:
+    """Send a map pin, with a caption message naming the sender.
+
+    sendLocation and sendVenue carry no caption, so the sender's name goes in a short
+    message before the pin — otherwise a group would show a pin from nobody.
+    """
+    from .utils.telegram_format import bold, esc
+
+    if sender:
+        label = f"📍 {bold(esc(sender))}" + (f"\n{esc(title)}" if title else "")
+        await _send_text(chat_id, label, reply_to_message_id)
+        reply_to_message_id = None  # the pin follows the label; no need to quote twice
+
+    payload = {
+        "chat_id": chat_id,
+        "latitude": latitude,
+        "longitude": longitude,
+        **_reply_params(reply_to_message_id),
+    }
+    r = await get_client().post(f"{BASE_URL}/sendLocation", json=payload)
+    if r.status_code == 200:
+        return True, None, _parse_message_id(r.text)
+    if r.status_code == 401 or _is_unauthorized(r.text):
+        return False, "401_UNAUTHORIZED", None
+    logger.warning("sendLocation failed for chat %s: %s", chat_id, r.text)
     return False, r.text, None
 
 
@@ -308,12 +368,14 @@ async def _send_media_multipart(
     media_filename: Optional[str] = None,
     media_mime: Optional[str] = None,
     reply_markup: Optional[dict] = None,
+    reply_to_message_id: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[int]]:
     """Send media natively, splitting an over-long caption so the media stays native and
     the caption remainder follows as a separate text message."""
     caption, overflow = _split_caption(caption)
     ok, err, msg_id = await _do_send_media(
-        endpoint, field_name, chat_id, caption, url, media_filename, media_mime, reply_markup,
+        endpoint, field_name, chat_id, caption, url, media_filename, media_mime,
+        reply_markup, reply_to_message_id,
     )
     if ok and overflow:
         # best-effort — don't fail the media delivery if the overflow text errors
@@ -333,6 +395,7 @@ async def _do_send_media(
     media_filename: Optional[str] = None,
     media_mime: Optional[str] = None,
     reply_markup: Optional[dict] = None,
+    reply_to_message_id: Optional[int] = None,
 ) -> Tuple[bool, Optional[str], Optional[int]]:
     """Generic multipart media sender with fallback chain.
 
@@ -343,6 +406,10 @@ async def _do_send_media(
     data_fields = {"chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML"}
     if reply_markup:
         data_fields["reply_markup"] = json.dumps(reply_markup)
+    reply_params = _reply_params(reply_to_message_id)
+    if reply_params:
+        # multipart carries JSON structures as encoded strings
+        data_fields["reply_parameters"] = json.dumps(reply_params["reply_parameters"])
 
     downloaded = await download_media(url, media_filename, media_mime)
     if downloaded:
@@ -379,6 +446,7 @@ async def _do_send_media(
         field_name: public_url,
         "caption": caption,
         "parse_mode": "HTML",
+        **_reply_params(reply_to_message_id),
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -389,6 +457,6 @@ async def _do_send_media(
 
     # Final fallback: text with link
     logger.warning("%s URL fallback also failed: %s", endpoint, r.text)
-    return await _send_text(chat_id, f"{caption}\n[Media: {public_url}]")
+    return await _send_text(chat_id, f"{caption}\n[Media: {public_url}]", reply_to_message_id)
 
 

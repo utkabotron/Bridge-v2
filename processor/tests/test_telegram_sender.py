@@ -344,3 +344,26 @@ def test_client_errors_are_not_retried():
     assert not _is_server_error('{"ok":false,"error_code":403,"description":"Forbidden"}')
     assert not _is_server_error('{"ok":false,"error_code":400,"description":"chat not found"}')
     assert not _is_server_error(None)
+
+
+# ── Stage 3: voice notes and replies ──────────────────────
+
+def test_whatsapp_voice_notes_map_to_sendVoice():
+    """WhatsApp emits type "ptt"; it was absent from the map, so the media was dropped
+    and the recipient got a message containing only the sender's name."""
+    from processor.src.telegram_sender import _MEDIA_TYPE_MAP
+
+    assert _MEDIA_TYPE_MAP["ptt"] == ("sendVoice", "voice")
+    # sendAudio would render a file player rather than a voice bubble.
+    assert _MEDIA_TYPE_MAP["voice"] == ("sendVoice", "voice")
+    assert _MEDIA_TYPE_MAP["audio"] == ("sendAudio", "audio")
+
+
+def test_reply_params_tolerate_a_deleted_target():
+    """Delivery must not fail because the quoted message is gone from Telegram."""
+    from processor.src.telegram_sender import _reply_params
+
+    assert _reply_params(None) == {}
+    params = _reply_params(42)["reply_parameters"]
+    assert params["message_id"] == 42
+    assert params["allow_sending_without_reply"] is True

@@ -31,7 +31,7 @@ from .config import (
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
     FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
     FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
-    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE,
+    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE, REVOKE_NOTE,
 )
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
@@ -798,7 +798,7 @@ async def analyze_media(body: AnalyzeRequest):
         if msg_type in ("image", "photo"):
             analysis_type = "image"
             result_text = await analyze_image(content_bytes, content_type, target_lang)
-        elif msg_type in ("audio", "voice"):
+        elif msg_type in ("audio", "voice", "ptt"):
             analysis_type = "audio"
             result_text = await transcribe_audio(content_bytes, filename, target_lang)
         elif msg_type == "document":
@@ -988,6 +988,10 @@ async def _process_message(r, raw: str) -> None:
             logger.error("Failed to push malformed message to DLQ: %s", dlq_exc)
         return
 
+    if payload.get("kind") == "revoke":
+        await _handle_revoke(payload)
+        return
+
     try:
         try:
             user_id = int(payload.get("user_id") or 0)
@@ -1010,6 +1014,10 @@ async def _process_message(r, raw: str) -> None:
             "timestamp": payload.get("timestamp", 0),
             "from_me": payload.get("from_me", False),
             "is_edited": payload.get("is_edited", False),
+            "media_failed": payload.get("media_failed", False),
+            "quoted": payload.get("quoted"),
+            "location": payload.get("location"),
+            "contacts": payload.get("contacts"),
             # Will be resolved by validate node
             "chat_pair_id": None,
             "tg_chat_id": None,
@@ -1062,6 +1070,50 @@ async def _process_message(r, raw: str) -> None:
             logger.info("Dedup skip: %s already delivered to pair %s", wa_message_id, chat_pair_id)
             continue
         await _run_pipeline(r, payload, branch, msg_id, wa_message_id)
+
+
+async def _handle_revoke(payload: dict) -> None:
+    """Note in Telegram that a message was deleted for everyone in WhatsApp.
+
+    Leaving the original standing misrepresents the conversation — the reader has no way
+    to know the sender took it back.
+    """
+    from .telegram_sender import send_message
+
+    wa_message_id = payload.get("wa_message_id")
+    if not wa_message_id:
+        return
+
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch(
+            """
+            select me.tg_message_id, cp.tg_chat_id
+            from public.message_events me
+            join public.chat_pairs cp on cp.id = me.chat_pair_id
+            where me.wa_message_id = $1
+              and me.delivery_status = 'delivered'
+              and me.tg_message_id is not null
+            """,
+            wa_message_id,
+        )
+    except Exception as exc:
+        logger.warning("Revoke lookup failed for %s: %s", wa_message_id, exc)
+        return
+
+    if not rows:
+        logger.debug("Revoke: no delivered copy of %s to annotate", wa_message_id)
+        return
+
+    for row in rows:
+        try:
+            await send_message(
+                chat_id=row["tg_chat_id"],
+                text=REVOKE_NOTE,
+                reply_to_message_id=row["tg_message_id"],
+            )
+        except Exception as exc:
+            logger.warning("Revoke note failed for %s: %s", wa_message_id, exc)
 
 
 async def _already_delivered(wa_message_id: str, chat_pair_id: int | None) -> bool:

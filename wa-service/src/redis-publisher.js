@@ -76,8 +76,20 @@ function fallbackDedupId(payload) {
  * id._serialized (whatsapp-web.js session drift) reached the processor as "" and
  * collapsed every such message into one message_events row (media silently undelivered).
  */
+/**
+ * WhatsApp ids carry the direction as a prefix: the same group message is
+ * `false_<chat>_<hash>` to a recipient and `true_<chat>_<hash>` on the sender's own
+ * device. Now that outgoing messages are bridged too, both can arrive for one message
+ * (the author's client and another participant's), and the prefix alone would make them
+ * look like two. Strip it so dedup collapses them.
+ */
+function normalizeMessageId(id) {
+  if (typeof id !== 'string') return id;
+  return id.replace(/^(true|false)_/, '');
+}
+
 async function publishMessage(payload) {
-  let dedupId = payload.wa_message_id || fallbackDedupId(payload);
+  let dedupId = normalizeMessageId(payload.wa_message_id) || fallbackDedupId(payload);
   // Edits share the original message id — give them a distinct id so they are neither
   // dropped by dedup nor mistaken for the original in the DB.
   if (payload.is_edited) {
@@ -95,6 +107,28 @@ async function publishMessage(payload) {
   if (enqueued === 0) {
     console.log(`Dedup: skipping duplicate message ${dedupId}`);
   }
+}
+
+/**
+ * Announce that a message was deleted for everyone in WhatsApp.
+ *
+ * Goes through the same list as messages rather than pub/sub, so it can never overtake
+ * the message it refers to and cannot be lost while the processor restarts.
+ */
+async function publishRevoke(userId, before) {
+  const waMessageId = normalizeMessageId(before?.id?._serialized);
+  if (!waMessageId) return;
+
+  const payload = {
+    kind: 'revoke',
+    user_id: userId,
+    wa_chat_id: before?.from || before?.to || null,
+    wa_message_id: waMessageId,
+    timestamp: before?.timestamp || Math.floor(Date.now() / 1000),
+  };
+
+  await redis.lpush('messages:in', JSON.stringify(payload));
+  console.log(`Queued revoke for ${waMessageId}`);
 }
 
 /**
@@ -132,4 +166,4 @@ async function setChatPairsCache(userId, chatId, data) {
   }
 }
 
-module.exports = { redis, publishMessage, publishQrScanned, getChatPairsCache, setChatPairsCache, fallbackDedupId };
+module.exports = { redis, publishMessage, publishRevoke, publishQrScanned, getChatPairsCache, setChatPairsCache, fallbackDedupId, normalizeMessageId };

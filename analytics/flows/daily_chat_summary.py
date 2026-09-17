@@ -137,13 +137,14 @@ def find_chats_due_now() -> list[dict]:
             cp.tg_chat_id,
             cp.wa_chat_name,
             cp.tg_chat_title,
-            u.target_language,
+            COALESCE(cp.target_language, u.target_language) AS target_language,
             u.tg_user_id
         FROM chat_summary_schedule css
         JOIN chat_pairs cp ON cp.id = css.chat_pair_id
         JOIN users u ON u.id = cp.user_id
         WHERE cp.status = 'active'
           AND u.is_active = true
+          AND css.enabled = true
           AND css.optimal_hour = extract(hour FROM now() AT TIME ZONE %s)::int
           AND css.optimal_minute = (CASE
               WHEN extract(minute FROM now() AT TIME ZONE %s)::int < 30 THEN 0

@@ -327,3 +327,72 @@ async def test_failed_pipeline_counts_towards_the_failure_rate():
 
     assert tracked == [True]
     dlq.assert_awaited()  # and the message is still kept for retry
+
+
+# ── Stage 3: message kinds that used to arrive broken ─────
+
+def test_format_node_flags_media_that_could_not_be_fetched():
+    """A failed download used to deliver a bare sender name with no hint of what was lost."""
+    from processor.src.pipeline.nodes import format_node
+
+    result = format_node(_base_state(original_text="", message_type="ptt", media_failed=True))
+
+    assert "голосовое сообщение" in result["formatted_text"]
+
+
+def test_format_node_marks_edits_and_own_messages():
+    from processor.src.pipeline.nodes import format_node
+
+    edited = format_node(_base_state(is_edited=True))
+    assert "✏️" in edited["formatted_text"]
+
+    own = format_node(_base_state(from_me=True))
+    assert "➡️" in own["formatted_text"]
+
+
+def test_format_node_renders_a_shared_contact_instead_of_raw_vcard():
+    from processor.src.pipeline.nodes import format_node
+
+    state = _base_state(
+        original_text="",
+        message_type="vcard",
+        contacts=[{"name": "Dr Cohen", "phones": ["+972-50-123"]}],
+    )
+    result = format_node(state)
+
+    assert "Dr Cohen" in result["formatted_text"]
+    assert "+972-50-123" in result["formatted_text"]
+    assert "VCARD" not in result["formatted_text"]
+
+
+def test_format_node_quotes_the_replied_message_when_threading_is_unavailable():
+    """Falls back to an inline preview only when we cannot use a real Telegram reply."""
+    from processor.src.pipeline.nodes import format_node
+
+    quoted = {"wa_message_id": "abc", "body": "во сколько встреча?", "sender": "Dana"}
+
+    inline = format_node(_base_state(quoted=quoted))
+    assert "во сколько встреча?" in inline["formatted_text"]
+    assert "Dana" in inline["formatted_text"]
+
+    threaded = format_node(_base_state(quoted=quoted, reply_to_message_id=555))
+    assert "во сколько встреча?" not in threaded["formatted_text"]
+
+
+# ── Stage 3: not paying to translate what is already readable ──
+
+def test_messages_already_in_the_target_script_skip_the_llm():
+    from processor.src.pipeline.graph import _already_in_target_script
+
+    assert _already_in_target_script("Привет, во сколько встреча?", "Russian")
+    assert _already_in_target_script("See you at 5", "English")
+
+
+def test_source_script_or_mixed_text_still_gets_translated():
+    from processor.src.pipeline.graph import _already_in_target_script
+
+    assert not _already_in_target_script("מה קורה?", "Russian")
+    # Mixed Hebrew/Russian must still go through the model.
+    assert not _already_in_target_script("Привет, מה קורה?", "Russian")
+    # An unknown target language is never assumed readable.
+    assert not _already_in_target_script("Hello", "Thai")

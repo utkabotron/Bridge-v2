@@ -44,7 +44,7 @@ def collect_per_chat_data() -> list[dict]:
     cur.execute("""
         SELECT cp.id AS chat_pair_id,
                cp.wa_chat_id,
-               u.target_language,
+               coalesce(cp.target_language, u.target_language) as target_language,
                prof.profile_data,
                prof.version
         FROM chat_pairs cp
