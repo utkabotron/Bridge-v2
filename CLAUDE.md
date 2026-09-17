@@ -233,6 +233,19 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 `idle → qr_pending → wa_connected → linking → done`
 Table: onboarding_sessions. /start always shows Mini App button.
 
+## MESSAGE PRESENTATION
+
+`format_node` собирает: `[➡️] Отправитель [✏️ изменено]` → цитата → контакты → оригинал →
+перевод → пометки (`⚠️ перевод недоступен`, `📎 не удалось получить <тип>`).
+Тексты — в `processor/src/config.py` (`MEDIA_FAILED_NOTE`, `EDITED_MARK`, `REVOKE_NOTE`,
+`OWN_MESSAGE_PREFIX`, `VOICE_TRANSCRIPT_TITLE`).
+
+Перевод пропускается, если текст уже в письменности целевого языка
+(`graph._already_in_target_script`) — смешанный текст всё равно переводится.
+
+Язык — per-pair: `coalesce(cp.target_language, u.target_language)`, NULL = наследовать
+аккаунт. Меняется кнопкой ⚙️ в `/chats`, там же переключатель сводки дня.
+
 ## RELIABILITY
 
 - `wa-health-check` алертит в Telegram: клиент отвалился, тишина >3ч днём, очередь растёт,
@@ -254,6 +267,13 @@ Table: onboarding_sessions. /start always shows Mini App button.
 - Бакет медиа приватный; ссылки наружу только presigned (`processor/src/s3.py`), объекты живут 90 дней.
 - wa-service port 3000: expose-only, NOT published. Access via nginx.
 - Media format: `*Sender*\n\noriginal\n\ntranslated`. Media sent natively (sendPhoto/etc), NOT in formatted_text.
+- Голосовые = тип `ptt` (не `voice`!) → `sendVoice` + авто-транскрипт Whisper отдельным reply.
+- Локации → `sendLocation`, контакты (vcard) → разбор в имя+телефоны, опросы → вопрос+варианты.
+  Всё это мимо LLM: раньше уходило в перевод как текст.
+- Цитаты/правки → реальный reply в Telegram через `reply_parameters` (поиск `tg_message_id`
+  в `message_events`). Удаления → пометка ответом на исходное сообщение.
+- Свои сообщения (`fromMe`) бриджатся через `message_create`; id нормализуется
+  (`normalizeMessageId` срезает префикс `true_/false_`), иначе своя и чужая копии = дубль.
 - MinIO locally (9000/9001), bucket `bridge-media` auto-created via `infra/minio-init.sh`.
 - Bot: polling-based, NO health endpoint. Mixed sync/async — Redis sub in daemon thread, `asyncio.run_coroutine_threadsafe` for cross-thread.
 - QR events buffered in `redis_sub.py._pending_events` until bot ready, drained on `set_bot_app()`.
