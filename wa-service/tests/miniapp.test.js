@@ -122,3 +122,40 @@ describe('theme', () => {
     expect(css).toContain('env(safe-area-inset-bottom)');
   });
 });
+
+describe('identity across the API and the DOM', () => {
+  // Postgres bigint columns reach JSON as strings ("30"), and a dataset attribute is
+  // always a string. Coercing one side to Number made every lookup fail, so tapping a
+  // bridge card registered the tap and then opened nothing — the handler returned on its
+  // first line because find() matched no pair.
+  const sameId = new Function(`${js.slice(js.indexOf('function sameId('), js.indexOf('function initial('))} return sameId;`)();
+
+  test('matches a bigint-as-string against the same value as a number', () => {
+    expect(sameId('30', 30)).toBe(true);
+    expect(sameId(30, '30')).toBe(true);
+    expect(sameId('-1004483843614', -1004483843614)).toBe(true);
+  });
+
+  test('still separates different ids', () => {
+    expect(sameId('30', 31)).toBe(false);
+    expect(sameId('120363@g.us', '120364@g.us')).toBe(false);
+  });
+
+  test('handles WhatsApp ids, which are genuinely strings', () => {
+    expect(sameId('120363@g.us', '120363@g.us')).toBe(true);
+  });
+
+  test('no dataset value is coerced to a number before comparison', () => {
+    // The shape of the original bug: Number(card.dataset.pair) against a string id.
+    expect(js).not.toMatch(/Number\(\s*\w+\.dataset\./);
+  });
+
+  test('id lookups go through sameId rather than raw ===', () => {
+    const lookups = [...js.matchAll(/\.find\(\((\w+)\) => [^)]*\)/g)].map((m) => m[0]);
+    const idLookups = lookups.filter((l) => /\.id|chat_id/.test(l));
+    expect(idLookups.length).toBeGreaterThan(0);
+    for (const lookup of idLookups) {
+      expect(lookup).toContain('sameId');
+    }
+  });
+});

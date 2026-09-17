@@ -109,6 +109,17 @@ function esc(value) {
   ));
 }
 
+/**
+ * Identity comparison for anything that crosses the API or the DOM.
+ *
+ * Postgres bigint columns (a pair id, a Telegram chat id) arrive as JSON strings, and a
+ * dataset attribute is always a string — but a WhatsApp chat id is a real string and a
+ * literal in code may be a number. Comparing without normalising silently fails.
+ */
+function sameId(a, b) {
+  return String(a) === String(b);
+}
+
 function initial(name) {
   const ch = String(name || '').trim().charAt(0);
   return ch ? esc(ch) : '·';
@@ -300,7 +311,7 @@ const SCREENS = {
     } else {
       body.innerHTML = `<div class="list">${state.pairs.map(bridgeCard).join('')}</div>`;
       body.querySelectorAll('[data-pair]').forEach((card) => {
-        card.onclick = () => openPairSheet(Number(card.dataset.pair));
+        card.onclick = () => openPairSheet(card.dataset.pair);
       });
     }
 
@@ -547,7 +558,7 @@ function drawWaChats(groupsError) {
   body.querySelectorAll('[data-wa]').forEach((card) => {
     card.onclick = () => {
       haptic('select');
-      state.selectedWa = state.waChats.find((c) => c.id === card.dataset.wa);
+      state.selectedWa = state.waChats.find((c) => sameId(c.id, card.dataset.wa));
       state.selectedTg = null;
       navigate('pick-tg');
     };
@@ -589,7 +600,7 @@ function drawTgGroups() {
       haptic('select');
       body.querySelectorAll('[data-tg]').forEach((c) => c.classList.remove('selected'));
       card.classList.add('selected');
-      state.selectedTg = state.tgGroups.find((g) => String(g.chat_id) === card.dataset.tg);
+      state.selectedTg = state.tgGroups.find((g) => sameId(g.chat_id, card.dataset.tg));
       setMain(T.tg_create, createBridge);
     };
   });
@@ -654,7 +665,9 @@ const backdrop = () => document.getElementById('sheet-backdrop');
 const sheetEl = () => document.getElementById('sheet');
 
 function openPairSheet(pairId) {
-  state.openPair = state.pairs.find((p) => p.id === pairId);
+  // Compare as strings on both sides: ids arrive from the API as strings (pg returns
+  // bigint that way) and from the DOM as strings, but nothing guarantees either.
+  state.openPair = state.pairs.find((p) => sameId(p.id, pairId));
   if (!state.openPair) return;
   haptic('select');
   drawPairSheet();
@@ -760,13 +773,13 @@ async function patchPair(body, after, row) {
     const { pair } = await api(`/chat-pairs/${state.openPair.id}`, { method: 'PATCH', body });
     haptic('success');
     state.openPair = pair;
-    state.pairs = state.pairs.map((p) => (p.id === pair.id ? pair : p));
+    state.pairs = state.pairs.map((p) => (sameId(p.id, pair.id) ? pair : p));
     after();
     // Keep the list underneath in step without a full reload.
     const card = document.querySelector(`[data-pair="${pair.id}"]`);
     if (card) card.outerHTML = bridgeCard(pair);
     document.querySelectorAll('[data-pair]').forEach((el) => {
-      el.onclick = () => openPairSheet(Number(el.dataset.pair));
+      el.onclick = () => openPairSheet(el.dataset.pair);
     });
   } catch (err) {
     haptic('error');
