@@ -122,6 +122,76 @@ async def test_translate_node_llm_call():
     assert result["translation_ms"] >= 0
 
 
+def test_looks_untranslated_detects_echo_but_not_real_translation():
+    """The passthrough guard flags echoed source, not legitimate translations."""
+    from processor.src.pipeline.nodes import _looks_untranslated
+
+    heb = "שלום חברים"
+    assert _looks_untranslated(heb, heb, "Russian") is True             # exact echo
+    assert _looks_untranslated(heb, heb + "  ", "Russian") is True      # whitespace-only diff
+    assert _looks_untranslated(heb, "שלום לכם", "Russian") is True      # still Hebrew, no target script
+    assert _looks_untranslated(heb, "Привет, друзья", "Russian") is False   # real translation
+    assert _looks_untranslated(heb, "Привет שלום", "Russian") is False      # mixed, has target script
+    assert _looks_untranslated(heb, "שלום", "Klingon") is False         # unknown target → cannot judge
+    assert _looks_untranslated(heb, "", "Russian") is False             # empty handled elsewhere
+
+
+@pytest.mark.asyncio
+async def test_translate_node_retries_when_model_echoes_source():
+    """A first reply that repeats the Hebrew source triggers one corrective retry."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
+                        original_text="שלום, מה שלומך?")
+    echo = MagicMock(); echo.content = "שלום, מה שלומך?"
+    good = MagicMock(); good.content = "Привет, как дела?"
+    ainvoke = AsyncMock(side_effect=[echo, good])
+
+    with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()) as set_cached, \
+         patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
+         patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
+
+        mock_llm.return_value.ainvoke = ainvoke
+        result = await translate_node(state)
+
+    assert ainvoke.await_count == 2
+    assert result["translated_text"] == "Привет, как дела?"
+    assert result["translation_passthrough"] is False
+    set_cached.assert_awaited()  # the corrected result is cache-worthy
+
+
+@pytest.mark.asyncio
+async def test_translate_node_flags_and_skips_cache_on_persistent_passthrough():
+    """When the model refuses to translate even after the retry, deliver as-is but never cache."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
+                        original_text="שלום, מה שלומך?")
+    echo = MagicMock(); echo.content = "שלום, מה שלומך?"
+    ainvoke = AsyncMock(side_effect=[echo, echo])
+
+    with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()) as set_cached, \
+         patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()) as set_cached_global, \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
+         patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
+
+        mock_llm.return_value.ainvoke = ainvoke
+        result = await translate_node(state)
+
+    assert ainvoke.await_count == 2
+    assert result["translated_text"] == "שלום, מה שלומך?"
+    assert result["translation_passthrough"] is True
+    set_cached.assert_not_awaited()
+    set_cached_global.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_translate_node_empty_text():
     """Empty text should be passed through without LLM call."""

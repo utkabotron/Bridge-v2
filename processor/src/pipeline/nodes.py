@@ -15,7 +15,7 @@ from typing import Any
 
 
 from langdetect import detect, LangDetectException
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import (
@@ -108,6 +108,43 @@ async def validate_node(state: MessageState) -> MessageState:
     }
 
 
+# ── Passthrough guard ─────────────────────────────────────
+# ~1% of Hebrew messages used to reach the recipient verbatim: the model handed the
+# source back untranslated (prompt rule 3 misfiring, or a lazy reply at temperature 0),
+# and translate_node delivered it — a message worthless to a reader who does not read the
+# source script. These are the worst-scoring translations we produce. Detect the echo and
+# give the model one corrective turn before giving up.
+_SRC_SCRIPT_RE = re.compile(r"[֐-׿؀-ۿ܀-ݏ]")  # Hebrew, Arabic, Syriac
+_CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_TGT_SCRIPT_RE = {
+    "russian": _CYRILLIC_RE, "ukrainian": _CYRILLIC_RE,
+    "english": _LATIN_RE, "spanish": _LATIN_RE, "french": _LATIN_RE,
+    "german": _LATIN_RE, "portuguese": _LATIN_RE,
+}
+
+
+def _looks_untranslated(original: str, translated: str, target_language: str) -> bool:
+    """True when the model echoed the source instead of translating it.
+
+    Two signals: an exact passthrough (output == input), or output that still carries
+    source-script characters while none of the target's own script is present — the source
+    was handed back verbatim. Deliberately conservative: a partial translation that mixes
+    some leftover source words with real target-script text is NOT flagged, so legitimate
+    mixed messages never trigger a needless retry.
+    """
+    if not translated:
+        return False  # empty output is handled by the degenerate-cache guard
+    o = original.strip()
+    t = translated.strip()
+    if t == o:
+        return True
+    tgt_re = _TGT_SCRIPT_RE.get((target_language or "").strip().lower())
+    if tgt_re is None:
+        return False  # cannot reason about scripts for this target language
+    return bool(_SRC_SCRIPT_RE.search(t)) and not tgt_re.search(t)
+
+
 # ── Node: translate ───────────────────────────────────────
 
 async def translate_node(state: MessageState) -> MessageState:
@@ -171,26 +208,57 @@ async def translate_node(state: MessageState) -> MessageState:
             "translation_failed": True,
         }
 
-    translation_ms = int((time.monotonic() - t0) * 1000)
-
     translated = response.content.strip()
 
-    # Guard against caching a degenerate translation (empty or a tiny fragment of a long
-    # source — usually a truncated/filtered LLM response). Caching it would serve that bad
-    # result for 24h, and globally it would poison every profileless pair. Deliver what we
-    # got this once, but do not persist it to cache.
+    # If the model echoed the source instead of translating, give it one corrective turn.
+    # Most passthroughs are a lazy reply the model fixes when told the previous output was
+    # untranslated; if it still refuses we deliver what we have but never cache it.
+    passthrough = False
+    if _looks_untranslated(text, translated, lang):
+        logger.warning("Translation passthrough (lang=%s, src_len=%d) — retrying once", lang, len(text))
+        retry_messages = messages + [
+            AIMessage(content=translated),
+            HumanMessage(content=(
+                f"Your reply was NOT translated into {lang} — it repeated the source text. "
+                f"Translate EVERY word into {lang} now, leaving nothing in the original "
+                f"language. Output only the {lang} translation."
+            )),
+        ]
+        try:
+            retried = (await get_llm().ainvoke(retry_messages)).content.strip()
+        except Exception as exc:
+            logger.error("Passthrough retry failed (%s) — keeping first result", exc)
+            retried = ""
+        if retried and not _looks_untranslated(text, retried, lang):
+            translated = retried
+        else:
+            passthrough = True
+            logger.warning("Translation still untranslated after retry (lang=%s) — delivering as-is", lang)
+
+    translation_ms = int((time.monotonic() - t0) * 1000)
+
+    # Guard against caching a bad translation: degenerate (empty or a tiny fragment of a
+    # long source — usually a truncated/filtered response) or an untranslated passthrough.
+    # Caching it would serve that bad result for 24h, and globally it would poison every
+    # profileless pair. Deliver what we got this once, but do not persist it to cache.
     is_degenerate = (not translated) or (len(text) > 80 and len(translated) < 0.3 * len(text))
     if is_degenerate:
         logger.warning(
             "Skipping cache for degenerate translation (src_len=%d, out_len=%d, lang=%s)",
             len(text), len(translated), lang,
         )
-    else:
+    if not (is_degenerate or passthrough):
         await set_cached(text, lang, translated, chat_pair_id)
         if not has_profile:
             await set_cached_global(text, lang, translated)
 
-    return {**state, "translated_text": translated, "translation_ms": translation_ms, "cache_hit": False}
+    return {
+        **state,
+        "translated_text": translated,
+        "translation_ms": translation_ms,
+        "cache_hit": False,
+        "translation_passthrough": passthrough,
+    }
 
 
 
