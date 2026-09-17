@@ -1,6 +1,8 @@
 """Unit tests for the LangGraph pipeline nodes."""
 from __future__ import annotations
 
+import os
+
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -74,6 +76,36 @@ async def test_validate_node_pair_already_resolved():
     fetch.assert_not_awaited()
     assert result["chat_pair_id"] == 9
     assert result["tg_chat_id"] == -100999
+
+
+@pytest.mark.asyncio
+async def test_validate_node_forwards_captionless_media_from_admin_chat():
+    """A caption-less video from an admin's unpaired chat is forwarded, not dropped."""
+    from processor.src.pipeline.nodes import validate_node
+
+    state = _base_state(user_id=100, original_text="", message_type="video",
+                        media_s3_url="https://s3/bridge-media/vid.mp4")
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+        result = await validate_node(state)
+
+    assert result.get("fallback_to_admins") is True
+    assert result.get("delivery_status") != "skipped"
+
+
+@pytest.mark.asyncio
+async def test_validate_node_skips_russian_text_without_media_from_admin_chat():
+    """Russian-only text with no media from an admin chat still gets skipped."""
+    from processor.src.pipeline.nodes import validate_node
+
+    state = _base_state(user_id=100, message_type="text", media_s3_url=None,
+                        original_text="привет как дела у тебя сегодня всё хорошо надеюсь")
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+        result = await validate_node(state)
+
+    assert result.get("fallback_to_admins") is not True
+    assert result["delivery_status"] == "skipped"
 
 
 # ── translate_node ────────────────────────────────────────

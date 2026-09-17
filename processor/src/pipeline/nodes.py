@@ -81,17 +81,21 @@ async def validate_node(state: MessageState) -> MessageState:
         # Fallback to admins only for admin's own WA messages
         admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
         if state["user_id"] in admin_ids:
+            has_media = bool(state.get("media_s3_url")) or bool(state.get("media_failed"))
             text = state.get("original_text", "").strip()
+            lang = "ru"
             if text:
                 try:
                     lang = detect(text)
                 except LangDetectException:
                     lang = "ru"
-            else:
-                lang = "ru"
 
-            if lang != "ru":
-                logger.info("Admin no-pair fallback (lang=%s) → send to admins", lang)
+            # Forward an unpaired admin chat into the bot on any media or any non-Russian
+            # text. A caption-less video/photo has empty original_text, which langdetect
+            # would read as Russian and drop — so media must bypass the language gate.
+            # Russian-only text with no media still falls through to skipped.
+            if has_media or lang != "ru":
+                logger.info("Admin no-pair fallback (media=%s, lang=%s) → send to admins", has_media, lang)
                 return {**state, "chat_pair_id": None, "tg_chat_id": None,
                         "target_language": "Russian",
                         "fallback_to_admins": True}
