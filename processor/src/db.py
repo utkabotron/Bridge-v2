@@ -167,25 +167,32 @@ async def fetch_chat_profile(chat_pair_id: int) -> Optional[dict]:
     return data
 
 
-async def find_tg_message_id(wa_message_id: str, chat_pair_id: int) -> Optional[int]:
-    """Telegram message_id of an already-delivered WhatsApp message in this pair.
+async def find_delivered_event(
+    wa_message_id: str, chat_pair_id: int,
+) -> tuple[Optional[int], Optional[int]]:
+    """(tg_message_id, event id) of an already-delivered WhatsApp message in this pair.
 
     Lets a reply or an edit attach to the message it refers to, instead of arriving as a
-    standalone message the reader has to match up by hand.
+    standalone message the reader has to match up by hand. The event id is what an edit
+    needs to rebuild the Analyze button of the media it revises.
     """
     pool = await get_pool()
     try:
-        return await pool.fetchval(
+        row = await pool.fetchrow(
             """
-            select tg_message_id from public.message_events
+            select id, tg_message_id from public.message_events
             where wa_message_id = $1 and chat_pair_id = $2
               and delivery_status = 'delivered' and tg_message_id is not null
+            order by id desc limit 1
             """,
             wa_message_id, chat_pair_id,
         )
     except Exception as exc:
         logger.warning("Reply target lookup failed for %s: %s", wa_message_id, exc)
-        return None
+        return None, None
+    if row is None:
+        return None, None
+    return row["tg_message_id"], row["id"]
 
 
 async def insert_message_event(state: dict[str, Any], return_id: bool = False) -> Optional[int]:

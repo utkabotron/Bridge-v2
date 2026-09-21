@@ -324,6 +324,68 @@ async def _send_text_single(
     return False, r.text, None
 
 
+async def edit_message(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    message_type: str = "text",
+    reply_markup: Optional[dict] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Revise an already-delivered Telegram message in place.
+
+    A WhatsApp edit used to arrive as a second, near-identical message; Telegram can
+    rewrite the first one and mark it "edited" on its own. Bots may edit their own
+    messages with no time limit.
+
+    Returns (ok, error). A False is not a delivery failure — the caller falls back to
+    sending a new message, which is what keeps the edit visible when the original is
+    gone, uneditable, or was split across several messages.
+    """
+    # Media carries its text as a caption; only a text message has a `text` to replace.
+    is_caption = message_type != "text"
+    limit = TG_MAX_CAPTION if is_caption else TG_MAX_TEXT
+    if len(text) > limit:
+        # The original went out as a message plus an overflow tail, so there is no single
+        # message that holds this text.
+        return False, "edit_text_too_long"
+
+    endpoint = "editMessageCaption" if is_caption else "editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "caption" if is_caption else "text": text,
+        "parse_mode": "HTML",
+    }
+    if reply_markup is not None:
+        # Telegram drops the inline keyboard on edit unless it is sent again.
+        payload["reply_markup"] = reply_markup
+
+    r = await get_client().post(f"{BASE_URL}/{endpoint}", json=payload)
+    if r.status_code == 200:
+        return True, None
+
+    body = r.text.lower()
+    if r.status_code == 400 and "can't parse entities" in body:
+        logger.warning("HTML parse failed editing message %s in chat %s, retrying without parse_mode",
+                       message_id, chat_id)
+        r2 = await get_client().post(
+            f"{BASE_URL}/{endpoint}",
+            json={k: v for k, v in payload.items() if k != "parse_mode"},
+        )
+        if r2.status_code == 200:
+            return True, None
+        return False, r2.text
+    if "message is not modified" in body:
+        # The delivered message already reads exactly like this. Falling back to a new
+        # message here would recreate the duplicate this whole path exists to remove.
+        return True, None
+    if r.status_code == 401 or _is_unauthorized(r.text):
+        logger.critical("401 Unauthorized editing message in chat %s — bot removed or token invalid", chat_id)
+        return False, "401_UNAUTHORIZED"
+    logger.warning("%s failed for chat %s message %s: %s", endpoint, chat_id, message_id, r.text)
+    return False, r.text
+
+
 async def send_location(
     chat_id: int,
     latitude: float,

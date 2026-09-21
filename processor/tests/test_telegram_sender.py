@@ -367,3 +367,105 @@ def test_reply_params_tolerate_a_deleted_target():
     params = _reply_params(42)["reply_parameters"]
     assert params["message_id"] == 42
     assert params["allow_sending_without_reply"] is True
+
+
+# ── edit_message ───────────────────────────────────────────
+
+def _resp(status_code: int, text: str) -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = text
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_edit_message_text_uses_edit_message_text():
+    from processor.src.telegram_sender import edit_message
+
+    with patch("processor.src.telegram_sender.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=_resp(200, json.dumps({"ok": True})))
+        mock_get_client.return_value = mock_client
+
+        ok, err = await edit_message(12345, 42, "<b>Alice</b>\n\nновый текст")
+
+    url, kwargs = mock_client.post.await_args.args[0], mock_client.post.await_args.kwargs
+    assert url.endswith("/editMessageText")
+    assert kwargs["json"]["text"] == "<b>Alice</b>\n\nновый текст"
+    assert kwargs["json"]["message_id"] == 42
+    assert ok is True and err is None
+
+
+@pytest.mark.asyncio
+async def test_edit_message_media_edits_the_caption():
+    from processor.src.telegram_sender import edit_message
+
+    with patch("processor.src.telegram_sender.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=_resp(200, json.dumps({"ok": True})))
+        mock_get_client.return_value = mock_client
+
+        ok, _ = await edit_message(12345, 42, "подпись", message_type="image")
+
+    url, kwargs = mock_client.post.await_args.args[0], mock_client.post.await_args.kwargs
+    assert url.endswith("/editMessageCaption")
+    assert kwargs["json"]["caption"] == "подпись"
+    assert "text" not in kwargs["json"]
+    assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_edit_message_refuses_text_that_was_split_on_delivery():
+    """Over the limit the original went out in pieces, so no single message holds it."""
+    from processor.src.telegram_sender import edit_message, TG_MAX_TEXT
+
+    with patch("processor.src.telegram_sender.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock()
+        mock_get_client.return_value = mock_client
+
+        ok, err = await edit_message(12345, 42, "x" * (TG_MAX_TEXT + 1))
+
+    mock_client.post.assert_not_called()
+    assert ok is False
+    assert err == "edit_text_too_long"
+
+
+@pytest.mark.asyncio
+async def test_edit_message_treats_an_unchanged_message_as_done():
+    """Resending here would recreate the duplicate that editing exists to remove."""
+    from processor.src.telegram_sender import edit_message
+
+    not_modified = json.dumps({
+        "ok": False, "error_code": 400,
+        "description": "Bad Request: message is not modified",
+    })
+
+    with patch("processor.src.telegram_sender.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=_resp(400, not_modified))
+        mock_get_client.return_value = mock_client
+
+        ok, err = await edit_message(12345, 42, "тот же текст")
+
+    assert ok is True and err is None
+
+
+@pytest.mark.asyncio
+async def test_edit_message_retries_without_parse_mode_on_bad_html():
+    from processor.src.telegram_sender import edit_message
+
+    bad_html = json.dumps({"ok": False, "error_code": 400,
+                           "description": "Bad Request: can't parse entities"})
+
+    with patch("processor.src.telegram_sender.get_client") as mock_get_client:
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=[
+            _resp(400, bad_html), _resp(200, json.dumps({"ok": True})),
+        ])
+        mock_get_client.return_value = mock_client
+
+        ok, err = await edit_message(12345, 42, "a < b")
+
+    assert ok is True and err is None
+    assert "parse_mode" not in mock_client.post.await_args.kwargs["json"]

@@ -45,6 +45,9 @@ class MessageState(TypedDict):
 
     # Set by format node
     formatted_text: Optional[str]
+    # Same text without the "edited" mark — used when the edit rewrites the delivered
+    # Telegram message, which Telegram labels as edited by itself.
+    formatted_text_plain: Optional[str]
 
     # Fallback routing
     fallback_to_admins: bool
@@ -52,6 +55,8 @@ class MessageState(TypedDict):
     # Set by deliver node
     # Telegram message this one replies to (a quote, or the message an edit revises).
     reply_to_message_id: Optional[int]
+    # message_events.id of that same message — lets an edited photo keep its Analyze button.
+    edit_target_event_id: Optional[int]
     tg_message_id: Optional[int]
     delivery_status: str       # pending | delivered | failed | skipped
     error: Optional[str]

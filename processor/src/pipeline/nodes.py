@@ -363,12 +363,12 @@ def format_node(state: MessageState) -> MessageState:
         header.append(esc(OWN_MESSAGE_PREFIX))
     if sender:
         header.append(bold(sender))
+    # An edit that rewrites the delivered message needs no mark of ours — Telegram adds
+    # its own "edited" label. The mark is for the fallback, where the edit still arrives
+    # as a second, near-identical message.
+    header_plain = list(header)
     if state.get("is_edited"):
-        # This used to arrive as a second, near-identical message with no explanation.
         header.append(esc(EDITED_MARK))
-    if header:
-        parts.append(" ".join(header))
-        parts.append("")
 
     # Quoted message: Telegram's own reply threading does the work when we know the
     # original's message_id; this preview is the fallback when we don't.
@@ -407,10 +407,17 @@ def format_node(state: MessageState) -> MessageState:
         parts.append("")
         parts.append(esc(MEDIA_FAILED_NOTE.format(kind=kind)))
 
-    # Sections are separated by a single blank line. Joining blindly left doubled gaps
-    # whenever a section was empty (e.g. media that failed to download, which has no text).
-    formatted = re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip()
-    return {**state, "formatted_text": formatted}
+    def _compose(head: list[str]) -> str:
+        # Sections are separated by a single blank line. Joining blindly left doubled gaps
+        # whenever a section was empty (e.g. media that failed to download, which has no text).
+        lines = ([" ".join(head), ""] if head else []) + parts
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+    return {
+        **state,
+        "formatted_text": _compose(header),
+        "formatted_text_plain": _compose(header_plain),
+    }
 
 
 # ── Node: deliver ─────────────────────────────────────────
@@ -433,11 +440,20 @@ async def deliver_node(state: MessageState) -> MessageState:
         return result
 
     # Resolve the Telegram message this one answers, so replies keep their thread.
-    state = {**state, "reply_to_message_id": await _resolve_reply_target(state)}
+    tg_target, target_event_id = await _resolve_reply_target(state)
+    state = {**state, "reply_to_message_id": tg_target, "edit_target_event_id": target_event_id}
 
     # A location has no text worth translating; send it as a real map pin.
     if state.get("location"):
         return await _deliver_location(state, tg_chat_id)
+
+    # A WhatsApp edit revises a message we already delivered — rewrite that Telegram
+    # message instead of sending a second copy. Falls through to the old behaviour when
+    # the original predates this feature, was never delivered, or Telegram refuses.
+    if state.get("is_edited") and state.get("reply_to_message_id"):
+        edited = await _deliver_edit(state, tg_chat_id)
+        if edited is not None:
+            return edited
 
     has_media = bool(state.get("media_s3_url"))
     msg_type = state.get("message_type", "text")
@@ -449,13 +465,18 @@ async def deliver_node(state: MessageState) -> MessageState:
     return await _deliver_simple(state, tg_chat_id)
 
 
-async def _resolve_reply_target(state: MessageState) -> int | None:
-    """Telegram message_id of the message this one quotes, if we delivered it."""
-    from ..db import find_tg_message_id
+async def _resolve_reply_target(state: MessageState) -> tuple[int | None, int | None]:
+    """(Telegram message_id, message_events.id) of the message this one refers to.
+
+    The event id is what lets an edited photo keep its Analyze button: the button's
+    callback names the original event, and Telegram drops the keyboard on edit unless it
+    is sent again.
+    """
+    from ..db import find_delivered_event
 
     chat_pair_id = state.get("chat_pair_id")
     if not chat_pair_id:
-        return None
+        return None, None
 
     # An edit should attach to the message it revises; a reply, to the message it quotes.
     target_wa_id = None
@@ -466,8 +487,59 @@ async def _resolve_reply_target(state: MessageState) -> int | None:
         target_wa_id = state["quoted"]["wa_message_id"]
 
     if not target_wa_id:
+        return None, None
+    return await find_delivered_event(target_wa_id, chat_pair_id)
+
+
+def _analyze_markup(event_id: int) -> dict:
+    """Inline keyboard that offers to analyze the media of `event_id`."""
+    return {
+        "inline_keyboard": [[
+            {"text": "\U0001f50d Analyze", "callback_data": f"analyze:{event_id}"},
+        ]],
+    }
+
+
+async def _deliver_edit(state: MessageState, tg_chat_id: int) -> MessageState | None:
+    """Rewrite the Telegram message this WhatsApp edit revises.
+
+    Returns None when Telegram refuses the edit — the original may be too old to edit in
+    a channel, deleted, or split across several messages — and the caller then delivers
+    the edit as a new message the way it always did.
+    """
+    from ..telegram_sender import edit_message
+
+    tg_message_id = state["reply_to_message_id"]
+    # Media keeps its text in a caption; without a file the original went out as plain
+    # text, even for a photo whose download failed.
+    has_media = bool(state.get("media_s3_url"))
+    msg_type = state.get("message_type", "text") if has_media else "text"
+
+    reply_markup = None
+    event_id = state.get("edit_target_event_id")
+    if event_id and has_media and state.get("message_type") in _ANALYZABLE_TYPES:
+        # The button belongs to the original media's event — the edit changed the caption,
+        # not the file.
+        reply_markup = _analyze_markup(event_id)
+
+    ok, error = await edit_message(
+        chat_id=tg_chat_id,
+        message_id=tg_message_id,
+        text=state.get("formatted_text_plain") or state["formatted_text"],
+        message_type=msg_type,
+        reply_markup=reply_markup,
+    )
+    if not ok:
+        logger.info("In-place edit of Telegram message %s failed (%s) — sending as a new message",
+                    tg_message_id, error)
         return None
-    return await find_tg_message_id(target_wa_id, chat_pair_id)
+
+    # The edit is recorded against the same Telegram message, so the next edit (and any
+    # reply to it) resolves to the very message the reader sees.
+    result = {**state, "tg_chat_id": tg_chat_id, "delivery_status": "delivered",
+              "error": None, "tg_message_id": tg_message_id}
+    await _persist_event(result)
+    return result
 
 
 async def _deliver_location(state: MessageState, tg_chat_id: int) -> MessageState:
@@ -554,11 +626,7 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
         return await _deliver_simple(state, tg_chat_id)
 
     # Phase 2: Send with inline keyboard
-    reply_markup = {
-        "inline_keyboard": [[
-            {"text": "\U0001f50d Analyze", "callback_data": f"analyze:{event_id}"},
-        ]],
-    }
+    reply_markup = _analyze_markup(event_id)
     ok, error, migrate_id, tg_msg_id = await send_message(
         chat_id=tg_chat_id,
         text=state["formatted_text"],

@@ -520,3 +520,117 @@ def test_source_script_or_mixed_text_still_gets_translated():
     assert not _already_in_target_script("Привет, מה קורה?", "Russian")
     # An unknown target language is never assumed readable.
     assert not _already_in_target_script("Hello", "Thai")
+
+
+# ── WhatsApp edits rewrite the delivered Telegram message ──
+
+def _edit_state(**overrides):
+    """An edit of an already-delivered message, ready for deliver_node."""
+    state = _base_state(
+        wa_message_id="test-123:edit:9f8e7d",
+        is_edited=True,
+        chat_pair_id=7,
+        tg_chat_id=-100500,
+        formatted_text="<b>Alice</b> ✏️ изменено\n\nновый текст",
+        formatted_text_plain="<b>Alice</b>\n\nновый текст",
+    )
+    state.update(overrides)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_edit_rewrites_the_delivered_message_instead_of_sending_a_second_one():
+    from processor.src.pipeline.nodes import deliver_node
+
+    edit_message = AsyncMock(return_value=(True, None))
+    send_message = AsyncMock()
+
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(4242, 77))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.edit_message", new=edit_message), \
+         patch("processor.src.telegram_sender.send_message", new=send_message):
+        result = await deliver_node(_edit_state())
+
+    send_message.assert_not_called()
+    kwargs = edit_message.await_args.kwargs
+    assert kwargs["message_id"] == 4242
+    assert kwargs["chat_id"] == -100500
+    # Telegram adds its own "edited" label, so ours must not be doubled up.
+    assert "✏️" not in kwargs["text"]
+    assert kwargs["reply_markup"] is None
+    assert result["delivery_status"] == "delivered"
+    # Points at the message the reader sees, so the next edit lands on it too.
+    assert result["tg_message_id"] == 4242
+
+
+@pytest.mark.asyncio
+async def test_edit_falls_back_to_a_new_message_when_telegram_refuses():
+    """Too old, deleted, or split in two — the edit must still reach the reader."""
+    from processor.src.pipeline.nodes import deliver_node
+
+    send_message = AsyncMock(return_value=(True, None, None, 999))
+
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(4242, 77))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.edit_message",
+               new=AsyncMock(return_value=(False, "message to edit not found"))), \
+         patch("processor.src.telegram_sender.send_message", new=send_message):
+        result = await deliver_node(_edit_state())
+
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["reply_to_message_id"] == 4242
+    assert "✏️" in kwargs["text"]
+    assert result["delivery_status"] == "delivered"
+    assert result["tg_message_id"] == 999
+
+
+@pytest.mark.asyncio
+async def test_edit_of_a_message_we_never_delivered_is_sent_as_before():
+    """Originals from before this feature (or failed ones) have no Telegram message to edit."""
+    from processor.src.pipeline.nodes import deliver_node
+
+    edit_message = AsyncMock()
+    send_message = AsyncMock(return_value=(True, None, None, 999))
+
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(None, None))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.edit_message", new=edit_message), \
+         patch("processor.src.telegram_sender.send_message", new=send_message):
+        result = await deliver_node(_edit_state())
+
+    edit_message.assert_not_called()
+    assert send_message.await_args.kwargs["reply_to_message_id"] is None
+    assert "✏️" in send_message.await_args.kwargs["text"]
+    assert result["tg_message_id"] == 999
+
+
+@pytest.mark.asyncio
+async def test_editing_a_photo_caption_keeps_the_analyze_button():
+    """Telegram strips the inline keyboard on edit unless it is sent again."""
+    from processor.src.pipeline.nodes import deliver_node
+
+    edit_message = AsyncMock(return_value=(True, None))
+
+    state = _edit_state(message_type="image", media_s3_url="s3://bridge-media/pic.jpg")
+
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(4242, 77))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.edit_message", new=edit_message), \
+         patch("processor.src.telegram_sender.send_message", new=AsyncMock()):
+        result = await deliver_node(state)
+
+    kwargs = edit_message.await_args.kwargs
+    # message_type drives editMessageCaption instead of editMessageText.
+    assert kwargs["message_type"] == "image"
+    assert kwargs["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "analyze:77"
+    assert result["delivery_status"] == "delivered"
+
+
+def test_format_node_keeps_a_mark_free_copy_for_in_place_edits():
+    from processor.src.pipeline.nodes import format_node
+
+    result = format_node(_base_state(is_edited=True))
+
+    assert "✏️" in result["formatted_text"]
+    assert "✏️" not in result["formatted_text_plain"]
+    assert "Alice" in result["formatted_text_plain"]

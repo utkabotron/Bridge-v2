@@ -275,6 +275,22 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
 Перевод пропускается, если текст уже в письменности целевого языка
 (`graph._already_in_target_script`) — смешанный текст всё равно переводится.
 
+Правка в WA (`is_edited`) **редактирует доставленное TG-сообщение**
+(`telegram_sender.edit_message` → `editMessageText` / `editMessageCaption` для медиа),
+метку «edited» рисует сам Telegram. `format_node` отдаёт два текста: `formatted_text`
+(с `✏️ изменено`) и `formatted_text_plain` — второй уходит в edit.
+
+| Случай | Поведение |
+|--------|-----------|
+| Оригинал найден (`db.find_delivered_event`) | edit на месте, `tg_message_id` = оригинала |
+| Telegram отказал (not found / can't be edited / текст > лимита) | fallback: новое сообщение reply + `✏️` |
+| Оригинал не в БД (до фичи, failed, другой чат) | старое поведение |
+| `message is not modified` | считается успехом — иначе вернётся дубль |
+| Медиа | правится caption; `reply_markup` Analyze пересобирается по `event_id` оригинала |
+
+Транскрипт голосового (отдельный reply) правка не трогает. Повторная одинаковая правка
+отбрасывается дедупом wa-service (`<orig>:edit:<hash>`).
+
 Язык — per-pair: `coalesce(cp.target_language, u.target_language)`, NULL = наследовать
 аккаунт. Меняется кнопкой ⚙️ в `/chats`, там же переключатель сводки дня.
 
