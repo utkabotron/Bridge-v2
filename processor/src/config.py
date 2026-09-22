@@ -51,6 +51,12 @@ FAILURE_RATE_WINDOW = int(os.getenv("FAILURE_RATE_WINDOW", 900))
 FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", 0.05))
 FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", 5))
 
+# ── Unpaired chats ──────────────────────────────────────
+# A WhatsApp message from a chat with no active pair used to fall back to the admin's own
+# Telegram chat. Off: every unpaired chat of the admin's number became a firehose into the
+# bot. Set to true to restore the fallback.
+ADMIN_NO_PAIR_FALLBACK = os.getenv("ADMIN_NO_PAIR_FALLBACK", "false").lower() == "true"
+
 # ── Dead-letter queue ───────────────────────────────────
 # Nothing drained the DLQ before; messages that failed during a brief OpenAI or Telegram
 # outage stayed there until someone clicked retry in the dashboard.

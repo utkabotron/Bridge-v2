@@ -22,6 +22,7 @@ from ..config import (
     LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE,
     VOICE_AUTO_TRANSCRIBE, VOICE_TRANSCRIPT_TITLE,
     MEDIA_FAILED_NOTE, EDITED_MARK, OWN_MESSAGE_PREFIX,
+    ADMIN_NO_PAIR_FALLBACK,
 )
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
@@ -78,9 +79,10 @@ async def validate_node(state: MessageState) -> MessageState:
     if not pair:
         logger.warning("No active chat pair for user=%s chat=%s", state["user_id"], state["wa_chat_id"])
 
-        # Fallback to admins only for admin's own WA messages
+        # Fallback to admins only for admin's own WA messages, and only when explicitly
+        # enabled — otherwise an unpaired chat is simply skipped.
         admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
-        if state["user_id"] in admin_ids:
+        if ADMIN_NO_PAIR_FALLBACK and state["user_id"] in admin_ids:
             has_media = bool(state.get("media_s3_url")) or bool(state.get("media_failed"))
             text = state.get("original_text", "").strip()
             lang = "ru"

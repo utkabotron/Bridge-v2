@@ -79,13 +79,31 @@ async def test_validate_node_pair_already_resolved():
 
 
 @pytest.mark.asyncio
-async def test_validate_node_forwards_captionless_media_from_admin_chat():
-    """A caption-less video from an admin's unpaired chat is forwarded, not dropped."""
+async def test_validate_node_skips_unpaired_admin_chat_by_default():
+    """With the fallback off, an unpaired admin chat is skipped — media included."""
     from processor.src.pipeline.nodes import validate_node
 
     state = _base_state(user_id=100, original_text="", message_type="video",
                         media_s3_url="https://s3/bridge-media/vid.mp4")
     with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", False), \
+         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+        result = await validate_node(state)
+
+    assert result.get("fallback_to_admins") is not True
+    assert result["delivery_status"] == "skipped"
+    assert result["error"] == "no_chat_pair"
+
+
+@pytest.mark.asyncio
+async def test_validate_node_forwards_captionless_media_when_fallback_enabled():
+    """With the fallback on, a caption-less video from an admin chat is forwarded."""
+    from processor.src.pipeline.nodes import validate_node
+
+    state = _base_state(user_id=100, original_text="", message_type="video",
+                        media_s3_url="https://s3/bridge-media/vid.mp4")
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
          patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
         result = await validate_node(state)
 
@@ -95,12 +113,13 @@ async def test_validate_node_forwards_captionless_media_from_admin_chat():
 
 @pytest.mark.asyncio
 async def test_validate_node_skips_russian_text_without_media_from_admin_chat():
-    """Russian-only text with no media from an admin chat still gets skipped."""
+    """Even with the fallback on, Russian-only text with no media gets skipped."""
     from processor.src.pipeline.nodes import validate_node
 
     state = _base_state(user_id=100, message_type="text", media_s3_url=None,
                         original_text="привет как дела у тебя сегодня всё хорошо надеюсь")
     with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
          patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
         result = await validate_node(state)
 
@@ -175,8 +194,10 @@ async def test_translate_node_retries_when_model_echoes_source():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
                         original_text="שלום, מה שלומך?")
-    echo = MagicMock(); echo.content = "שלום, מה שלומך?"
-    good = MagicMock(); good.content = "Привет, как дела?"
+    echo = MagicMock()
+    echo.content = "שלום, מה שלומך?"
+    good = MagicMock()
+    good.content = "Привет, как дела?"
     ainvoke = AsyncMock(side_effect=[echo, good])
 
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
@@ -203,7 +224,8 @@ async def test_translate_node_flags_and_skips_cache_on_persistent_passthrough():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
                         original_text="שלום, מה שלומך?")
-    echo = MagicMock(); echo.content = "שלום, מה שלומך?"
+    echo = MagicMock()
+    echo.content = "שלום, מה שלומך?"
     ainvoke = AsyncMock(side_effect=[echo, echo])
 
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
