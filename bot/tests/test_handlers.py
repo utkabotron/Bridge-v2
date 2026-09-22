@@ -446,3 +446,22 @@ async def test_a_failed_button_keeps_the_translation_on_screen():
     query.message.edit_text.assert_not_called()
     assert query.answer.await_args.kwargs.get("show_alert") is True
     assert "❌" in query.answer.await_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_direct_text_quotes_the_source_so_the_buttons_can_find_it():
+    """Without an explicit quote a private chat gets no reply_to_message, and every
+    language button answers 'Send the text again'."""
+    from bot.src.handlers.translate import handle_direct_text
+
+    update = _make_update(user_id=42, text="Привет, как дела")
+    update.message.message_id = 777
+    update.message.reply_text = AsyncMock(return_value=AsyncMock())
+
+    with patch("bot.src.handlers.translate.http_client.post", new=AsyncMock(return_value=_translate_resp())), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await handle_direct_text(update, MagicMock())
+
+    params = update.message.reply_text.call_args.kwargs["reply_parameters"]
+    assert params.message_id == 777
+    assert params.allow_sending_without_reply is True

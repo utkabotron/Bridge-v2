@@ -5,7 +5,7 @@ import logging
 import os
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
 from telegram.error import BadRequest
 from ..utils import http_client
 from telegram.ext import ContextTypes
@@ -96,8 +96,18 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text(render("not_authorized"), parse_mode="Markdown")
         return
 
-    # Phase 1: instant preview with hourglass
-    preview_msg = await msg.reply_text("⏳")
+    # Phase 1: instant preview with hourglass. The quote is not decoration: the language
+    # buttons read the source text back off it, and in a private chat python-telegram-bot
+    # does not quote unless told to — which left every button with nothing to translate.
+    preview_msg = await msg.reply_text(
+        "⏳",
+        reply_parameters=ReplyParameters(
+            message_id=msg.message_id,
+            # A message deleted in the split second before this lands must not cost the
+            # user their translation.
+            allow_sending_without_reply=True,
+        ),
+    )
 
     # Phase 2: the default language, with a button for the other one.
     language = DIRECT_LANGUAGES[DIRECT_LANG_DEFAULT][0]
