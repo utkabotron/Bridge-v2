@@ -179,6 +179,7 @@ services:
       - TARGET_LANGUAGE=${TARGET_LANGUAGE:-Russian}
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
+      - ADMIN_NO_PAIR_FALLBACK=${ADMIN_NO_PAIR_FALLBACK:-false}
       # Media reads are signed now that the bucket is private (src/s3.py).
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}
