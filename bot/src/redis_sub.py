@@ -1,7 +1,8 @@
-"""Redis pub/sub subscriber loop for onboarding QR events.
+"""Redis pub/sub subscriber loop for WhatsApp session events.
 
 Ported from services/bot.py — redis_subscriber_loop().
-Listens to onboarding:qr_scanned:* and notifies users when WA connects.
+Listens to onboarding:qr_scanned:* (WA connected) and wa:disconnected:* (session lost)
+and tells the user either way — a dead session is otherwise silent.
 """
 from __future__ import annotations
 
@@ -19,20 +20,21 @@ logger = logging.getLogger(__name__)
 # Module-level references injected by main.py at startup
 _bot_app = None
 _loop = None
-_pending_events: list[dict] = []
+_pending_events: list[tuple[dict, object]] = []
 
 
-def _dispatch(data: dict) -> None:
-    """Schedule handle_qr_event on the bot loop and LOG any failure — a bare
+def _dispatch(data: dict, handler=None) -> None:
+    """Schedule the handler on the bot loop and LOG any failure — a bare
     run_coroutine_threadsafe drops the returned future, so exceptions inside
     (bad userId, DB down) would otherwise vanish and the user would hang in qr_pending."""
-    fut = asyncio.run_coroutine_threadsafe(handle_qr_event(data), _loop)
+    handler = handler or handle_qr_event
+    fut = asyncio.run_coroutine_threadsafe(handler(data), _loop)
 
     def _log_result(f):
         try:
             f.result()
         except Exception as exc:
-            logger.error("handle_qr_event failed for %s: %s", data.get("userId"), exc)
+            logger.error("%s failed for %s: %s", handler.__name__, data.get("userId"), exc)
 
     fut.add_done_callback(_log_result)
 
@@ -42,9 +44,9 @@ def set_bot_app(app):
     _bot_app = app
     # Drain buffered events that arrived before bot was ready
     if _pending_events and _loop and _loop.is_running():
-        logger.info("Draining %d buffered QR events", len(_pending_events))
-        for evt in _pending_events:
-            _dispatch(evt)
+        logger.info("Draining %d buffered WA events", len(_pending_events))
+        for evt, handler in _pending_events:
+            _dispatch(evt, handler)
         _pending_events.clear()
 
 
@@ -78,7 +80,7 @@ async def handle_qr_event(data: dict) -> None:
         return
     if not _bot_app:
         logger.warning("QR event for user %s but _bot_app not ready, buffering", user_id)
-        _pending_events.append(data)
+        _pending_events.append((data, handle_qr_event))
         return
 
     from .db import set_wa_connected
@@ -109,28 +111,81 @@ async def handle_qr_event(data: dict) -> None:
         logger.error("Failed to notify user %s: %s", user_id, exc)
 
 
+async def handle_wa_disconnected(data: dict) -> None:
+    """Called when a WhatsApp session dies for good (logout, or recovery gave up).
+
+    Nothing used to be sent here, so a user's bridge could sit dead for days while the bot
+    kept answering /start with a cheerful welcome screen.
+    """
+    user_id = data.get("userId")
+    reason = data.get("reason", "unknown")
+
+    if not user_id:
+        logger.warning("Disconnect event missing userId, raw data: %s", data)
+        return
+    if not _bot_app:
+        logger.warning("Disconnect event for user %s but _bot_app not ready, buffering", user_id)
+        _pending_events.append((data, handle_wa_disconnected))
+        return
+
+    logger.info("User %s WA disconnected (reason=%s) — notifying", user_id, reason)
+
+    from .templates.messages import render
+
+    try:
+        await _bot_app.bot.send_message(
+            chat_id=user_id,
+            text=render("wa_disconnected_notice"),
+            parse_mode="Markdown",
+            reply_markup=_miniapp_keyboard(_bot_app.bot.username),
+        )
+    except Exception as exc:
+        logger.error("Failed to notify user %s about disconnect: %s", user_id, exc)
+
+
+def _miniapp_keyboard(bot_username: str):
+    """The notice is only useful if reconnecting is one tap away.
+
+    ?bot= is what the app's "add me to a group" link is built from — same URL /start uses.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+
+    from .onboarding.wizard import MINIAPP_URL
+
+    url = f"{MINIAPP_URL}?bot={bot_username}" if bot_username else MINIAPP_URL
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📱 Open Mini App", web_app=WebAppInfo(url=url))]]
+    )
+
+
 def redis_subscriber_loop():
     """Blocking pub/sub loop — runs in a thread (via asyncio.to_thread)."""
     client = _make_pubsub_redis()
     pubsub = client.pubsub()
 
-    def on_message(message):
-        if message.get("type") != "pmessage":
-            return
-        try:
-            data = json.loads(message["data"])
-            if _loop and _loop.is_running():
-                _dispatch(data)
-            else:
-                logger.warning("No running event loop — buffering QR event for user %s", data.get("userId"))
-                _pending_events.append(data)
-        except Exception as exc:
-            logger.error("QR event handler error: %s", exc)
+    def _make_on_message(handler):
+        def on_message(message):
+            if message.get("type") != "pmessage":
+                return
+            try:
+                data = json.loads(message["data"])
+                if _loop and _loop.is_running():
+                    _dispatch(data, handler)
+                else:
+                    logger.warning("No running event loop — buffering WA event for user %s", data.get("userId"))
+                    _pending_events.append((data, handler))
+            except Exception as exc:
+                logger.error("WA event handler error: %s", exc)
+
+        return on_message
 
     while True:
         try:
-            pubsub.psubscribe(**{"onboarding:qr_scanned:*": on_message})
-            logger.info("Subscribed to onboarding:qr_scanned:*")
+            pubsub.psubscribe(**{
+                "onboarding:qr_scanned:*": _make_on_message(handle_qr_event),
+                "wa:disconnected:*": _make_on_message(handle_wa_disconnected),
+            })
+            logger.info("Subscribed to onboarding:qr_scanned:* and wa:disconnected:*")
             for msg in pubsub.listen():
                 pass  # callbacks handle it
         except redis.exceptions.TimeoutError:

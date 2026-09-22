@@ -6,7 +6,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
-const { publishMessage, publishQrScanned, publishRevoke, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
+const { publishMessage, publishQrScanned, publishRevoke, publishWaDisconnected, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
 const { serializedMsgId } = require('./message-id');
 const { setWaConnected, setWaDisconnected } = require('./db');
@@ -196,6 +196,11 @@ async function reconnectClient(userId, reason) {
     console.error(`All ${RECONNECT_DELAYS.length} fast reconnect attempts exhausted for user ${userId} — handing off to recovery loop.`);
     await setWaDisconnected(userId).catch((err) =>
       console.error(`Failed to set wa_connected=false for user ${userId}: ${err.message}`)
+    );
+    // The recovery loop keeps trying in the background, but from here on the bridge is
+    // down as far as the user is concerned — say so rather than let them discover it.
+    await publishWaDisconnected(userId, reason || 'reconnect_failed').catch((err) =>
+      console.error(`Failed to publish disconnect for user ${userId}: ${err.message}`)
     );
   } finally {
     inProgress.delete(userId);
@@ -647,6 +652,9 @@ async function buildClient(userId) {
       );
       removeSessionDir(userId);
       recoveryState.delete(userId);
+      publishWaDisconnected(userId, 'LOGOUT').catch((err) =>
+        console.error(`Failed to publish disconnect for user ${userId}: ${err.message}`)
+      );
       return;
     }
 

@@ -102,6 +102,65 @@ def expected_clients() -> int:
         return 0
 
 
+@task(name="detect-dropped-sessions")
+def detect_dropped_sessions() -> list[str]:
+    """Alert when a user's wa_connected flips true → false since the last run.
+
+    Every other check here compares against `wa_connected = true`, so a user whose session
+    dies simply leaves the expected count — the outage makes the numbers look *better*.
+    That is how @Ramzeszdes sat disconnected for three days with nothing firing.
+    """
+    logger = get_run_logger()
+    key = "analytics:health:connected_users"
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor()
+        cur.execute(
+            "select tg_user_id, coalesce(tg_username, '') from public.users "
+            "where wa_connected = true and is_active = true"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        logger.error("Could not read connected users: %s", exc)
+        return []
+
+    now = {str(uid): name for uid, name in rows}
+
+    try:
+        r = _redis()
+        previous = r.smembers(key) or set()
+        # Overwrite rather than update: a user who reconnects must leave the set too.
+        pipe = r.pipeline()
+        pipe.delete(key)
+        if now:
+            pipe.sadd(key, *now.keys())
+        pipe.expire(key, 86400)
+        pipe.execute()
+    except Exception as exc:
+        logger.warning("Session-drop tracking unavailable: %s", exc)
+        return []
+
+    # First run after a restart has no baseline — everyone would look "dropped".
+    if not previous:
+        logger.info("No previous snapshot, seeding with %d connected users", len(now))
+        return []
+
+    dropped = sorted(previous - set(now.keys()))
+    if not dropped:
+        return []
+
+    logger.error("WhatsApp session dropped for: %s", ", ".join(dropped))
+    detail = "\n".join(f"• <code>{uid}</code>" for uid in dropped)
+    _alert_once(
+        f"wa_session_dropped:{':'.join(dropped)}",
+        f"⚠️ <b>WhatsApp session lost for {len(dropped)} user(s)</b>\n\n{detail}\n\n"
+        "They have been told in the bot and need to re-scan the QR code.",
+    )
+    return dropped
+
+
 @task(name="evaluate-clients")
 def evaluate_clients(health: dict, expected: int) -> dict:
     """Alert when a user's WhatsApp client is gone, or wa-service lost Redis."""
@@ -333,6 +392,7 @@ def wa_health_check():
     expected = expected_clients()
 
     clients = evaluate_clients(health, expected)
+    dropped = detect_dropped_sessions()
     silence = check_silence(health)
     queues = check_queues()
     metrics = check_processor_metrics()
@@ -341,6 +401,7 @@ def wa_health_check():
 
     return {
         "clients": clients,
+        "dropped_sessions": dropped,
         "silence": silence,
         "queues": queues,
         "metrics": metrics,

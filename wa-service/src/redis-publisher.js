@@ -145,6 +145,20 @@ async function publishQrScanned(userId, event = 'ready') {
 }
 
 /**
+ * Publish a terminal disconnect so the bot can tell the user their bridge is down.
+ * A dead session is silent by nature: messages simply stop arriving, and the user only
+ * finds out by noticing the absence — @Ramzeszdes went three days before complaining.
+ * Bot subscribes to "wa:disconnected:*".
+ */
+async function publishWaDisconnected(userId, reason) {
+  await redis.publish(
+    `wa:disconnected:${userId}`,
+    JSON.stringify({ userId, reason, timestamp: new Date().toISOString() })
+  );
+  console.log(`Published wa_disconnected (${reason}) for user ${userId}`);
+}
+
+/**
  * Cache chat pairs: key = chat_pairs:user:{uid}:chat:{chatId}
  */
 async function getChatPairsCache(userId, chatId) {
@@ -167,4 +181,4 @@ async function setChatPairsCache(userId, chatId, data) {
   }
 }
 
-module.exports = { redis, publishMessage, publishRevoke, publishQrScanned, getChatPairsCache, setChatPairsCache, fallbackDedupId, normalizeMessageId };
+module.exports = { redis, publishMessage, publishRevoke, publishQrScanned, publishWaDisconnected, getChatPairsCache, setChatPairsCache, fallbackDedupId, normalizeMessageId };

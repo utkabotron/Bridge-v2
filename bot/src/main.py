@@ -10,24 +10,27 @@ import os
 import threading
 
 from dotenv import load_dotenv
+
+# Every import below reads env at module import time, so the .env has to be loaded first —
+# these E402s are the point, not an oversight.
 load_dotenv()
 
-from telegram.ext import (
+from telegram.ext import (  # noqa: E402
     Application,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     filters,
-)
+)  # noqa: E402
 
-from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist
-from .handlers.analyze import cb_analyze_media, cb_noop
-from .handlers.translate import handle_direct_media, handle_direct_text
-from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats
-from .handlers.groups import cb_cmd_add, handle_group_message, handle_my_chat_member
-from .onboarding.wizard import cmd_start
-from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop
+from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist  # noqa: E402
+from .handlers.analyze import cb_analyze_media, cb_noop  # noqa: E402
+from .handlers.translate import handle_direct_media, handle_direct_text  # noqa: E402
+from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats  # noqa: E402
+from .handlers.groups import cb_cmd_add, handle_group_message, handle_my_chat_member  # noqa: E402
+from .onboarding.wizard import cmd_start  # noqa: E402
+from .redis_sub import redis_subscriber_loop, set_bot_app, set_event_loop  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,

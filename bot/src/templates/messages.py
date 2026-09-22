@@ -38,6 +38,14 @@ TEMPLATES = {
         "Open the app to link a chat."
     ),
 
+    "wa_disconnected_notice": (
+        "⚠️ *WhatsApp disconnected.*\n\n"
+        "Your bridges have stopped — nothing from WhatsApp will reach Telegram "
+        "until you reconnect.\n\n"
+        "Open the app and tap *Reconnect* to scan a new QR code. "
+        "Your linked chats are kept."
+    ),
+
     # ── /chats ────────────────────────────────────────────
     "chats_empty": (
         "No linked chats.\n\n"

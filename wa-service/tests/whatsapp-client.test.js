@@ -4,6 +4,7 @@ jest.mock('fs');
 jest.mock('../src/redis-publisher', () => ({
   publishMessage: jest.fn(),
   publishQrScanned: jest.fn().mockResolvedValue(),
+  publishWaDisconnected: jest.fn().mockResolvedValue(),
   getChatPairsCache: jest.fn().mockResolvedValue(null),
   setChatPairsCache: jest.fn().mockResolvedValue(),
 }));
@@ -271,6 +272,32 @@ describe('disconnected handler', () => {
     // No reconnect should be scheduled for a terminal LOGOUT.
     jest.advanceTimersByTime(60000);
     expect(mockInitialize).not.toHaveBeenCalled();
+  });
+
+  test('LOGOUT tells the user their bridge is down', async () => {
+    // A dead session is silent — messages just stop. Without this event the user only
+    // finds out by noticing the absence, which took three days the one time it happened.
+    const { publishWaDisconnected } = require('../src/redis-publisher');
+    publishWaDisconnected.mockClear();
+
+    const clientData = await createWhatsAppClient(42);
+    clientData.client.emit('disconnected', 'LOGOUT');
+    await jest.advanceTimersByTimeAsync(0);
+
+    expect(publishWaDisconnected).toHaveBeenCalledWith(42, 'LOGOUT');
+  });
+
+  test('an intentional disconnect stays quiet', async () => {
+    // Pressing "disconnect" in the Mini App is not an outage; a warning there would be noise.
+    const { publishWaDisconnected } = require('../src/redis-publisher');
+    publishWaDisconnected.mockClear();
+
+    const clientData = await createWhatsAppClient(42);
+    clientData.intentionalDestroy = true;
+    clientData.client.emit('disconnected', 'NAVIGATION');
+    await jest.advanceTimersByTimeAsync(0);
+
+    expect(publishWaDisconnected).not.toHaveBeenCalled();
   });
 });
 
