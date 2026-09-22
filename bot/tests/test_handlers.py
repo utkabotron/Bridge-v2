@@ -283,3 +283,166 @@ async def test_handle_direct_text_no_message():
     ctx = MagicMock()
 
     await handle_direct_text(update, ctx)  # must not raise
+
+
+# ── Direct translation: language buttons ───────────────────
+
+def _translate_resp(translated="שלום", language="Hebrew", ms=150):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "translated": translated,
+        "target_language": language,
+        "translation_ms": ms,
+    }
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_direct_text_answers_in_hebrew_with_an_english_button():
+    """Russian is what gets typed, so the profile language (Russian by default) is no use."""
+    from bot.src.handlers.translate import handle_direct_text
+
+    preview_msg = AsyncMock()
+    update = _make_update(user_id=42, text="Привет, когда встречаемся?")
+    update.message.reply_text = AsyncMock(return_value=preview_msg)
+
+    post = AsyncMock(return_value=_translate_resp())
+    with patch("bot.src.handlers.translate.http_client.post", new=post), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await handle_direct_text(update, MagicMock())
+
+    assert post.await_args.kwargs["json"]["target_language"] == "Hebrew"
+
+    kwargs = preview_msg.edit_text.call_args.kwargs
+    text = preview_msg.edit_text.call_args[0][0]
+    # Tapping the monospace block copies the translation and nothing else.
+    assert "<code>שלום</code>" in text
+    assert "150ms" in text
+
+    buttons = kwargs["reply_markup"].inline_keyboard[0]
+    labels = [b.text for b in buttons]
+    assert "✓ עברית" in labels
+    assert "English" in labels
+    # The language already on screen is inert; the other one retranslates.
+    assert [b.callback_data for b in buttons] == ["noop", "tr:en"]
+
+
+@pytest.mark.asyncio
+async def test_language_button_retranslates_the_message_it_replies_to():
+    from bot.src.handlers.translate import cb_translate_lang
+
+    query = AsyncMock()
+    query.data = "tr:en"
+    query.from_user.id = 42
+    query.message = AsyncMock()
+    query.message.reply_to_message.text = "Привет, когда встречаемся?"
+
+    update = MagicMock()
+    update.callback_query = query
+
+    post = AsyncMock(return_value=_translate_resp("Hi, when are we meeting?", "English", 120))
+    with patch("bot.src.handlers.translate.http_client.post", new=post), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await cb_translate_lang(update, MagicMock())
+
+    sent = post.await_args.kwargs["json"]
+    assert sent["target_language"] == "English"
+    # The source text comes off the replied-to message, so a restart does not break it.
+    assert sent["text"] == "Привет, когда встречаемся?"
+
+    kwargs = query.message.edit_text.call_args.kwargs
+    assert "Hi, when are we meeting?" in query.message.edit_text.call_args[0][0]
+    assert [b.callback_data for b in kwargs["reply_markup"].inline_keyboard[0]] == ["tr:he", "noop"]
+
+
+@pytest.mark.asyncio
+async def test_language_button_without_the_original_text_asks_for_it_again():
+    from bot.src.handlers.translate import cb_translate_lang
+
+    query = AsyncMock()
+    query.data = "tr:en"
+    query.from_user.id = 42
+    query.message = AsyncMock()
+    query.message.reply_to_message = None
+
+    update = MagicMock()
+    update.callback_query = query
+
+    post = AsyncMock()
+    with patch("bot.src.handlers.translate.http_client.post", new=post), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await cb_translate_lang(update, MagicMock())
+
+    post.assert_not_called()
+    query.answer.assert_awaited_once()
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_language_button_is_whitelist_gated():
+    """The button costs an LLM call, so a stranger must not be able to press it."""
+    from bot.src.handlers.translate import cb_translate_lang
+
+    query = AsyncMock()
+    query.data = "tr:en"
+    query.from_user.id = 999
+    query.message = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = query
+
+    post = AsyncMock()
+    with patch("bot.src.handlers.translate.http_client.post", new=post), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=False)):
+        await cb_translate_lang(update, MagicMock())
+
+    post.assert_not_called()
+    query.message.edit_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_direct_text_failure_leaves_no_buttons():
+    from bot.src.handlers.translate import handle_direct_text
+
+    preview_msg = AsyncMock()
+    update = _make_update(user_id=42, text="Привет")
+    update.message.reply_text = AsyncMock(return_value=preview_msg)
+
+    resp = MagicMock()
+    resp.status_code = 500
+    resp.text = "Internal Server Error"
+
+    with patch("bot.src.handlers.translate.http_client.post", new=AsyncMock(return_value=resp)), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await handle_direct_text(update, MagicMock())
+
+    assert "❌" in preview_msg.edit_text.call_args[0][0]
+    assert "reply_markup" not in preview_msg.edit_text.call_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_a_failed_button_keeps_the_translation_on_screen():
+    """Rewriting the message with an error would cost both the text and the buttons."""
+    from bot.src.handlers.translate import cb_translate_lang
+
+    query = AsyncMock()
+    query.data = "tr:en"
+    query.from_user.id = 42
+    query.message = AsyncMock()
+    query.message.reply_to_message.text = "Привет"
+
+    update = MagicMock()
+    update.callback_query = query
+
+    resp = MagicMock()
+    resp.status_code = 503
+    resp.text = "Translation is temporarily disabled"
+
+    with patch("bot.src.handlers.translate.http_client.post", new=AsyncMock(return_value=resp)), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await cb_translate_lang(update, MagicMock())
+
+    query.message.edit_text.assert_not_called()
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+    assert "❌" in query.answer.await_args[0][0]

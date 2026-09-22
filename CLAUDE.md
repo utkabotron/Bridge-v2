@@ -111,7 +111,8 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `bot/src/redis_sub.py` — daemon thread pub/sub (buffers events until bot ready)
 - `bot/src/utils/http_client.py` — shared httpx.AsyncClient + retry (1x, 2s delay)
 - `bot/src/onboarding/wizard.py` — /start + 5-step onboarding
-- `bot/src/handlers/translate.py` — direct text translation + media analysis in DM
+- `bot/src/handlers/translate.py` — DM: перевод текста (кнопки иврит/английский) + анализ медиа
+- `bot/src/config.py` — константы бота (`DIRECT_LANGUAGES`, `DIRECT_LANG_DEFAULT`)
 - `bot/src/handlers/analyze.py` — "Analyze" button callback
 - `bot/src/handlers/chats.py` — /chats, /add, /pause, /resume, /done
 - `bot/src/handlers/admin.py` — /users, /broadcast, /whitelist
@@ -290,6 +291,24 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
 
 Транскрипт голосового (отдельный reply) правка не трогает. Повторная одинаковая правка
 отбрасывается дедупом wa-service (`<orig>:edit:<hash>`).
+
+## DM-ПЕРЕВОД
+
+Текст боту в личку → перевод на иврит + инлайн-кнопки выбора языка
+(`handlers/translate.py`). Перевод в `<code>` — тап копирует его целиком, служебная
+строка `ms · язык` вне блока.
+
+| Правило | Причина |
+|---------|---------|
+| Дефолт — `DIRECT_LANG_DEFAULT` (иврит), НЕ профиль | `users.target_language` по умолчанию `Russian` = язык ввода |
+| Активная кнопка → `callback_data="noop"` | нечего переводить заново, переиспользует `cb_noop` |
+| Исходник берётся из `query.message.reply_to_message` | кнопка работает после рестарта бота, ничего не в памяти |
+| Ошибка по кнопке → алерт, сообщение не трогаем | иначе теряется и перевод, и кнопки |
+| Callback под whitelist | тап стоит вызова LLM |
+
+Языки — `bot/src/config.py:DIRECT_LANGUAGES`, добавление языка = одна строка там
+(pattern хендлера `^tr:[a-z]{2}$` менять не надо). Processor `/translate` уже принимает
+`target_language`, менять его не требуется.
 
 Язык — per-pair: `coalesce(cp.target_language, u.target_language)`, NULL = наследовать
 аккаунт. Меняется кнопкой ⚙️ в `/chats`, там же переключатель сводки дня.
