@@ -7,8 +7,9 @@
  * undefined`. Messages still flowed — they just lost their real id and fell back to a
  * content hash, which breaks reply threading and revoke/edit matching.
  *
- * Chat and contact ids (Wid) are a different class and keep `_serialized`; only message
- * keys (MsgKey) are affected, so this is deliberately message-only.
+ * Chat and contact ids (Wid) are a different class. They kept `_serialized` on the
+ * models whatsapp-web.js hands us, but the raw Store models lost it too (2026-09), which
+ * is why `serializedWid` exists for anything read straight off the Store.
  */
 function serializedMsgId(messageOrId) {
   const id = messageOrId?.id ?? messageOrId;
@@ -41,4 +42,29 @@ function serializedMsgId(messageOrId) {
   return null;
 }
 
-module.exports = { serializedMsgId };
+/**
+ * Resolve a chat/contact id (Wid) to `user@server`. Same minifier drift as above:
+ * `_serialized` first, then a string `$`-alias, then the parts, which keep their names.
+ */
+function serializedWid(wid) {
+  if (!wid) return null;
+  if (typeof wid === 'string') return wid;
+  if (typeof wid !== 'object') return null;
+
+  if (typeof wid._serialized === 'string') return wid._serialized;
+
+  for (const key of Object.keys(wid)) {
+    if (key.startsWith('$') && typeof wid[key] === 'string' && wid[key].includes('@')) {
+      return wid[key];
+    }
+  }
+
+  if (typeof wid.user === 'string' && typeof wid.server === 'string') {
+    return `${wid.user}@${wid.server}`;
+  }
+
+  const asString = typeof wid.toString === 'function' ? wid.toString() : '';
+  return asString.includes('@') && !asString.includes('[object') ? asString : null;
+}
+
+module.exports = { serializedMsgId, serializedWid };

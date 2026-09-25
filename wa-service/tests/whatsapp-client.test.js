@@ -712,6 +712,126 @@ describe('liveness tracking', () => {
   });
 });
 
+// ── Chat resolution without getChatModel ─────────────────
+
+describe('chat resolution', () => {
+  // An earlier describe resets the module registry, so the top-level `clients` map is
+  // not the one these tests fill — clear the live instance ourselves.
+  afterEach(() => {
+    const mod = require('../src/whatsapp-client');
+    mod.clients.clear();
+    mod.inProgress.clear();
+    mod.recoveryState.clear();
+  });
+  const emitAndFlush = async (client, message) => {
+    client.emit('message', message);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+  };
+  const baseMessage = (over = {}) => ({
+    id: { _serialized: 'false_123@g.us_m1_9@lid', remote: '123@g.us' },
+    from: '123@g.us',
+    timestamp: Math.floor(Date.now() / 1000),
+    type: 'chat',
+    body: 'hi',
+    // The library call is broken in production — it must never be needed.
+    getChat: jest.fn().mockRejectedValue(new Error('r')),
+    getContact: jest.fn().mockResolvedValue({ pushname: 'A' }),
+    _data: { notifyName: 'Sender Push Name' },
+    ...over,
+  });
+
+  test('reads id and title off the Store instead of message.getChat()', async () => {
+    const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    await createWhatsAppClient(42);
+    const client = clients.get(42).client;
+    client.pupPage = {
+      evaluate: jest.fn().mockResolvedValue({ id: '123@g.us', name: 'Parents 1A' }),
+    };
+    const message = baseMessage();
+    await emitAndFlush(client, message);
+
+    expect(client.pupPage.evaluate).toHaveBeenCalledWith(expect.any(Function), '123@g.us');
+    expect(message.getChat).not.toHaveBeenCalled();
+    expect(publishMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ wa_chat_id: '123@g.us', wa_chat_name: 'Parents 1A' })
+    );
+  });
+
+  test('falls back to the chat id from the key, never the sender name, when the Store read fails', async () => {
+    const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    await createWhatsAppClient(43);
+    const client = clients.get(43).client;
+    client.pupPage = { evaluate: jest.fn().mockRejectedValue(new Error('r')) };
+    await emitAndFlush(client, baseMessage());
+
+    expect(publishMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ wa_chat_id: '123@g.us', wa_chat_name: '' })
+    );
+  });
+
+  test('a chat missing from the Store still forwards the message', async () => {
+    const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    await createWhatsAppClient(44);
+    const client = clients.get(44).client;
+    client.pupPage = { evaluate: jest.fn().mockResolvedValue(null) };
+    await emitAndFlush(client, baseMessage({ id: { _serialized: 'false_5@c.us_m2' }, from: '5@c.us' }));
+
+    expect(publishMessage).toHaveBeenCalledWith(expect.objectContaining({ wa_chat_id: '5@c.us' }));
+  });
+
+  test('rebuilds the quote from raw data when getQuotedMessage breaks', async () => {
+    const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    await createWhatsAppClient(45);
+    const client = clients.get(45).client;
+    client.pupPage = { evaluate: jest.fn().mockResolvedValue({ id: '123@g.us', name: 'G' }) };
+    await emitAndFlush(client, baseMessage({
+      hasQuotedMsg: true,
+      getQuotedMessage: jest.fn().mockRejectedValue(new Error('r')),
+      _data: {
+        quotedStanzaID: 'ABC123',
+        quotedParticipant: { user: '777', server: 'lid' },
+        quotedMsg: { body: 'original text' },
+      },
+    }));
+
+    expect(publishMessage).toHaveBeenCalledWith(expect.objectContaining({
+      quoted: { wa_message_id: '123@g.us_ABC123_777@lid', body: 'original text', sender: null },
+    }));
+  });
+});
+
+describe('resolveChatLite', () => {
+  test('rejects without a page instead of hanging', async () => {
+    const { resolveChatLite } = require('../src/whatsapp-client');
+    await expect(resolveChatLite({}, '1@g.us')).rejects.toThrow('pupPage unavailable');
+  });
+});
+
+describe('serializedWid', () => {
+  const { serializedWid } = require('../src/message-id');
+  test('handles every shape the Store has used', () => {
+    expect(serializedWid('1@c.us')).toBe('1@c.us');
+    expect(serializedWid({ _serialized: '1@c.us' })).toBe('1@c.us');
+    expect(serializedWid({ $1: '1@c.us', user: '1', server: 'c.us' })).toBe('1@c.us');
+    expect(serializedWid({ $1: {}, user: '1', server: 'c.us' })).toBe('1@c.us');
+    expect(serializedWid({ $1: {} })).toBeNull();
+    expect(serializedWid(null)).toBeNull();
+  });
+});
+
 describe('connecting lock', () => {
   test('is released when building the client throws', async () => {
     const { createWhatsAppClient, connecting, clients } = require('../src/whatsapp-client');

@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { publishMessage, publishQrScanned, publishRevoke, publishWaDisconnected, getChatPairsCache, setChatPairsCache } = require('./redis-publisher');
 const { handleMedia } = require('./media-handler');
-const { serializedMsgId } = require('./message-id');
+const { serializedMsgId, serializedWid } = require('./message-id');
 const { setWaConnected, setWaDisconnected } = require('./db');
 
 /** Reject with a labelled error if `promise` outlives `ms`. */
@@ -267,6 +267,75 @@ async function getGroupsLite(client) {
       }))
       .sort((a, b) => b.lastActivity - a.lastActivity);
   });
+}
+
+// ── Per-message chat resolution ───────────────────────────
+// message.getChat() runs through WWebJS.getChatModel(), which for groups calls
+// createWid(chat.id._serialized) and GroupMetadata.update(). Since WhatsApp dropped
+// `_serialized` from the Store's Wid objects (2026-09) that throws a bare 'r' on nearly
+// every group message, and the fallback stamped the sender's push name as the chat name.
+// The handler only needs an id and a title — read them off the chat collection, the way
+// getGroupsLite does, and never touch the metadata machinery.
+async function resolveChatLite(client, chatId) {
+  const page = client?.pupPage;
+  if (!page) throw new Error('pupPage unavailable');
+  return page.evaluate((chatId) => {
+    const tryRequire = (name) => {
+      try {
+        return window.require(name);
+      } catch {
+        return null;
+      }
+    };
+    // Mirror of serializedWid() — functions do not cross the puppeteer boundary.
+    const widToString = (wid) => {
+      if (!wid) return null;
+      if (typeof wid === 'string') return wid;
+      if (typeof wid._serialized === 'string') return wid._serialized;
+      for (const key of Object.keys(wid)) {
+        if (key.startsWith('$') && typeof wid[key] === 'string' && wid[key].includes('@')) {
+          return wid[key];
+        }
+      }
+      if (typeof wid.user === 'string' && typeof wid.server === 'string') {
+        return `${wid.user}@${wid.server}`;
+      }
+      return null;
+    };
+
+    const collections = window.Store || tryRequire('WAWebCollections');
+    const Chat = collections?.Chat;
+    if (!Chat?.get) {
+      throw new Error(`chat collection unavailable (store=${typeof window.Store})`);
+    }
+    const WidFactory = window.Store?.WidFactory || tryRequire('WAWebWidFactory');
+
+    let chat = null;
+    try {
+      chat = WidFactory?.createWid ? Chat.get(WidFactory.createWid(chatId)) : null;
+    } catch {
+      chat = null;
+    }
+    if (!chat) {
+      try {
+        chat = Chat.get(chatId) || null;
+      } catch {
+        chat = null;
+      }
+    }
+    if (!chat) return null;
+
+    let id = widToString(chat.id) || chatId;
+    // A 1:1 chat can be addressed by the peer's @lid while the pair was saved as @c.us.
+    // The contact carries the phone-number wid; prefer it so the pair still matches.
+    if (id.endsWith('@lid')) {
+      const pn = widToString(chat.contact?.phoneNumber);
+      if (pn && pn.endsWith('@c.us')) id = pn;
+    }
+    const name = chat.name || chat.formattedTitle || chat.contact?.name
+      || chat.contact?.pushname || '';
+    return { id, name: typeof name === 'string' ? name : '' };
+  }, chatId);
 }
 
 // Full model first (it carries participant counts); fall back to the lightweight read
@@ -788,23 +857,34 @@ async function handleIncomingMessage(userId, message, isEdited) {
     console.warn(`Message ${safeId} has no timestamp — forwarding (relying on dedup)`);
   }
 
-  let chatId, chatName;
-  if (message.from?.includes('@newsletter')) {
-    // Newsletter chats break getChat() in whatsapp-web.js — skip the call
-    chatId = message.from;
-    chatName = message._data?.subject || message._data?.notifyName || '';
-  } else {
+  // The chat this message belongs to. `id.remote` is the chat for both directions;
+  // `from` is what whatsapp-web.js exposes when the key did not survive serialization.
+  const lookupId = (typeof message.id?.remote === 'string' && message.id.remote)
+    || serializedWid(message.id?.remote)
+    || message.from;
+  // Without the chat model the only name on the message is the SENDER's push name —
+  // wrong for a group, so leave it empty rather than mislabel the chat.
+  const fallbackName = message._data?.subject || '';
+
+  let chatId = lookupId;
+  let chatName = fallbackName;
+  if (!lookupId?.includes('@newsletter')) {
     try {
-      // Bounded: these reach into WA's Store, and when it degrades they hang until the
+      // Bounded: this reaches into WA's Store, and when it degrades it hangs until the
       // 120s protocol timeout. Unbounded, parallel hangs pile up holding whole messages
-      // in memory while delivery stalls; the fallback below is cheap and correct.
-      const chat = await withTimeout(message.getChat(), 'getChat', config.GET_CHAT_TIMEOUT);
-      chatId = chat.id._serialized;
-      chatName = chat.name;
+      // in memory while delivery stalls; the fallback is cheap and correct.
+      const client = message.client || clients.get(userId)?.client;
+      const chat = await withTimeout(
+        resolveChatLite(client, lookupId), 'resolveChat', config.GET_CHAT_TIMEOUT
+      );
+      if (chat?.id) {
+        chatId = chat.id;
+        chatName = chat.name || fallbackName;
+      } else {
+        console.warn(`Chat ${lookupId} not in Store for message ${safeId} — using fallback`);
+      }
     } catch (err) {
-      console.warn(`getChat() failed for message ${safeId}: ${err.message} — using fallback`);
-      chatId = message.from;
-      chatName = message._data?.subject || message._data?.notifyName || '';
+      console.warn(`resolveChat failed for message ${safeId}: ${err.message} — using fallback`);
     }
   }
 
@@ -903,7 +983,25 @@ async function handleIncomingMessage(userId, message, isEdited) {
         sender: q?._data?.notifyName || null,
       };
     } catch (err) {
-      console.warn(`getQuotedMessage failed for ${safeId}: ${err.message}`);
+      // The raw message already carries the quote's key and body; the library call
+      // only adds the sender's push name. Without this the reply arrived with no
+      // thread at all whenever the Store call broke.
+      const d = message._data || {};
+      const stanza = typeof d.quotedStanzaID === 'string' ? d.quotedStanzaID : null;
+      if (stanza) {
+        const participant = serializedWid(d.quotedParticipant);
+        const parts = [chatId, stanza];
+        if ((chatId || '').endsWith('@g.us') && participant) parts.push(participant);
+        quoted = {
+          wa_message_id: parts.join('_'),
+          body: (d.quotedMsg?.body || d.quotedMsg?.caption || '').slice(0, 120),
+          sender: null,
+        };
+      }
+      console.warn(
+        `getQuotedMessage failed for ${safeId}: ${err.message}`
+        + (quoted ? ' — rebuilt from raw data' : '')
+      );
     }
   }
 
@@ -1043,6 +1141,7 @@ module.exports = {
   clients,
   connecting,
   getGroups,
+  resolveChatLite,
   createWhatsAppClient,
   restoreExistingSessions,
   destroyAllClients,
