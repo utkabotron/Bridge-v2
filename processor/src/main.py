@@ -31,6 +31,8 @@ from .config import (
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
     FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
     FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
+    TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
+    OPENAI_BILLING_URL,
     COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE, REVOKE_NOTE,
 )
 from .pipeline.events import emit, subscribe, unsubscribe
@@ -293,6 +295,73 @@ def _track_delivery(failed: bool) -> None:
     # reset flag when window clears (allow re-alerting next window)
     if _failure_rate_alert_sent and failed_count == 0:
         _failure_rate_alert_sent = False
+
+# ── Translation failure alert ─────────────────────────────
+# An untranslated message still counts as delivered, so the failure-rate alert never saw
+# it: on 30.09 the OpenAI balance ran out and every message went untranslated for 12h
+# without a word to the admins.
+_translation_fail_times: deque = deque()
+_last_translation_alert: float | None = None
+
+
+def _is_quota_error(error: str) -> bool:
+    e = error.lower()
+    return "insufficient_quota" in e or "no credits" in e or "exceeded your current quota" in e
+
+
+async def _alert_admins_translation(failed: int, error: str) -> None:
+    """Tell admins messages are going out untranslated, and why."""
+    from html import escape
+    from .feature_flags import is_enabled
+    if not await is_enabled("admin_alerts_enabled"):
+        return
+    import httpx as _httpx
+    from .telegram_sender import BOT_TOKEN
+    if not BOT_TOKEN or not ADMIN_TG_IDS:
+        return
+    if _is_quota_error(error):
+        text = (
+            "\U0001F4B3 <b>OpenAI credits ran out</b>\n\n"
+            "Messages are delivered untranslated; media analysis, voice transcripts "
+            "and DM translation are down too.\n"
+            f"Top up: {OPENAI_BILLING_URL}"
+        )
+    else:
+        text = (
+            "⚠️ <b>Translation is failing</b>\n\n"
+            f"{failed} messages in the last {TRANSLATION_FAIL_WINDOW // 60} min "
+            "were delivered untranslated.\n"
+            f"<code>{escape(error[:300])}</code>"
+        )
+    async with _httpx.AsyncClient(timeout=10) as client:
+        for admin_id in ADMIN_TG_IDS:
+            try:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML",
+                          "disable_web_page_preview": True},
+                )
+            except Exception as exc:
+                logger.error("Failed to send translation alert to admin %s: %s", admin_id, exc)
+
+
+def _track_translation_failure(error: str) -> None:
+    """Record an untranslated delivery and alert admins once per cooldown."""
+    global _last_translation_alert
+    now = time.monotonic()
+    _translation_fail_times.append(now)
+    while _translation_fail_times and _translation_fail_times[0] < now - TRANSLATION_FAIL_WINDOW:
+        _translation_fail_times.popleft()
+    if not _is_quota_error(error) and len(_translation_fail_times) < TRANSLATION_FAIL_THRESHOLD:
+        return
+    if _last_translation_alert is not None and now - _last_translation_alert < TRANSLATION_ALERT_COOLDOWN:
+        return
+    _last_translation_alert = now
+    logger.critical(
+        "Translation failing (%d in window): %s — alerting admins",
+        len(_translation_fail_times), error[:200],
+    )
+    asyncio.create_task(_alert_admins_translation(len(_translation_fail_times), error))
 
 # ── SSE stream ───────────────────────────────────────────
 
@@ -1188,6 +1257,8 @@ async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_i
                 "cache_hit": final_state.get("cache_hit"),
             })
             _track_delivery(failed=False)
+            if final_state.get("translation_failed"):
+                _track_translation_failure(final_state.get("translation_error") or "")
             logger.info(
                 "Delivered %s (lang=%s, cache=%s, ms=%s)",
                 wa_message_id,

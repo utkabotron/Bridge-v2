@@ -212,6 +212,7 @@ async def translate_node(state: MessageState) -> MessageState:
             "translation_ms": translation_ms,
             "cache_hit": False,
             "translation_failed": True,
+            "translation_error": str(exc)[:500],
         }
 
     translated = response.content.strip()

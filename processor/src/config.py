@@ -50,6 +50,12 @@ UNAUTH_THRESHOLD = int(os.getenv("UNAUTH_THRESHOLD", 3))
 FAILURE_RATE_WINDOW = int(os.getenv("FAILURE_RATE_WINDOW", 900))
 FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", 0.05))
 FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", 5))
+# Untranslated deliveries in a window before admins hear about it. An exhausted OpenAI
+# balance alerts on the first one — it never heals by itself.
+TRANSLATION_FAIL_WINDOW = int(os.getenv("TRANSLATION_FAIL_WINDOW", 900))
+TRANSLATION_FAIL_THRESHOLD = int(os.getenv("TRANSLATION_FAIL_THRESHOLD", 3))
+TRANSLATION_ALERT_COOLDOWN = int(os.getenv("TRANSLATION_ALERT_COOLDOWN", 3600))
+OPENAI_BILLING_URL = "https://platform.openai.com/settings/organization/billing"
 
 # ── Unpaired chats ──────────────────────────────────────
 # A WhatsApp message from a chat with no active pair used to fall back to the admin's own

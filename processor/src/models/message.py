@@ -42,6 +42,8 @@ class MessageState(TypedDict):
     cache_hit: bool
     # True when the LLM was unreachable and the original was delivered untranslated.
     translation_failed: bool
+    # Why it failed (the LLM exception text) — tells an outage from an empty balance.
+    translation_error: Optional[str]
 
     # Set by format node
     formatted_text: Optional[str]

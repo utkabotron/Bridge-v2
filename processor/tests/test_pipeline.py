@@ -411,8 +411,56 @@ async def test_translate_node_degrades_when_llm_fails():
         result = await translate_node(_base_state(chat_pair_id=None))
 
     assert result["translation_failed"] is True
+    assert result["translation_error"] == "openai unavailable"
     assert result["translated_text"] == ""
     assert result["original_text"] == _base_state()["original_text"]  # nothing lost
+
+
+@pytest.fixture
+def translation_alerts():
+    """Fresh alert state, with the Telegram send replaced by a mock."""
+    import processor.src.main as main
+
+    main._translation_fail_times.clear()
+    main._last_translation_alert = None
+    with patch("processor.src.main._alert_admins_translation", new=AsyncMock()) as alert:
+        yield main, alert
+    main._translation_fail_times.clear()
+    main._last_translation_alert = None
+
+
+QUOTA_ERROR = ("Error code: 429 - {'error': {'message': 'You have no credits remaining.', "
+               "'code': 'insufficient_quota'}}")
+
+
+@pytest.mark.asyncio
+async def test_empty_openai_balance_alerts_on_the_first_untranslated_message(translation_alerts):
+    """On 30.09 the balance ran out and messages went untranslated for 12h unnoticed."""
+    import asyncio
+    main, alert = translation_alerts
+
+    main._track_translation_failure(QUOTA_ERROR)
+    main._track_translation_failure(QUOTA_ERROR)  # within cooldown — no second alert
+    await asyncio.sleep(0)
+
+    alert.assert_awaited_once()
+    assert alert.await_args.args[1] == QUOTA_ERROR
+
+
+@pytest.mark.asyncio
+async def test_a_transient_translation_error_alerts_only_past_the_threshold(translation_alerts):
+    import asyncio
+    from processor.src.config import TRANSLATION_FAIL_THRESHOLD
+    main, alert = translation_alerts
+
+    for _ in range(TRANSLATION_FAIL_THRESHOLD - 1):
+        main._track_translation_failure("Request timed out.")
+    await asyncio.sleep(0)
+    alert.assert_not_awaited()
+
+    main._track_translation_failure("Request timed out.")
+    await asyncio.sleep(0)
+    alert.assert_awaited_once()
 
 
 def test_format_node_marks_an_untranslated_message():
