@@ -47,6 +47,13 @@ module.exports = {
   // Upper bound per client during shutdown; Docker's default stop grace is 10s total.
   DESTROY_TIMEOUT: parseInt(process.env.DESTROY_TIMEOUT) || 8000,
   OLD_MESSAGE_THRESHOLD: parseInt(process.env.OLD_MESSAGE_THRESHOLD) || 120,
+  // WhatsApp's own service records, not something a person wrote. An e2e_notification
+  // ("security code changed") reached Telegram as a bare "143503497625799@lid" and cost
+  // an LLM call each time.
+  IGNORED_MESSAGE_TYPES: new Set([
+    'e2e_notification', 'notification', 'notification_template', 'gp2',
+    'call_log', 'protocol', 'message_history_notice',
+  ]),
   PUPPETEER_PROTOCOL_TIMEOUT: parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT) || 120000,
   SESSION_RESTORE_BATCH_DELAY: parseInt(process.env.SESSION_RESTORE_BATCH_DELAY) || 1000,
 

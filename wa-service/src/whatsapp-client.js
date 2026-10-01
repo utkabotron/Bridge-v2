@@ -50,6 +50,7 @@ const HEALTH_CHECK_INTERVAL = config.HEALTH_CHECK_INTERVAL;
 const HEALTH_CHECK_TIMEOUT = config.HEALTH_CHECK_TIMEOUT;
 const MAX_MESSAGE_ERRORS = config.MAX_MESSAGE_ERRORS;
 const OLD_MESSAGE_THRESHOLD = config.OLD_MESSAGE_THRESHOLD;
+const IGNORED_MESSAGE_TYPES = config.IGNORED_MESSAGE_TYPES;
 const INIT_STUCK_TIMEOUT = config.INIT_STUCK_TIMEOUT;
 const SYNC_STUCK_TIMEOUT = config.SYNC_STUCK_TIMEOUT;
 const DESTROY_TIMEOUT = config.DESTROY_TIMEOUT;
@@ -841,6 +842,8 @@ function parseVCards(body, vcardList) {
 
 async function handleIncomingMessage(userId, message, isEdited) {
   const safeId = safeMessageId(message);
+
+  if (IGNORED_MESSAGE_TYPES.has(message.type)) return;
 
   // Skip old messages (e.g. after session restore). Edits carry the ORIGINAL timestamp,
   // so never age-filter them. A missing timestamp (same session-drift mode that drops

@@ -776,6 +776,21 @@ describe('chat resolution', () => {
     );
   });
 
+  test('drops WhatsApp service records like a security-code change', async () => {
+    const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
+    const { publishMessage } = require('../src/redis-publisher');
+    publishMessage.mockResolvedValue();
+
+    await createWhatsAppClient(46);
+    const client = clients.get(46).client;
+    client.pupPage = { evaluate: jest.fn().mockResolvedValue({ id: '123@g.us', name: 'G' }) };
+    await emitAndFlush(client, baseMessage({ type: 'e2e_notification', body: '143503497625799@lid' }));
+    await emitAndFlush(client, baseMessage({ type: 'notification_template', body: '' }));
+
+    expect(publishMessage).not.toHaveBeenCalled();
+    expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+  });
+
   test('a chat missing from the Store still forwards the message', async () => {
     const { createWhatsAppClient, clients } = require('../src/whatsapp-client');
     const { publishMessage } = require('../src/redis-publisher');
