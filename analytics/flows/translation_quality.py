@@ -407,27 +407,30 @@ Issue patterns found across {len(evaluations)} samples:
 Worst translation examples (original → translated):
 {json.dumps(worst_examples, indent=2, ensure_ascii=False)}"""
 
-    response = client.chat.completions.create(
-        model=EVAL_MODEL,
-        messages=[
+    # Same path as the judge: EVAL_MODEL is a reasoning model that rejects `temperature` and
+    # `max_tokens`, and a nightly call has no reason to skip the Flex tier.
+    response = llm.complete(client, llm.build_request(
+        EVAL_MODEL,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         max_tokens=4000,
-        temperature=0,
-    )
+    ), log=logger)
 
-    content = response.choices[0].message.content.strip()
+    content = (response.choices[0].message.content or "").strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
     suggestions = json.loads(content)
-    tokens = response.usage.total_tokens if response.usage else 0
+    tokens = llm.total_tokens(response.usage)
+    cost = llm.usage_cost(EVAL_MODEL, response.usage)
 
-    logger.info("Generated %d prompt suggestions (tokens: %d)", len(suggestions), tokens)
+    logger.info("Generated %d prompt suggestions (tokens: %d, cost $%.3f)", len(suggestions), tokens, cost)
     return {
         "suggestions": suggestions,
         "tokens_used": tokens,
+        "cost_usd": cost,
         "avg_scores": avg_scores,
         "issue_counts": issue_counts,
         "worst_examples": worst_examples,
@@ -449,8 +452,8 @@ def store_quality_results(
     cur = conn.cursor()
 
     total_tokens = eval_result.get("tokens_used", 0) + suggestion_result.get("tokens_used", 0)
-    # Judge cost is measured; the (normally disabled) suggestion call is a rough add-on.
-    cost = eval_result.get("cost_usd", 0.0) + suggestion_result.get("tokens_used", 0) * 0.001 / 1000
+    # Both calls report their own measured cost (llm.usage_cost); the suggestion one is 0 while disabled.
+    cost = eval_result.get("cost_usd", 0.0) + suggestion_result.get("cost_usd", 0.0)
 
     summary = {
         "samples_evaluated": len(eval_result.get("evaluations", [])),
