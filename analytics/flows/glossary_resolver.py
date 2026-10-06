@@ -174,8 +174,10 @@ municipal or Ministry of Education lists — and follow it.
 A name is a school, kindergarten, street, neighbourhood, city, park, venue, organisation,
 company, brand, app or programme. An everyday word (class, round, after-school, club,
 homework, a holiday greeting) is NOT a name: set is_name to false.
-translation: in {target_lang} script, following the official pronunciation (for Russian,
-Israeli-Russian conventions: ח/כ → х, צ → ц; e.g. Givolim → Гиволим, Ofek → Офек).
+translation: the NAME as it sounds, in {target_lang} script, following the official
+pronunciation (for Russian, Israeli-Russian conventions: ח/כ → х, צ → ц; the article ה →
+ха-; e.g. Givolim → Гиволим, Ofek → Офек). Transliterate, never translate the meaning of
+its words: שער הדר → Шаар Хадар, not «Ворота Хадар»; גינת השקדיה → Гинат ха-Шкедия.
 Return ONLY JSON: {{"is_name": true, "kind": "place|org|other", "latin": "official Latin
 spelling or null", "url": "source URL or null", "translation": "...", "note": "what it is,
 a few words in Russian", "confidence": 0.9}}

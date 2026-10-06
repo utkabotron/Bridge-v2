@@ -70,10 +70,11 @@ def collect_per_chat_data() -> list[dict]:
         pairs = [dict(r) for r in cur.fetchall()]
 
         # Names the service glossary already settled (migration 025) — not the builder's
-        # to re-guess. Rejected ones neither: they were judged not names, or misread.
+        # to re-guess. Rejected ones stay the chat's business: "not a name for the whole
+        # service" can still be one chat's kindergarten group (חרדון — Хардон).
         cur.execute("""
             SELECT source, target_language FROM glossary
-            WHERE status IN ('verified', 'locked', 'rejected')
+            WHERE status IN ('verified', 'locked')
         """)
         pinned: dict[str, list[str]] = {}
         for r in cur.fetchall():

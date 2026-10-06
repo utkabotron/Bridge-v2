@@ -149,7 +149,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 словарь в памяти (`pipeline/glossary.py`), перечитывает при смене count/max(updated_at) — любая
 запись в таблицы ОБЯЗАНА трогать `updated_at`. Запись словаря перекрывает запись глоссария/участника
 чата (`chat_context.with_glossary`); override чата перекрывает словарь. Действует и в DM `/translate`.
-Строитель не предлагает verified/locked/rejected (`glossary.drop_global`). Люди — по словам, БЕЗ связей
+Строитель не предлагает verified/locked (`glossary.drop_global`). Люди — по словам, БЕЗ связей
 («ребёнок X» остаётся в профиле чата). Резолвер: `python -m flows.glossary_resolver --import | --resolve
 [--limit N] [--contested] [--kind person|other] [--dry-run]` — веб-поиск латинского написания для мест/
 организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8).
