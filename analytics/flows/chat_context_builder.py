@@ -28,15 +28,18 @@ from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import glossary as glossary_rules
+from . import llm
 from .shared import invalidate_profile_cache
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-ANALYSIS_MODEL = "gpt-4.1"
+ANALYSIS_MODEL = os.getenv("CONTEXT_MODEL", "gpt-6.1-sol")
 
-# Minimum messages per chat to trigger analysis
+# Minimum messages per chat to trigger analysis. A chat with an existing profile needs a
+# real day of talk before another LLM pass is worth it — three messages never add a name.
 MIN_MESSAGES = 5
+MIN_MESSAGES_EXISTING = int(os.getenv("CONTEXT_MIN_MESSAGES_EXISTING", 15))
 
 PROFILE_FIELDS = ("chat_type", "chat_description", "tone", "glossary", "members", "mentioned_people", "recurring_topics")
 
@@ -89,7 +92,7 @@ def collect_per_chat_data() -> list[dict]:
 
         messages = [dict(r) for r in cur.fetchall()]
 
-        if len(messages) < MIN_MESSAGES:
+        if len(messages) < (MIN_MESSAGES_EXISTING if has_profile else MIN_MESSAGES):
             continue
 
         result.append({
@@ -183,30 +186,37 @@ Recent messages:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
+    # Web search verifies school, place and organisation names. That matters when a
+    # profile is first built from 90 days of history; a daily delta of one or two names
+    # does not justify a paid search per chat per day.
+    request: dict = {
+        "model": ANALYSIS_MODEL,
+        "instructions": system_prompt,
+        "input": user_prompt,
+        "max_output_tokens": 2000,
+        "reasoning": {"effort": "low"},
+    }
+    if not existing:
+        request["tools"] = [{
+            "type": "web_search",
+            "search_context_size": "low",
+            "user_location": {
+                "type": "approximate",
+                "country": "IL",
+                "timezone": "Asia/Jerusalem",
+            },
+        }]
+
     try:
-        response = client.responses.create(
-            model=ANALYSIS_MODEL,
-            tools=[{
-                "type": "web_search",
-                "search_context_size": "low",
-                "user_location": {
-                    "type": "approximate",
-                    "country": "IL",
-                    "timezone": "Asia/Jerusalem",
-                },
-            }],
-            instructions=system_prompt,
-            input=user_prompt,
-            max_output_tokens=2000,
-            temperature=0,
-        )
+        response = llm.respond(client, request, log=logger)
 
         content = (response.output_text or "").strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
         delta = json.loads(content)
-        tokens_used = response.usage.total_tokens if response.usage else 0
+        tokens_used = llm.total_tokens(response.usage)
+        cost_usd = llm.usage_cost(ANALYSIS_MODEL, response.usage)
 
         logger.info(
             "Chat %d: extracted delta with %d glossary, %d members, %d mentioned, %d topics (tokens: %d)",
@@ -223,6 +233,7 @@ Recent messages:
             "target_language": target_lang,
             "delta": delta,
             "tokens_used": tokens_used,
+            "cost_usd": cost_usd,
             "messages_analyzed": len(messages),
         }
 
@@ -352,8 +363,7 @@ def store_profiles(results: list[dict]) -> int:
         merged["messages_analyzed"] = (existing or {}).get("messages_analyzed", 0) + messages_analyzed
         new_version = current_version + 1
 
-        # Cost estimate: gpt-4.1 ~$2/1M input + $8/1M output
-        cost = tokens * 0.005 / 1000
+        cost = r.get("cost_usd", 0.0)
 
         change_parts = []
         if delta.get("glossary"):

@@ -38,20 +38,29 @@ _llm: Any = None
 _ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "ptt", "document"}
 
 
-def get_llm() -> ChatOpenAI:
-    global _llm
-    if _llm is None:
-        _llm = ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            temperature=0,
-            tags=["bridge-v2", f"prompt-{PROMPT_VERSION}"],
+_llms: dict[str, ChatOpenAI] = {}
+
+
+def get_llm(model: str | None = None) -> ChatOpenAI:
+    """One client per model. The A/B variant may run a different model than OPENAI_MODEL."""
+    model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    if model not in _llms:
+        kwargs: dict = {
+            "model": model,
+            "tags": ["bridge-v2", f"prompt-{PROMPT_VERSION}", f"model-{model}"],
             # Unbounded, the SDK waits 600s and langchain retries twice, so one sick
             # request could hold the single-threaded consumer for half an hour while
             # every user's messages queued behind it.
-            timeout=LLM_TIMEOUT,
-            max_retries=LLM_MAX_RETRIES,
-        )
-    return _llm
+            "timeout": LLM_TIMEOUT,
+            "max_retries": LLM_MAX_RETRIES,
+        }
+        if model.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+            # Reasoning models reject `temperature`; a chat message needs no thinking.
+            kwargs["reasoning_effort"] = "none"
+        else:
+            kwargs["temperature"] = 0
+        _llms[model] = ChatOpenAI(**kwargs)
+    return _llms[model]
 
 
 # ── DB helpers (lazy import to avoid circular deps) ──────
@@ -183,7 +192,7 @@ async def translate_node(state: MessageState) -> MessageState:
     # evaluation can compare the two.
     from ..feature_flags import is_enabled
     variant = choose_variant(chat_pair_id, await is_enabled("prompt_ab_enabled"))
-    version = VARIANTS[variant][0]
+    version = VARIANTS[variant]["version"]
 
     # Cache lookup: pair-specific first; for chats without profile also check global cache
     cached = await get_cached(text, lang, chat_pair_id, context=chat_context, version=version)
@@ -208,8 +217,9 @@ async def translate_node(state: MessageState) -> MessageState:
         HumanMessage(content=text),
     ]
     llm_config = {"tags": [f"prompt-{version}", f"variant-{variant}"]}
+    llm = get_llm(VARIANTS[variant]["model"])  # after the cache: a hit never needs a client
     try:
-        response = await get_llm().ainvoke(messages, config=llm_config)
+        response = await llm.ainvoke(messages, config=llm_config)
     except Exception as exc:
         # An OpenAI outage used to raise here, escape the graph and send the message to a
         # dead-letter queue nobody drained — so the whole bridge went quiet and stayed
@@ -244,7 +254,7 @@ async def translate_node(state: MessageState) -> MessageState:
             )),
         ]
         try:
-            retried = (await get_llm().ainvoke(retry_messages, config=llm_config)).content.strip()
+            retried = (await llm.ainvoke(retry_messages, config=llm_config)).content.strip()
         except Exception as exc:
             logger.error("Passthrough retry failed (%s) — keeping first result", exc)
             retried = ""

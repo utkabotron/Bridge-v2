@@ -29,10 +29,12 @@ ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T 
 - Если `prompt_draft` нового отчёта отличается от текущего B в `prompt_registry` — показать
   diff и предложить сделать его новым вариантом B (`SYSTEM_TRANSLATE_B` + `PROMPT_VERSION_B`)
 
-**Продвижение B → A** (только по решению пользователя): текст B копируется в
-`SYSTEM_TRANSLATE`, `PROMPT_VERSION` = версия B, флаг `prompt_ab_enabled` выключается
-(`PATCH /api/flags/prompt_ab_enabled {"enabled": false}`). Смена версии попадает в
-`analytics_changelog` сама при старте processor.
+**Продвижение B → A** (только по решению пользователя). Вариант B — `prompts.VARIANTS["B"]`,
+это версия + промпт + модель, меняется что-то одно за эксперимент. Если B выиграл моделью —
+`OPENAI_MODEL=<модель>` в `.env` на проде (переключит и DM, и медиа); если промптом — текст B
+в `SYSTEM_TRANSLATE`, `PROMPT_VERSION` = версия B. Затем флаг `prompt_ab_enabled` выключить
+(`PATCH /api/flags/prompt_ab_enabled {"enabled": false}`) и завести следующий B. Смена версии
+попадает в `analytics_changelog` сама при старте processor.
 
 ### 2. Классифицируем рекомендации
 

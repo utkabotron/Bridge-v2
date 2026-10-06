@@ -3,10 +3,13 @@ Translation prompts — versioned so LangSmith can diff between deployments.
 Change PROMPT_VERSION when updating the system prompt.
 
 A/B: with the `prompt_ab_enabled` feature flag on, odd-numbered chat pairs are translated
-with variant B (SYSTEM_TRANSLATE_B, PROMPT_VERSION_B). Every message and evaluation
-records the version it was made with, so translation_evaluations.prompt_version compares
-the two after a week. To promote B: copy its text into SYSTEM_TRANSLATE, bump
-PROMPT_VERSION, turn the flag off. The version change lands in analytics_changelog on
+with variant B — a prompt text and/or a model (VARIANTS below). Every message and
+evaluation records the variant's version string, so translation_evaluations.prompt_version
+compares the two after a week. One change per experiment: the bake-off of 2026-10-06
+(docs/model-bakeoff-2026-10-06.md) put gpt-6-luna far ahead of gpt-4.1-mini, so B is now
+the production prompt on gpt-6-luna; the v3.0 prompt text waits its turn. To promote a
+model: set OPENAI_MODEL; to promote a prompt: copy its text into SYSTEM_TRANSLATE and bump
+PROMPT_VERSION; then turn the flag off. A version change lands in analytics_changelog on
 the next processor start (register_prompt), which is how the weekly report learns of it.
 """
 
@@ -63,9 +66,11 @@ Rules:
    g) Formatting (punctuation, spacing, blank lines) matches the original.
 """
 
-VARIANTS: dict[str, tuple[str, str]] = {
-    "A": (PROMPT_VERSION, SYSTEM_TRANSLATE),
-    "B": (PROMPT_VERSION_B, SYSTEM_TRANSLATE_B),
+# A variant: the version string recorded with every translation, the prompt template, and
+# the model (None = OPENAI_MODEL). B differs from A in exactly one thing at a time.
+VARIANTS: dict[str, dict] = {
+    "A": {"version": PROMPT_VERSION, "template": SYSTEM_TRANSLATE, "model": None},
+    "B": {"version": f"{PROMPT_VERSION}@gpt-6-luna", "template": SYSTEM_TRANSLATE, "model": "gpt-6-luna"},
 }
 
 
@@ -119,7 +124,7 @@ def format_chat_context(profile: dict) -> str:
 
 
 def get_translate_prompt(target_language: str, chat_context: str = "", variant: str = "A") -> str:
-    _, template = VARIANTS.get(variant, VARIANTS["A"])
+    template = VARIANTS.get(variant, VARIANTS["A"])["template"]
     prompt = template.format(target_language=target_language)
     if chat_context:
         prompt += chat_context + "\n"
@@ -136,7 +141,8 @@ async def register_prompt(pool) -> None:
     row = await pool.fetchrow("SELECT version FROM prompt_registry WHERE key = 'translate'")
     previous = row["version"] if row else None
 
-    for key, (version, content) in (("translate", VARIANTS["A"]), ("translate_b", VARIANTS["B"])):
+    for key, variant in (("translate", VARIANTS["A"]), ("translate_b", VARIANTS["B"])):
+        version, content = variant["version"], variant["template"]
         await pool.execute(
             """
             INSERT INTO prompt_registry (key, version, content, updated_at)
@@ -156,6 +162,6 @@ async def register_prompt(pool) -> None:
             VALUES ('prompt_version', $1, $2)
             """,
             f"translate prompt {previous} → {PROMPT_VERSION}",
-            f"Variant B for the A/B flag is {PROMPT_VERSION_B}. "
+            f"Variant B for the A/B flag is {VARIANTS['B']['version']}. "
             "Compare translation_evaluations.prompt_version from this date.",
         )

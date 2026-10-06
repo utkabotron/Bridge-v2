@@ -25,7 +25,7 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
-from . import jev_eval, quality_stats
+from . import jev_eval, llm, quality_stats
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -33,8 +33,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # The judge must be stronger than the translator it grades. gpt-4.1-mini judged
 # gpt-4.1-mini until 2026-10-06; scores before and after that date are not comparable.
 EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-6.1-sol")
-# $/1M tokens (input, output) — developers.openai.com/api/docs/pricing, 2026-10-06
-EVAL_PRICE = {"gpt-6.1-sol": (2.00, 10.00), "gpt-4.1-mini": (0.40, 1.60), "gpt-6-luna": (0.10, 0.50)}
 
 JEV_MODE = os.getenv("JEV_MODE", "off").strip().lower()
 # Nightly "add a rule to the prompt" suggestions are off: three months of them produced
@@ -73,13 +71,15 @@ def _load_prompt_from_db() -> tuple[str, str]:
         pass
     return fallback_version, fallback_prompt
 
-SAMPLE_SIZE = 50
+# Bridge chats only: DM and unpaired-chat rows were judged and then excluded from every
+# metric — paid for, never used.
+SAMPLE_SIZE = 40
 BATCH_SIZE = 10
 
 
 @task(retries=2, name="sample-translations")
 def sample_translations() -> list[dict]:
-    """Get stratified sample: 20 short + 20 long + 10 failed translations."""
+    """Stratified sample from paired chats: 20 short + 20 long delivered translations."""
     logger = get_run_logger()
     conn = psycopg2.connect(DB_URL)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -102,6 +102,7 @@ def sample_translations() -> list[dict]:
           AND me.translated_text IS NOT NULL
           AND length(me.original_text) < 100
           AND me.delivery_status = 'delivered'
+          AND me.chat_pair_id IS NOT NULL
         ORDER BY random()
         LIMIT 20
     """)
@@ -123,46 +124,9 @@ def sample_translations() -> list[dict]:
           AND me.translated_text IS NOT NULL
           AND length(me.original_text) >= 100
           AND me.delivery_status = 'delivered'
+          AND me.chat_pair_id IS NOT NULL
         ORDER BY random()
         LIMIT 20
-    """)
-    samples.extend([dict(r) for r in cur.fetchall()])
-
-    # Failed translations
-    cur.execute("""
-        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
-               me.delivery_status, me.error_message,
-               me.chat_pair_id, me.message_type, me.prompt_version,
-               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
-               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
-        FROM message_events me
-        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
-        LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= current_date - interval '1 day'
-          AND me.created_at < current_date
-          AND me.original_text IS NOT NULL
-          AND me.translated_text IS NOT NULL
-          AND me.delivery_status = 'failed'
-        ORDER BY random()
-        LIMIT 10
-    """)
-    samples.extend([dict(r) for r in cur.fetchall()])
-
-    # Direct translations (bot private chat)
-    cur.execute("""
-        SELECT di.id, di.original_text, di.translated_text, di.translation_ms,
-               'completed' AS delivery_status, NULL AS error_message,
-               NULL::bigint AS chat_pair_id, 'chat' AS message_type, NULL AS prompt_version,
-               COALESCE(di.target_language, 'Unknown') AS target_language,
-               'direct' AS source
-        FROM direct_interactions di
-        WHERE di.created_at >= current_date - interval '1 day'
-          AND di.created_at < current_date
-          AND di.interaction_type = 'translation'
-          AND di.translated_text IS NOT NULL
-          AND di.status = 'completed'
-        ORDER BY random()
-        LIMIT 10
     """)
     samples.extend([dict(r) for r in cur.fetchall()])
 
@@ -249,7 +213,7 @@ def evaluate_translations(samples: list[dict]) -> dict:
     client = OpenAI(api_key=OPENAI_API_KEY)
     all_evals = []
     total_tokens = 0
-    tokens_in = tokens_out = 0
+    cost_total = 0.0
 
     system_prompt = """You are a translation quality evaluator for a WhatsApp→Telegram bridge.
 Evaluate each translation pair and return a JSON array with one object per sample.
@@ -261,7 +225,9 @@ Each object must have:
 - naturalness_score: 1-5 (reads naturally in target language)
 - issues: array of issue objects, each with:
   - type: one of "mistranslation", "lost_formatting", "wrong_tone", "unnecessary_addition", "omission", "grammar", "untranslated"
-  - detail: brief description
+  - detail: at most 12 words
+  Report issues ONLY when quality_score <= 4; for a 5 return "issues": []. Output tokens cost
+  five times input: be terse, no praise, no restating the texts.
 
 Scoring guide:
 - 5: Perfect or near-perfect
@@ -285,31 +251,23 @@ Return ONLY the JSON array, no markdown fences."""
                 "target_language": s.get("target_language", "Unknown"),
             })
 
-        request: dict = {
-            "model": EVAL_MODEL,
-            "messages": [
+        response = llm.complete(client, llm.build_request(
+            EVAL_MODEL,
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(pairs, ensure_ascii=False)},
             ],
-        }
-        if EVAL_MODEL.startswith(("gpt-5", "gpt-6", "o")):
-            request["reasoning_effort"] = "low"   # a rubric, not a proof
-            request["max_completion_tokens"] = 4000
-        else:
-            request["temperature"] = 0
-            request["max_tokens"] = 4000
-        response = client.chat.completions.create(**request)
+            max_tokens=3000,
+        ), log=logger)
 
         content = (response.choices[0].message.content or "").strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
         batch_evals = json.loads(content)
-        tokens = response.usage.total_tokens if response.usage else 0
+        tokens = llm.total_tokens(response.usage)
         total_tokens += tokens
-        if response.usage:
-            tokens_in += response.usage.prompt_tokens or 0
-            tokens_out += response.usage.completion_tokens or 0
+        cost_total += llm.usage_cost(EVAL_MODEL, response.usage)
 
         # Attach message_event_id to each evaluation
         for ev in batch_evals:
@@ -327,10 +285,8 @@ Return ONLY the JSON array, no markdown fences."""
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
 
-    price = EVAL_PRICE.get(EVAL_MODEL, (2.00, 10.00))
-    cost = (tokens_in * price[0] + tokens_out * price[1]) / 1e6
-    logger.info("Total evaluations: %d, tokens: %d, cost $%.3f (%s)", len(all_evals), total_tokens, cost, EVAL_MODEL)
-    return {"evaluations": all_evals, "tokens_used": total_tokens, "cost_usd": cost, "judge": EVAL_MODEL}
+    logger.info("Total evaluations: %d, tokens: %d, cost $%.3f (%s)", len(all_evals), total_tokens, cost_total, EVAL_MODEL)
+    return {"evaluations": all_evals, "tokens_used": total_tokens, "cost_usd": cost_total, "judge": EVAL_MODEL}
 
 
 @task(retries=1, name="fetch-pending-suggestions")

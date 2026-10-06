@@ -19,11 +19,14 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from . import llm
+
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-ANALYSIS_MODEL = "o3"
+# o3 left the main catalogue; gpt-6.1-sol costs the same and halves on Flex.
+ANALYSIS_MODEL = os.getenv("WEEKLY_MODEL", "gpt-6.1-sol")
 
 
 @task(retries=2, name="collect-weekly-data")
@@ -430,21 +433,23 @@ Rules:
 
     user_prompt = "\n".join(context_parts)
 
-    response = client.chat.completions.create(
-        model=ANALYSIS_MODEL,
-        messages=[
+    response = llm.complete(client, llm.build_request(
+        ANALYSIS_MODEL,
+        [
             {"role": "developer", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_completion_tokens=16000,
-    )
+        max_tokens=16000,
+        reasoning="high",
+    ), log=logger)
 
     content = response.choices[0].message.content.strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
     analysis = json.loads(content)
-    tokens_used = response.usage.total_tokens if response.usage else 0
+    tokens_used = llm.total_tokens(response.usage)
+    cost_usd = llm.usage_cost(ANALYSIS_MODEL, response.usage)
 
     logger.info(
         "o3 analysis complete: %d tokens, %d recommendations, %d suggestion reviews",
@@ -452,7 +457,7 @@ Rules:
         len(analysis.get("recommendations", [])),
         len(analysis.get("prompt_evaluation", {}).get("suggestion_reviews", [])),
     )
-    return {"analysis": analysis, "tokens_used": tokens_used}
+    return {"analysis": analysis, "cost_usd": cost_usd, "tokens_used": tokens_used}
 
 
 @task(retries=2, name="store-weekly-insights")
@@ -465,7 +470,7 @@ def store_weekly_insights(data: dict, o3_result: dict) -> int:
     analysis = o3_result["analysis"]
     tokens = o3_result.get("tokens_used", 0)
     # o3: ~$2/1M input + $8/1M output (thinking tokens billed as output)
-    cost = tokens * 0.010 / 1000
+    cost = o3_result.get("cost_usd", 0.0)
 
     today = date.today()
     week_start = today - timedelta(days=7)

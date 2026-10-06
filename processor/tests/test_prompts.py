@@ -55,13 +55,17 @@ def test_variant_b_only_for_odd_pairs_while_the_flag_is_on():
     assert choose_variant(0, True) == "A"
 
 
-def test_variants_are_different_prompts_with_different_versions():
-    a = get_translate_prompt("Russian", variant="A")
-    b = get_translate_prompt("Russian", variant="B")
-    assert a != b
-    assert "Compound nouns" in b and "Compound nouns" not in a
-    assert PROMPT_VERSION != PROMPT_VERSION_B
-    assert get_translate_prompt("Russian", variant="nonsense") == a  # unknown → A
+def test_variant_b_changes_exactly_one_thing():
+    """Right now B is the same prompt on another model, so the test measures the model."""
+    from processor.src.pipeline.prompts import VARIANTS, SYSTEM_TRANSLATE_B
+    a, b = VARIANTS["A"], VARIANTS["B"]
+    assert a["template"] == b["template"]
+    assert a["model"] is None and b["model"] == "gpt-6-luna"
+    assert b["version"] != a["version"] and b["version"].startswith(PROMPT_VERSION)
+    assert get_translate_prompt("Russian", variant="B") == get_translate_prompt("Russian", variant="A")
+    assert get_translate_prompt("Russian", variant="nonsense") == get_translate_prompt("Russian")
+    # The v3.0 prompt text is kept for the next experiment
+    assert "Compound nouns" in SYSTEM_TRANSLATE_B and PROMPT_VERSION_B != PROMPT_VERSION
 
 
 @pytest.mark.asyncio
@@ -76,6 +80,7 @@ async def test_register_prompt_logs_a_version_change_for_the_weekly_report():
     changelog = [call for call in pool.execute.await_args_list if "analytics_changelog" in call.args[0]]
     assert len(changelog) == 1
     assert changelog[0].args[1] == f"translate prompt v2.9 → {PROMPT_VERSION}"
+    assert "gpt-6-luna" in changelog[0].args[2]
 
 
 @pytest.mark.asyncio

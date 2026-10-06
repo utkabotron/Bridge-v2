@@ -90,7 +90,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
 - `processor/src/pipeline/graph.py` — LangGraph StateGraph
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
-- `processor/src/pipeline/prompts.py` — prompt A/B (`SYSTEM_TRANSLATE`/`_B`, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`
+- `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
@@ -223,7 +223,7 @@ Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 | media_analysis_enabled | POST /analyze, /analyze-direct |
 | direct_chat_enabled | (reserved) |
 | admin_alerts_enabled | 401 + failure rate alerts to admins |
-| prompt_ab_enabled | A/B промпта: нечётные пары → `SYSTEM_TRANSLATE_B` (v3.0), чётные/DM → A; сравнение по `prompt_version` в оценках |
+| prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (сейчас gpt-6-luna на промпте v2.10), чётные/DM → A; сравнение по `prompt_version` в оценках |
 
 ## DATABASE
 
@@ -251,11 +251,11 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 |------|------|-------|
 | wa-health-check | */15 * * * * | — |
 | daily-cleanup | 0 3 * * * | — |
-| nightly-problems | 0 4 * * * | gpt-4.1-mini |
+| nightly-problems | 0 4 * * * | gpt-6-luna |
 | translation-quality | 30 4 * * * | gpt-6.1-sol (судья, `EVAL_MODEL`) |
-| chat-context-builder | 0 5 * * * | gpt-4.1 + web_search |
-| weekly-report | 0 5 * * 1 | o3 |
-| daily-chat-summary | */30 * * * * | gpt-4.1-mini |
+| chat-context-builder | 0 5 * * * | gpt-6.1-sol (+ web_search только при первом построении профиля) |
+| weekly-report | 0 5 * * 1 | gpt-6.1-sol, reasoning high |
+| daily-chat-summary | */30 * * * * | gpt-6-luna |
 | nightly-backup | 30 2 * * * | — (pg_dump, 7 копий) |
 | daily-digest | 20 5 * * * | — (единственное утреннее сообщение админам) |
 
@@ -263,6 +263,11 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 (`analytics/flows/daily_digest.py`) читает их результаты из БД и шлёт один дайджест на русском.
 Алерты по событиям (health, DLQ, кредиты OpenAI, бэкап) — отдельно, как были.
 Проверить текст без отправки: `docker compose exec -e DIGEST_DRY_RUN=1 analytics python -m flows.daily_digest`.
+
+Все LLM-вызовы analytics — через `flows/llm.py`: `build_request` (форма под семейство модели),
+`complete`/`respond` (Flex-тариф −50%, откат на стандарт при ошибке), `usage_cost` (цена по
+таблице). Модели переопределяются env: `EVAL_MODEL`, `NIGHTLY_MODEL`, `SUMMARY_MODEL`,
+`WEEKLY_MODEL`, `CONTEXT_MODEL`, `GLOSSARY_VALIDATION_MODEL`.
 
 ## ONBOARDING
 

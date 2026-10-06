@@ -19,13 +19,14 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from . import llm
 from .shared import esc, send_to_chat
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TZ = "Asia/Jerusalem"
 
-ANALYSIS_MODEL = "gpt-4.1-mini"
+ANALYSIS_MODEL = os.getenv("SUMMARY_MODEL", "gpt-6-luna")
 MIN_MESSAGES = 3
 SCHEDULE_REFRESH_DAYS = 7
 DEFAULT_HOUR = 22
@@ -283,22 +284,23 @@ Rules:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
     try:
-        response = client.chat.completions.create(
-            model=ANALYSIS_MODEL,
-            messages=[
+        response = llm.complete(client, llm.build_request(
+            ANALYSIS_MODEL,
+            [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=2000,
             temperature=0.3,
-        )
+        ), log=logger)
 
         content = response.choices[0].message.content.strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
         result = json.loads(content)
-        tokens_used = response.usage.total_tokens if response.usage else 0
+        tokens_used = llm.total_tokens(response.usage)
+        cost_usd = llm.usage_cost(ANALYSIS_MODEL, response.usage)
 
         logger.info(
             "Chat %d: summary generated (%d plans, %d tokens)",
@@ -320,6 +322,7 @@ Rules:
             "plans": result.get("plans", []),
             "stats_line": result.get("stats_line", ""),
             "tokens_used": tokens_used,
+            "cost_usd": cost_usd,
         }
 
     except Exception as exc:
@@ -389,7 +392,7 @@ def store_summary(result: dict) -> None:
 
     tokens = result.get("tokens_used", 0)
     # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output
-    cost = tokens * 0.001 / 1000
+    cost = result.get("cost_usd", 0.0)
 
     cur.execute("""
         INSERT INTO daily_chat_summaries

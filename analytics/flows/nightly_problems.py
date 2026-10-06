@@ -18,11 +18,13 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from . import llm
+
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-ANALYSIS_MODEL = "gpt-4.1-mini"
+ANALYSIS_MODEL = os.getenv("NIGHTLY_MODEL", "gpt-6-luna")
 
 
 @task(retries=2, name="collect-stats")
@@ -189,15 +191,14 @@ Rules:
 
     user_prompt = f"24h stats for {date.today().isoformat()}:\n\n{json.dumps(stats, indent=2, default=str)}"
 
-    response = client.chat.completions.create(
-        model=ANALYSIS_MODEL,
-        messages=[
+    response = llm.complete(client, llm.build_request(
+        ANALYSIS_MODEL,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         max_tokens=4000,
-        temperature=0,
-    )
+    ), log=logger)
 
     content = response.choices[0].message.content.strip()
     # Handle possible markdown fences
@@ -205,10 +206,11 @@ Rules:
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
     issues = json.loads(content)
-    tokens_used = response.usage.total_tokens if response.usage else 0
+    tokens_used = llm.total_tokens(response.usage)
+    cost_usd = llm.usage_cost(ANALYSIS_MODEL, response.usage)
 
-    logger.info("LLM found %d issues (tokens: %d)", len(issues), tokens_used)
-    return {"issues": issues, "tokens_used": tokens_used}
+    logger.info("LLM found %d issues (tokens: %d, $%.4f)", len(issues), tokens_used, cost_usd)
+    return {"issues": issues, "tokens_used": tokens_used, "cost_usd": cost_usd}
 
 
 @task(retries=2, name="store-results")
@@ -220,7 +222,7 @@ def store_results(stats: dict, analysis: dict) -> int:
 
     tokens = analysis.get("tokens_used", 0)
     # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
-    cost = tokens * 0.001 / 1000
+    cost = analysis.get("cost_usd", 0.0)
     issues = analysis.get("issues", [])
 
     cur.execute(

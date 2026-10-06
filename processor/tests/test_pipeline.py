@@ -174,12 +174,12 @@ async def test_translate_node_llm_call():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag_on,pair,expected_version,expected_marker", [
-    (True, 29, "v3.0", "Compound nouns"),
-    (True, 12, "v2.10", "e) Formatting"),
-    (False, 29, "v2.10", "e) Formatting"),
+@pytest.mark.parametrize("flag_on,pair,expected_version,expected_model", [
+    (True, 29, "v2.10@gpt-6-luna", "gpt-6-luna"),
+    (True, 12, "v2.10", None),
+    (False, 29, "v2.10", None),
 ])
-async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_on, pair, expected_version, expected_marker):
+async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_on, pair, expected_version, expected_model):
     """Odd pairs get variant B while the flag is on; the version rides along for the evaluation."""
     from processor.src.pipeline.nodes import translate_node
 
@@ -199,8 +199,7 @@ async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_o
         result = await translate_node(state)
 
     assert result["prompt_version"] == expected_version
-    system_prompt = mock_llm.return_value.ainvoke.await_args.args[0][0].content
-    assert expected_marker in system_prompt
+    mock_llm.assert_called_with(expected_model)
     assert f"prompt-{expected_version}" in mock_llm.return_value.ainvoke.await_args.kwargs["config"]["tags"]
     # The cache is partitioned by version, so A and B never serve each other's translations.
     assert get_cached.await_args.kwargs["version"] == expected_version

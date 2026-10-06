@@ -21,12 +21,14 @@ import json
 import os
 from datetime import date
 
+from . import llm
+
 # Bad-translation signals that implicate a glossary entry. Omissions and formatting are
 # never the glossary's fault.
 GLOSSARY_ISSUE_TYPES = {"mistranslation", "untranslated", "grammar"}
 FLAG_THRESHOLD = int(os.getenv("GLOSSARY_FLAG_THRESHOLD", 3))
 MAX_EXAMPLES = 3
-VALIDATION_MODEL = os.getenv("GLOSSARY_VALIDATION_MODEL", "gpt-4.1-mini")
+VALIDATION_MODEL = os.getenv("GLOSSARY_VALIDATION_MODEL", "gpt-6-luna")
 
 GLOSSARY_RULES = """\
 A glossary entry is a NAMED ENTITY with one fixed rendering in {target_lang}: a school, \
@@ -152,15 +154,14 @@ def validate_entries(glossary: dict, target_lang: str, client, model: str = VALI
         return {}, {}
     payload = {k: _rendering(v) for k, v in glossary.items()}
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+        response = llm.complete(client, llm.build_request(
+            model,
+            [
                 {"role": "system", "content": validation_prompt(target_lang)},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             max_tokens=1500,
-            temperature=0,
-        )
+        ), log=log)
         dropped = parse_validation(response.choices[0].message.content)
     except Exception as exc:
         if log:
