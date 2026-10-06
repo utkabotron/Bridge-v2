@@ -16,8 +16,8 @@
 
 - [x] A1. (06.10) Вредоносные ключи `backup1..4` в Redis: сохранить копию, удалить. — Fable → сейчас → `redis-cli keys backup*` пусто
 - [x] (06.10 код; прод — ночь 1) A2. Пароль на Redis (`requirepass`), все 4 клиента (processor, wa-service, bot, analytics) берут `REDIS_PASSWORD` из `.env`; пустой = без пароля. — Opus → ночь 1 (с откатом: если health не ok, убрать `REDIS_PASSWORD` и поднять заново) → `redis-cli ping` без пароля → NOAUTH, все health ok
-- [ ] A3. SSH: убрать `PasswordAuthentication yes` из `/etc/ssh/sshd_config.d/50-cloud-init.conf`. — **ты** подтверждаешь, что входишь только по ключу → Fable → `sshd -T | grep passwordauthentication` = no
-- [ ] A4. `~/.ssh/authorized_keys`: 4 записи (одна без подписи, `claude-code@n8n-access`, битый RSA с переносами, `bridge-v2-deploy`). — **ты** говоришь, какие оставить
+- [x] (06.10) A3. SSH: убрать `PasswordAuthentication yes` из `/etc/ssh/sshd_config.d/50-cloud-init.conf`. — **ты** подтверждаешь, что входишь только по ключу → Fable → `sshd -T | grep passwordauthentication` = no
+- [x] (06.10) A4. `authorized_keys`: оставлены 2 ключа мака (`id_bridge_vps` = bridge-v2-deploy, `id_ed25519` с парольной фразой); битый RSA и `claude-code@n8n-access` удалены. Бэкапы `/root/*.bak-2026-10-06`. На будущее: деплой ходит под root, есть пользователь `deploy` — перевести (отдельная задача).
 - [x] A5. (06.10) Публичные порты: 9000 — MinIO, нужен для presigned-ссылок Telegram, оставлен; 3100 — `fieldtracker-bot`, другой проект на этом VPS, не наш; UFW-правила 3000/8000/2222 удалены (на хосте там ничего не слушало). — Fable
 
 ## B. Ресурсы сервера
