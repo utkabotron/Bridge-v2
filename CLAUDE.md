@@ -144,7 +144,11 @@ processor и bot НЕ общаются — оба независимо → Postg
 **Словарь имён сервиса** (`glossary` + `glossary_override`, миграция 025, план — `docs/glossary-plan.md`):
 одно чтение имени на весь сервис, ключ — иврит/латиница как в сообщениях (`glossary_match.key_of`).
 Статусы: candidate → proposed (ждёт одобрения) → verified / locked (ручная) / rejected; в промпт —
-только verified/locked, и только найденные в тексте. Поиск — `bridge_shared.glossary_match.GlossaryIndex`:
+статусы `GLOSSARY_USED_STATUSES` (сейчас по умолчанию только `locked`), и только найденные в тексте.
+Имя, которое пишется как обычное слово (`also_word`: עמוס «занят», אופק «горизонт»), — ТОЛЬКО в чатах
+из `chat_pairs`; однозначные и locked — везде, включая DM. Без этого «אני עמוס היום» → «Я сегодня Амос».
+Перед включением статуса: `docker compose exec processor python -m src.glossary_check --statuses verified,locked`
+(фразы имя/слово, обе A/B-модели, мимо кэша; exit 1 при провале). Поиск — `bridge_shared.glossary_match.GlossaryIndex`:
 по словам с отрезанием приставок ו/ה/ב/ל/מ/ש/כ, НЕ по подстроке (גיל ⊄ רגיל). processor держит
 словарь в памяти (`pipeline/glossary.py`), перечитывает при смене count/max(updated_at) — любая
 запись в таблицы ОБЯЗАНА трогать `updated_at`. Запись словаря перекрывает запись глоссария/участника
@@ -152,7 +156,8 @@ processor и bot НЕ общаются — оба независимо → Postg
 Строитель не предлагает verified/locked (`glossary.drop_global`). Люди — по словам, БЕЗ связей
 («ребёнок X» остаётся в профиле чата). Резолвер: `python -m flows.glossary_resolver --import | --resolve
 [--limit N] [--contested] [--kind person|other] [--dry-run]` — веб-поиск латинского написания для мест/
-организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8).
+организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8);
+`--classify` — `also_word` + подсказка ≤ 3 слов (длинное пояснение модель копировала в перевод).
 
 **Глоссарий чатов:** только имена собственные. `chat_context_builder` видит ТОЛЬКО оригиналы;
 новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
@@ -281,6 +286,7 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 023 | users −= wa_session_id (никто не читал) |
 | 024 | glossary_global (заменена в 025) |
 | 025 | glossary, glossary_override — словарь имён сервиса; glossary_global → locked, удалена |
+| 026 | glossary += also_word, chat_pairs — неоднозначные имена только в своих чатах |
 
 ## ANALYTICS FLOWS
 

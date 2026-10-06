@@ -1038,8 +1038,10 @@ def fresh_glossary():
 async def test_glossary_is_loaded_once_and_matched_in_memory(fresh_glossary):
     glossary = fresh_glossary
     pool = _glossary_pool(
-        rows=[{"source": "גבעולים", "target_language": "Russian", "translation": "Гиволим", "note": "школа"},
-              {"source": "גיל", "target_language": "Russian", "translation": "Гиль", "note": None}],
+        rows=[{"source": "גבעולים", "target_language": "Russian", "translation": "Гиволим", "note": "школа",
+               "status": "locked", "also_word": True, "chat_pairs": []},
+              {"source": "גיל", "target_language": "Russian", "translation": "Гиль", "note": None,
+               "status": "verified", "also_word": False, "chat_pairs": [3]}],
         overrides=[{"chat_pair_id": 7, "source": "גיל", "target_language": "Russian",
                     "translation": "Гил", "note": None}],
     )
@@ -1060,7 +1062,7 @@ async def test_glossary_is_loaded_once_and_matched_in_memory(fresh_glossary):
 async def test_glossary_outage_keeps_what_was_loaded(fresh_glossary):
     glossary = fresh_glossary
     pool = _glossary_pool(rows=[{"source": "גבעולים", "target_language": "Russian",
-                                 "translation": "Гиволим", "note": None}])
+                                 "translation": "Гиволим", "note": None, "status": "locked"}])
     with patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
         assert await glossary.lookup("Russian", "גבעולים")
 
@@ -1080,8 +1082,26 @@ async def test_glossary_never_loaded_means_chat_glossaries_only(fresh_glossary):
 @pytest.mark.real_glossary
 async def test_people_entries_say_they_are_names(fresh_glossary):
     """עמוס is Amos and "busy": the hint must tell the translator which one it is about."""
-    pool = _glossary_pool(rows=[{"source": "עמוס", "target_language": "Russian",
-                                 "translation": "Амос", "note": None, "kind": "person"}])
+    pool = _glossary_pool(rows=[{"source": "עמוס", "target_language": "Russian", "translation": "Амос",
+                                 "note": None, "kind": "person", "status": "verified",
+                                 "also_word": True, "chat_pairs": [5]}])
     with patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
-        hits = await fresh_glossary.lookup("Russian", "אני עמוס היום")
+        hits = await fresh_glossary.lookup("Russian", "עמוס אמר", chat_pair_id=5)
     assert hits["עמוס"]["note"] == fresh_glossary.PERSON_NOTE
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_glossary
+async def test_names_that_are_also_words_stay_in_their_chats(fresh_glossary):
+    """עמוס everywhere turned "I'm busy" into "I'm Amos"; only chats that know an Amos get it."""
+    row = {"target_language": "Russian", "note": None, "kind": "person", "status": "verified"}
+    pool = _glossary_pool(rows=[
+        {**row, "source": "עמוס", "translation": "Амос", "also_word": True, "chat_pairs": [5, 9]},
+        {**row, "source": "עידו", "translation": "Идо", "also_word": False, "chat_pairs": [5]},
+        {**row, "source": "קשת", "translation": "Кешет", "also_word": None, "chat_pairs": [5]},  # unclassified
+    ])
+    with patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת", chat_pair_id=5)) == {"עמוס", "עידו", "קשת"}
+        assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת", chat_pair_id=9)) == {"עמוס", "עידו"}
+        assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת", chat_pair_id=2)) == {"עידו"}
+        assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת")) == {"עידו"}  # DM

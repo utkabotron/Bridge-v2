@@ -60,10 +60,12 @@ def test_import_upserts_candidates_with_chat_renderings():
     assert "INSERT INTO glossary" in sql and "CASE WHEN glossary.status = 'candidate'" in sql
     by_source = {r[0]: r for r in rows}
     assert n == len(rows)
-    source, lang, kind_, note, renderings, chats = by_source["גבעולים"]
-    assert (lang, kind_, chats) == ("Russian", "other", 2)
+    source, lang, kind_, note, renderings, chats, pairs = by_source["גבעולים"]
+    assert (lang, kind_, chats, pairs) == ("Russian", "other", 2, [11, 29])
     assert json.loads(renderings) == {"Гивъолим": 1, "Геваулим": 1}
-    assert by_source["דנה"][5] == 2
+    assert by_source["דנה"][5:] == (2, [11, 29])
+    assert by_source["דרחי"][6] == [11]
+    assert "chat_pairs = EXCLUDED.chat_pairs" in sql
 
 
 class _Client:
@@ -132,3 +134,38 @@ def test_a_failed_answer_leaves_the_name_a_candidate():
     assert {d["source"]: d["status"] for d in result["decisions"]} == {"גבעולים": "candidate", "דנה": "candidate"}
     (_, _, updates), = conn.executed("executemany")
     assert updates == []
+
+
+def test_classify_marks_everyday_words_and_shortens_notes():
+    rows = [
+        {"id": 1, "source": "עמוס", "translation": "Амос", "kind": "person", "note": None, "status": "verified"},
+        {"id": 2, "source": "אופק", "translation": "Офек", "kind": "other",
+         "note": "Школьная образовательная платформа CET (МАТАХ)", "status": "verified"},
+        {"id": 3, "source": "גבעולים", "translation": "Гиволим", "kind": "org",
+         "note": "название школы в Рамат-Гане", "status": "locked"},
+        {"id": 4, "source": "פייבוקס", "translation": "Пейбокс", "kind": "other", "note": None, "status": "verified"},
+    ]
+    answer = {"items": [
+        {"source": "עמוס", "also_word": True, "hint": "имя"},
+        {"source": "אופק", "also_word": True, "hint": "школьная платформа"},
+        {"source": "גבעולים", "also_word": True, "hint": "школа"},
+        {"source": "פייבוקס", "also_word": False, "hint": "платёжное приложение"},
+    ]}
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(answer, ensure_ascii=False)))],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10)))))
+    conn = FakeConn(fetchall=[rows])
+    result = gr.classify(conn, client)
+    (_, sql, updates), = conn.executed("executemany")
+    assert "also_word = %s" in sql
+    assert updates == [
+        (True, None, 1),                    # people carry no note
+        (True, "школьная платформа", 2),   # the long note that leaked into translations goes
+        (True, None, 3),                    # the admin's note on a locked entry stays
+        (False, "платёжное приложение", 4),
+    ]
+    assert result["also_word"] == 3
+
+    conn = FakeConn(fetchall=[rows])
+    gr.classify(conn, client, dry_run=True)
+    assert conn.executed("executemany") == []

@@ -17,6 +17,11 @@ is `proposed` for the admin's approval in the digest. A confident "not a name" i
   python -m flows.glossary_resolver --import                     profiles → candidates
   python -m flows.glossary_resolver --resolve --limit 20 --contested --dry-run
   python -m flows.glossary_resolver --resolve [--limit N] [--kind person|other]
+  python -m flows.glossary_resolver --classify [--dry-run]       also_word + short hint
+
+A name spelled like an everyday word (עמוס Amos / "busy") is `also_word`: the processor
+applies it only in the chats it was seen in (chat_pairs). In every prompt it turned
+"I'm busy today" into "I'm Amos today".
 
 People are stored word by word and without who they are: a relation ("child of …") would
 cross from one user's chats into another's prompts. Relations stay in the chat profile.
@@ -124,20 +129,22 @@ def import_candidates(conn) -> int:
     rows = []
     for (source, lang), item in names.items():
         renderings = {r: len(p) for r, p in item["renderings"].items()}
-        chats = len(set().union(*item["renderings"].values()))
+        pairs = sorted(set().union(*item["renderings"].values()))
         rows.append((source, lang, item["kind"], "; ".join(item["notes"]) or None,
-                     json.dumps(renderings, ensure_ascii=False), chats))
+                     json.dumps(renderings, ensure_ascii=False), len(pairs), pairs))
     cur.executemany("""
-        INSERT INTO glossary (source, target_language, kind, note, chat_renderings, chats_seen)
-        VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+        INSERT INTO glossary (source, target_language, kind, note, chat_renderings, chats_seen, chat_pairs)
+        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
         ON CONFLICT (source, target_language) DO UPDATE
             SET chat_renderings = EXCLUDED.chat_renderings,
                 chats_seen = EXCLUDED.chats_seen,
+                chat_pairs = EXCLUDED.chat_pairs,
                 kind = CASE WHEN glossary.status = 'candidate' THEN EXCLUDED.kind ELSE glossary.kind END,
                 note = CASE WHEN glossary.status = 'candidate' THEN EXCLUDED.note ELSE glossary.note END,
                 updated_at = now()
             WHERE glossary.chat_renderings IS DISTINCT FROM EXCLUDED.chat_renderings
                OR glossary.chats_seen IS DISTINCT FROM EXCLUDED.chats_seen
+               OR glossary.chat_pairs IS DISTINCT FROM EXCLUDED.chat_pairs
     """, rows)
     return len(rows)
 
@@ -230,6 +237,74 @@ def resolve_entity(client, source: str, note: str | None, target_lang: str) -> t
     except Exception as exc:
         logger.warning("Resolving %s failed: %s", source, exc)
         return None, 0.0, 0
+
+
+# ── Names that are also everyday words ────────────────────
+
+CLASSIFY_BATCH = 50
+
+
+def classify_prompt() -> str:
+    return """You check entries of a glossary of names used to translate Hebrew WhatsApp messages.
+Many Hebrew names are spelled exactly like an everyday word: עמוס (Amos / "busy"),
+אופק (Ofek / "horizon"), קשת (Keshet / "rainbow"), ישראל (Israel the person / the country),
+קסם (an app / "magic"), גבעולים (a school / "stalks"), טל (Tal / "dew").
+For each entry say whether its spelling (with or without a one-letter prefix) is ALSO a common
+Hebrew word, phrase or well-known place with another meaning that people write in ordinary
+messages. Latin-letter brand names that are also English words count too (Smart School no,
+Apple yes).
+Also give a hint of at most 3 Russian words saying what the name is (школа, приложение,
+парк в Рамат-Гане); for people just "имя".
+Return ONLY JSON: {"items": [{"source": "<as given>", "also_word": true, "hint": "..."}]}"""
+
+
+def classify(conn, client, *, dry_run: bool = False) -> dict:
+    """Mark also_word and a short hint on every resolved entry that has none yet."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, source, translation, kind, note, status FROM glossary
+        WHERE also_word IS NULL AND translation IS NOT NULL
+          AND status IN ('verified', 'proposed', 'locked')
+        ORDER BY id
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cost, results = 0.0, {}
+    for i in range(0, len(rows), CLASSIFY_BATCH):
+        batch = rows[i:i + CLASSIFY_BATCH]
+        payload = [{"source": r["source"], "rendering": r["translation"], "kind": r["kind"],
+                    "about": (r["note"] or "")[:80]} for r in batch]
+        try:
+            response = llm.complete(client, llm.build_request(
+                RESOLVER_MODEL,
+                [{"role": "system", "content": classify_prompt()},
+                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                max_tokens=6000, json_mode=True,
+            ), log=logger)
+            cost += llm.usage_cost(RESOLVER_MODEL, response.usage)
+            items = _parse_json(response.choices[0].message.content).get("items") or []
+        except Exception as exc:
+            logger.warning("Classify batch failed (%s) — %d entries stay unclassified", exc, len(batch))
+            continue
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("also_word"), bool):
+                results[key_of(item.get("source") or "")] = item
+
+    updates = []
+    for r in rows:
+        item = results.get(key_of(r["source"]))
+        if item is None:
+            continue
+        hint = _clean_rendering(item.get("hint"))[:40] or None
+        # A hand-written note on a locked entry is the admin's; people carry no note at all.
+        keep_note = r["status"] == "locked" or r["kind"] == "person"
+        updates.append((item["also_word"], None if keep_note else hint, r["id"]))
+    if not dry_run:
+        cur.executemany("""
+            UPDATE glossary SET also_word = %s, note = coalesce(%s, note), updated_at = now()
+            WHERE id = %s
+        """, updates)
+    return {"classified": len(updates), "also_word": sum(1 for u in updates if u[0]),
+            "cost": round(cost, 4), "items": {r["source"]: results.get(key_of(r["source"])) for r in rows}}
 
 
 # ── Deciding ──────────────────────────────────────────────
@@ -343,6 +418,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="flows.glossary_resolver")
     parser.add_argument("--import", dest="do_import", action="store_true")
     parser.add_argument("--resolve", action="store_true")
+    parser.add_argument("--classify", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--contested", action="store_true")
     parser.add_argument("--kind", choices=("person", "other"))
@@ -359,6 +435,13 @@ def main(argv: list[str] | None = None) -> None:
             result = resolve(conn, client, limit=args.limit, contested=args.contested,
                              kind=args.kind, dry_run=args.dry_run)
         _print_decisions(result)
+    if args.classify or (args.resolve and not args.dry_run):
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        with db_conn() as conn:
+            result = classify(conn, client, dry_run=args.dry_run)
+        ambiguous = sorted(s for s, i in result["items"].items() if i and i.get("also_word"))
+        print(f"classified {result['classified']}, also a word: {result['also_word']} · "
+              f"cost ${result['cost']}\n" + ", ".join(ambiguous))
 
 
 if __name__ == "__main__":

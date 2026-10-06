@@ -55,15 +55,20 @@ def format_chat_context(profile: dict | None) -> str:
             if isinstance(info, dict):
                 entry = f"{word} → {info.get('translation', '')}"
                 if info.get("note"):
-                    entry += f" ({info['note']})"
+                    entry += f"   [{info['note']}]"
             else:
                 entry = f"{word} → {info}"
             items.append(entry)
         # Named entities only. This used to say "use these transliterations", and the
         # glossary held everyday words, so the translator wrote "кадурсаль" for basketball.
+        # The note sat in parentheses and was copied into translations as is ("новый Офек
+        # (Школьная образовательная платформа…)"); many names are also everyday words.
         parts.append(
             "- Glossary — established renderings of names, places, organisations and "
-            "programmes. Use them for these names only; translate everything else normally:\n  "
+            "programmes. Use a rendering only where the word IS that name; where the same "
+            "word means something ordinary (עמוס \"busy\", אופק \"horizon\"), translate it "
+            "normally. [Square brackets] say what the name is — never copy them into the "
+            "translation:\n  "
             + "\n  ".join(items)
         )
 

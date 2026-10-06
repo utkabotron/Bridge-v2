@@ -19,9 +19,11 @@ def test_glossary_is_framed_as_names_not_transliterations():
     """'Use these transliterations' made the translator write кадурсаль for basketball."""
     ctx = format_chat_context({"glossary": {"אופק": {"translation": "Офек", "note": "school platform"}}})
 
-    assert "אופק → Офек (school platform)" in ctx
+    # Brackets, not parentheses: "(note)" was copied into translations as is.
+    assert "אופק → Офек   [school platform]" in ctx
+    assert "never copy them into the translation" in ctx
     assert "transliteration" not in ctx.lower()
-    assert "translate everything else normally" in ctx
+    assert "translate it normally" in ctx
 
 
 def test_removal_log_and_flags_never_reach_the_translator():
