@@ -102,7 +102,7 @@ def test_record_dropped_removes_and_remembers():
 
 
 def test_builder_leaves_names_pinned_service_wide_alone():
-    """glossary_global covers a name and any phrase containing it; nothing gets banned."""
+    """The service glossary covers a name and any phrase containing it; nothing gets banned."""
     delta = {
         "גבעולים": {"translation": "Геваулим"},
         "ביה״ס גבעולים": {"translation": "Бейт-сефер Гевалим"},

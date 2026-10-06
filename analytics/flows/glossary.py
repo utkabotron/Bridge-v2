@@ -6,8 +6,8 @@ became "кадурсаль", a club "хуг", English "англит" — and the
 ever removed an entry, and the builder learned from its own translations, so the worst
 chat sat at a third of its messages rated bad.
 
-Names that recur across chats (a school several families share) are pinned by hand in
-the service-wide glossary_global table instead; the builder leaves those alone.
+Names settled in the service glossary (table `glossary`, docs/glossary-plan.md) are not
+the builder's to guess; it leaves those alone.
 
 Two gates now:
   validate_entries   an LLM classifies each NEW entry as a named entity (kept) or an
@@ -128,7 +128,7 @@ def drop_removed(delta_glossary: dict, profile: dict | None) -> dict:
 
 
 def drop_global(delta_glossary: dict, global_keys) -> dict:
-    """Names pinned service-wide (glossary_global) are not the builder's to guess.
+    """Names settled in the service glossary are not the builder's to guess.
 
     Not recorded in glossary_removed: if the global entry is deleted later, the chat may
     learn the name again.

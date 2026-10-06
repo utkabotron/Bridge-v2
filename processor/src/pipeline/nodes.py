@@ -11,7 +11,7 @@ import logging
 import re
 import time
 
-from bridge_shared.chat_context import with_global_glossary
+from bridge_shared.chat_context import with_glossary
 from bridge_shared.scripts import CYRILLIC_RE, SOURCE_SCRIPT_RE, target_script_re
 
 from ..config import (
@@ -150,8 +150,8 @@ async def translate_node(state: MessageState) -> MessageState:
             from ..db import fetch_chat_profile
             profile = await fetch_chat_profile(chat_pair_id) or {}
             await set_chat_profile(chat_pair_id, profile)
-    # Names pinned for the whole service override the chat's own guess at them.
-    profile = with_global_glossary(profile, await glossary.global_glossary(lang), text)
+    # Names from the service glossary override the chat's own guess at them.
+    profile = with_glossary(profile, await glossary.lookup(lang, text, chat_pair_id))
     chat_context = format_chat_context(profile) if profile else ""
 
     # Determine if this chat has a meaningful profile (glossary or member names)

@@ -69,8 +69,12 @@ def collect_per_chat_data() -> list[dict]:
         """)
         pairs = [dict(r) for r in cur.fetchall()]
 
-        # Names pinned for every chat (migration 024) — the builder must not re-guess them.
-        cur.execute("SELECT source, target_language FROM glossary_global")
+        # Names the service glossary already settled (migration 025) — not the builder's
+        # to re-guess. Rejected ones neither: they were judged not names, or misread.
+        cur.execute("""
+            SELECT source, target_language FROM glossary
+            WHERE status IN ('verified', 'locked', 'rejected')
+        """)
         pinned: dict[str, list[str]] = {}
         for r in cur.fetchall():
             pinned.setdefault(r["target_language"], []).append(r["source"])

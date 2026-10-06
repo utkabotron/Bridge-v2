@@ -86,7 +86,8 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `shared/bridge_shared/` — stdlib-only пакет, копируется в три образа (`COPY shared/bridge_shared /app/bridge_shared`); build context этих сервисов — КОРЕНЬ репо (`context: .`, `dockerfile: <svc>/Dockerfile`, корневой `.dockerignore` — белый список). Правка в `shared/` = пересобрать и выкатить processor, bot, analytics вместе.
   - `llm.py` — `MODEL_PRICES`, `TRANSCRIBE_PRICES`, `is_reasoning`, `supports_flex`, `chat_request`, `token_cost`
   - `scripts.py` — регэкспы письменностей (`HEBREW_RE`, `SOURCE_SCRIPT_RE`, `CYRILLIC_RE`, `LATIN_RE`, `TARGET_SCRIPT_RE`)
-  - `chat_context.py` — `format_chat_context` (единственная версия)
+  - `chat_context.py` — `format_chat_context` (единственная версия), `with_glossary`
+  - `glossary_match.py` — `GlossaryIndex`, `key_of`, `words`, `covers`: поиск имён в иврите по словам
   - `telegram_html.py` — `esc`; `env.py` — `parse_ids`, `admin_tg_ids`
   - `processor/tests/test_shared.py` — страж: падает, если копия цен/регэкспов/`format_chat_context`/`esc` появится в сервисе
 
@@ -102,7 +103,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
 - `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
-- `processor/src/pipeline/glossary.py` — общий глоссарий: Redis → `glossary_global`, best-effort
+- `processor/src/pipeline/glossary.py` — словарь имён в памяти, `lookup(lang, text, pair)`, `reload()`
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
 - `processor/src/media_analyzer.py` — OpenAI vision (`DIRECT_MODEL`) + `gpt-transcribe` + PyPDF
@@ -135,15 +136,23 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `analytics/flows/translation_quality.py` — nightly quality eval; `JEV_MODE` = off | shadow | primary
 - `analytics/flows/jev_eval.py` — TypeSafe Jev scoring (`typesafe-sdk`), без Prefect/DB, тесты в `analytics/tests/`
 - `analytics/flows/jev_benchmark.py` — read-only сверка Jev с LLM-оценками: `docker compose exec analytics python -m flows.jev_benchmark`
+- `analytics/flows/glossary_resolver.py` — словарь имён: импорт кандидатов из профилей, резолвер, авто-принятие
 - `analytics/flows/glossary.py` — гейты глоссария: LLM-валидатор новых записей, флаги от оценщика (3 → удаление в `glossary_removed`)
 - `analytics/flows/quality_stats.py` — разбивка оценок по source/pair/language/type/prompt_version; отчёты считают только `source='bridge'`
 - `docs/quality-loop-plan.md` — чеклист петли «аналитика → качество перевода», отмечать по факту выкатки
 
-**Общий глоссарий** (`glossary_global`, миграция 024): имена, закреплённые вручную для ВСЕХ
-чатов всех пользователей (школа, общая для нескольких семей). Перекрывает запись чата с тем же
-ключом или фразой, его содержащей (`bridge_shared.chat_context.with_global_glossary`), и попадает
-в промпт только когда ключ есть в тексте. Действует и в DM `/translate`. Строитель такие имена
-не предлагает (`glossary.drop_global`). Правка: `PUT /api/glossary`, сброс Redis — автоматически.
+**Словарь имён сервиса** (`glossary` + `glossary_override`, миграция 025, план — `docs/glossary-plan.md`):
+одно чтение имени на весь сервис, ключ — иврит/латиница как в сообщениях (`glossary_match.key_of`).
+Статусы: candidate → proposed (ждёт одобрения) → verified / locked (ручная) / rejected; в промпт —
+только verified/locked, и только найденные в тексте. Поиск — `bridge_shared.glossary_match.GlossaryIndex`:
+по словам с отрезанием приставок ו/ה/ב/ל/מ/ש/כ, НЕ по подстроке (גיל ⊄ רגיל). processor держит
+словарь в памяти (`pipeline/glossary.py`), перечитывает при смене count/max(updated_at) — любая
+запись в таблицы ОБЯЗАНА трогать `updated_at`. Запись словаря перекрывает запись глоссария/участника
+чата (`chat_context.with_glossary`); override чата перекрывает словарь. Действует и в DM `/translate`.
+Строитель не предлагает verified/locked/rejected (`glossary.drop_global`). Люди — по словам, БЕЗ связей
+(«ребёнок X» остаётся в профиле чата). Резолвер: `python -m flows.glossary_resolver --import | --resolve
+[--limit N] [--contested] [--kind person|other] [--dry-run]` — веб-поиск латинского написания для мест/
+организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8).
 
 **Глоссарий чатов:** только имена собственные. `chat_context_builder` видит ТОЛЬКО оригиналы;
 новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
@@ -177,7 +186,6 @@ processor и bot НЕ общаются — оба независимо → Postg
 | `translation:{lang}:{pair_id}:{sha256}` | String | 24h | Translation cache (per-pair) |
 | `translation_global:{lang}:{sha256}` | String | 24h | Translation cache (no profile) |
 | `chat_profile:{pair_id}` | String | 1h | Chat profile cache |
-| `glossary_global:{lang}` | String | 10m | Общий глоссарий (`pipeline/glossary.py`), сбрасывает `/api/glossary` |
 | `ff:{flag_name}` | String | 60s | Feature flag cache |
 
 ## PROCESSOR API
@@ -198,9 +206,12 @@ processor и bot НЕ общаются — оба независимо → Postg
 | PATCH | /api/flags/{name} | — | Toggle flag `{"enabled": bool}` |
 | GET | /api/costs?days= | — | LLM costs по дням и по назначению из `llm_usage` |
 | GET | /api/profiles | — | Chat profiles with glossaries |
-| GET | /api/glossary | — | Общий глоссарий |
-| PUT | /api/glossary | — | Upsert `{source, translation, note?, target_language?}` |
-| DELETE | /api/glossary/{id} | — | Удалить запись общего глоссария |
+| GET | /api/glossary?status=&kind= | — | Словарь имён |
+| PUT | /api/glossary | — | Закрепить имя (`locked`): `{source, translation, note?, kind?, target_language?}` |
+| DELETE | /api/glossary/{id} | — | Удалить запись словаря |
+| GET | /api/glossary/overrides | — | Переопределения по чатам |
+| PUT | /api/glossary/override | — | `{chat_pair_id, source, translation, note?}` |
+| DELETE | /api/glossary/override/{pair}?source= | — | Удалить переопределение |
 | POST | /translate | translation_enabled | Text translation |
 | POST | /analyze | media_analysis_enabled | Media analysis by event_id |
 | POST | /analyze-direct | media_analysis_enabled | Media analysis (file upload) |
@@ -268,7 +279,8 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 021 | llm_usage — журнал каждого вызова модели из processor (purpose, model, tag, tokens, cost_usd, ms), 90 дней |
 | 022 | feature_flags −= direct_chat_enabled (мёртвый) |
 | 023 | users −= wa_session_id (никто не читал) |
-| 024 | glossary_global — общий глоссарий имён для всех чатов (seed: גבעולים → Гиволим) |
+| 024 | glossary_global (заменена в 025) |
+| 025 | glossary, glossary_override — словарь имён сервиса; glossary_global → locked, удалена |
 
 ## ANALYTICS FLOWS
 

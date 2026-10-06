@@ -548,46 +548,65 @@ async def api_profiles():
     return result
 
 
-# ── Global Glossary API ──────────────────────────────────
+# ── Glossary API ─────────────────────────────────────────
+# One glossary of names for the whole service (migration 025, docs/glossary-plan.md).
+# Edits here are by hand, so they are `locked`: the resolver and the digest never touch them.
+
+_GLOSSARY_COLUMNS = """id, source, target_language, translation, kind, note, status, evidence,
+                      confidence, chat_renderings, chats_seen, updated_at, decided_at"""
+
+
+def _glossary_row(r) -> dict:
+    d = dict(r)
+    if isinstance(d.get("chat_renderings"), str):
+        d["chat_renderings"] = json.loads(d["chat_renderings"])
+    return d
+
 
 @app.get("/api/glossary")
-async def api_glossary():
-    """Service-wide glossary (migration 024): names pinned for every chat."""
+async def api_glossary(status: str | None = Query(default=None), kind: str | None = Query(default=None)):
+    """Glossary entries, optionally filtered by status (candidate|proposed|verified|locked|rejected)."""
     from .db import get_pool
     pool = await get_pool()
-    rows = await pool.fetch("""
-        SELECT id, source, target_language, translation, note, updated_at
-        FROM glossary_global ORDER BY target_language, source
-    """)
-    return [dict(r) for r in rows]
+    rows = await pool.fetch(f"""
+        SELECT {_GLOSSARY_COLUMNS} FROM glossary
+        WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR kind = $2)
+        ORDER BY chats_seen DESC, source LIMIT 2000
+    """, status, kind)
+    return [_glossary_row(r) for r in rows]
 
 
 class GlossaryEntry(BaseModel):
     source: str
     translation: str
     note: str | None = None
+    kind: str = "other"
     target_language: str = TARGET_LANGUAGE
 
 
 @app.put("/api/glossary")
 async def api_glossary_upsert(body: GlossaryEntry):
-    """Add or replace the rendering of one name; applies from the next message."""
+    """Pin the rendering of one name for every chat; applies from the next message."""
+    from bridge_shared.glossary_match import key_of
     from .db import get_pool
     from .pipeline import glossary
 
-    source, translation = body.source.strip(), body.translation.strip()
+    source, translation = key_of(body.source), body.translation.strip()
     if not source or not translation:
         return JSONResponse({"error": "source and translation are required"}, status_code=400)
+    if body.kind not in ("person", "place", "org", "other"):
+        return JSONResponse({"error": "kind: person | place | org | other"}, status_code=400)
     pool = await get_pool()
-    row = await pool.fetchrow("""
-        INSERT INTO glossary_global (source, target_language, translation, note)
-        VALUES ($1, $2, $3, $4)
+    row = await pool.fetchrow(f"""
+        INSERT INTO glossary (source, target_language, translation, kind, note, status, decided_at)
+        VALUES ($1, $2, $3, $4, $5, 'locked', now())
         ON CONFLICT (source, target_language) DO UPDATE
-            SET translation = EXCLUDED.translation, note = EXCLUDED.note, updated_at = now()
-        RETURNING id, source, target_language, translation, note, updated_at
-    """, source, body.target_language, translation, (body.note or "").strip() or None)
-    await glossary.invalidate(body.target_language)
-    return dict(row)
+            SET translation = EXCLUDED.translation, kind = EXCLUDED.kind, note = EXCLUDED.note,
+                status = 'locked', decided_at = now(), updated_at = now()
+        RETURNING {_GLOSSARY_COLUMNS}
+    """, source, body.target_language, translation, body.kind, (body.note or "").strip() or None)
+    glossary.reload()
+    return _glossary_row(row)
 
 
 @app.delete("/api/glossary/{entry_id}")
@@ -596,12 +615,75 @@ async def api_glossary_delete(entry_id: int = Path(...)):
     from .pipeline import glossary
 
     pool = await get_pool()
-    lang = await pool.fetchval(
-        "DELETE FROM glossary_global WHERE id = $1 RETURNING target_language", entry_id)
-    if lang is None:
+    deleted = await pool.fetchval("DELETE FROM glossary WHERE id = $1 RETURNING id", entry_id)
+    if deleted is None:
         return JSONResponse({"error": "entry not found"}, status_code=404)
-    await glossary.invalidate(lang)
+    glossary.reload()
     return {"deleted": entry_id}
+
+
+@app.get("/api/glossary/overrides")
+async def api_glossary_overrides():
+    from .db import get_pool
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT chat_pair_id, source, target_language, translation, note, updated_at
+        FROM glossary_override ORDER BY chat_pair_id, source
+    """)
+    return [dict(r) for r in rows]
+
+
+class GlossaryOverride(BaseModel):
+    chat_pair_id: int
+    source: str
+    translation: str
+    note: str | None = None
+    target_language: str = TARGET_LANGUAGE
+
+
+@app.put("/api/glossary/override")
+async def api_glossary_override(body: GlossaryOverride):
+    """A different rendering of one name for one chat only."""
+    import asyncpg
+    from bridge_shared.glossary_match import key_of
+    from .db import get_pool
+    from .pipeline import glossary
+
+    source, translation = key_of(body.source), body.translation.strip()
+    if not source or not translation:
+        return JSONResponse({"error": "source and translation are required"}, status_code=400)
+    pool = await get_pool()
+    try:
+        row = await pool.fetchrow("""
+            INSERT INTO glossary_override (chat_pair_id, source, target_language, translation, note)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (chat_pair_id, source, target_language) DO UPDATE
+                SET translation = EXCLUDED.translation, note = EXCLUDED.note, updated_at = now()
+            RETURNING chat_pair_id, source, target_language, translation, note, updated_at
+        """, body.chat_pair_id, source, body.target_language, translation,
+            (body.note or "").strip() or None)
+    except asyncpg.ForeignKeyViolationError:
+        return JSONResponse({"error": "chat pair not found"}, status_code=404)
+    glossary.reload()
+    return dict(row)
+
+
+@app.delete("/api/glossary/override/{chat_pair_id}")
+async def api_glossary_override_delete(chat_pair_id: int = Path(...), source: str = Query(...),
+                                       target_language: str = Query(default=TARGET_LANGUAGE)):
+    from bridge_shared.glossary_match import key_of
+    from .db import get_pool
+    from .pipeline import glossary
+
+    pool = await get_pool()
+    deleted = await pool.fetchval("""
+        DELETE FROM glossary_override
+        WHERE chat_pair_id = $1 AND source = $2 AND target_language = $3 RETURNING chat_pair_id
+    """, chat_pair_id, key_of(source), target_language)
+    if deleted is None:
+        return JSONResponse({"error": "override not found"}, status_code=404)
+    glossary.reload()
+    return {"deleted": {"chat_pair_id": chat_pair_id, "source": key_of(source)}}
 
 
 # ── Costs API (LangSmith) ────────────────────────────────
@@ -662,7 +744,7 @@ async def translate_text(body: TranslateRequest):
         return JSONResponse({"error": "Translation is temporarily disabled"}, status_code=503)
     from .llm import chat as llm_chat
     from .pipeline.cache import get_cached, set_cached
-    from bridge_shared.chat_context import format_chat_context, with_global_glossary
+    from bridge_shared.chat_context import format_chat_context, with_glossary
     from .pipeline import glossary
     from .pipeline.prompts import PROMPT_VERSION, get_translate_prompt
 
@@ -683,7 +765,7 @@ async def translate_text(body: TranslateRequest):
         lang = TARGET_LANGUAGE
 
     # No chat here, so no chat profile — but pinned names apply in the DM too.
-    context = format_chat_context(with_global_glossary({}, await glossary.global_glossary(lang), text))
+    context = format_chat_context(with_glossary({}, await glossary.lookup(lang, text)))
 
     # Cache check
     cached = await get_cached(text, lang, context=context, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")

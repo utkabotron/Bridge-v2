@@ -124,9 +124,9 @@ REVOKE_NOTE = os.getenv("REVOKE_NOTE", "🗑 Сообщение удалено �
 # ── Cache TTLs ───────────────────────────────────────────
 TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
-# Service-wide glossary (pipeline/glossary.py). Edits through /api/glossary drop the key at
-# once; the TTL only bounds a change made straight in the database.
-GLOBAL_GLOSSARY_CACHE_TTL = int(os.getenv("GLOBAL_GLOSSARY_CACHE_TTL", 600))
+# Service glossary (pipeline/glossary.py) lives in memory; this is how often a message may
+# check whether the tables changed. /api/glossary edits apply at once regardless.
+GLOSSARY_REFRESH_SECONDS = int(os.getenv("GLOSSARY_REFRESH_SECONDS", 60))
 MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
 # Active pairs of a WhatsApp chat, looked up for every message (pipeline/cache.py). Pair
 # changes made outside the processor (wa-service, bot) do not invalidate the key yet, so
