@@ -29,6 +29,9 @@ jobs:
       - name: Lint analytics
         run: ruff check analytics/flows/
 
+      - name: Lint shared
+        run: ruff check shared/
+
   test:
     name: Tests
     runs-on: ubuntu-latest
@@ -99,10 +102,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # processor, bot and analytics build from the repo root: their images also get
+      # shared/bridge_shared (see docker-compose.yml and the root .dockerignore).
       - name: Build processor
         uses: docker/build-push-action@v5
         with:
-          context: ./processor
+          context: .
+          file: processor/Dockerfile
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -110,7 +116,8 @@ jobs:
       - name: Build bot
         uses: docker/build-push-action@v5
         with:
-          context: ./bot
+          context: .
+          file: bot/Dockerfile
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -118,7 +125,8 @@ jobs:
       - name: Build analytics
         uses: docker/build-push-action@v5
         with:
-          context: ./analytics
+          context: .
+          file: analytics/Dockerfile
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

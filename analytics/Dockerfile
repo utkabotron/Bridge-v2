@@ -6,13 +6,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends postgresql-clie
 
 WORKDIR /app
 
-COPY requirements.txt requirements.lock ./
+# Built from the repo root (docker-compose: context ., dockerfile analytics/Dockerfile) so
+# the shared package below is inside the build context.
+COPY analytics/requirements.txt analytics/requirements.lock ./
 # Install the lock, not the ranges — see requirements.lock for why.
 RUN pip install --no-cache-dir -r requirements.lock
 
-COPY flows/ ./flows/
-COPY serve_flows.py ./serve_flows.py
-COPY entrypoint.sh ./entrypoint.sh
+# Code shared with processor and bot (prices, script regexes, chat context, esc). Next to
+# flows/, so it imports the way flows does: /app is the working directory.
+COPY shared/bridge_shared/ ./bridge_shared/
+COPY analytics/flows/ ./flows/
+COPY analytics/serve_flows.py ./serve_flows.py
+COPY analytics/entrypoint.sh ./entrypoint.sh
 RUN chmod +x entrypoint.sh
 
 # Drop root: the service needs no privileged operation at runtime, and a bug in a
