@@ -71,11 +71,10 @@ async def add_to_whitelist(tg_user_id: int, tg_username: Optional[str] = None) -
     )
 
 
-async def set_wa_connected(tg_user_id: int, session_id: str) -> None:
+async def set_wa_connected(tg_user_id: int) -> None:
     pool = await get_pool()
     await pool.execute(
-        "update public.users set wa_session_id = $1, wa_connected = true where tg_user_id = $2",
-        session_id,
+        "update public.users set wa_connected = true where tg_user_id = $1",
         tg_user_id,
     )
 
