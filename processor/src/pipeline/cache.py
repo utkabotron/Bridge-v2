@@ -13,6 +13,8 @@ Used when chat has no profile — same text across multiple pairs hits cache.
 
 Chat profile cache:
 Key: chat_profile:{chat_pair_id}
+Value: the profile as JSON; {} caches "this pair has no profile", so unprofiled pairs do not
+       hit Postgres on every message (analytics DELs the key when it builds a profile)
 TTL: PROFILE_CACHE_TTL env var (default 3600s = 1h)
 
 Chat pairs cache (the pair lookup every message needs):
@@ -98,16 +100,16 @@ async def set_cached_global(text: str, language: str, translation: str, version:
 
 
 async def get_chat_profile(chat_pair_id: int) -> Optional[dict]:
-    """Get cached chat profile from Redis."""
+    """Get cached chat profile from Redis. None = nothing cached; {} = known to have none."""
     try:
         raw = await get_redis().get(f"chat_profile:{chat_pair_id}")
-        return json.loads(raw) if raw else None
+        return json.loads(raw) if raw is not None else None
     except Exception:
         return None
 
 
 async def set_chat_profile(chat_pair_id: int, profile: dict) -> None:
-    """Cache chat profile in Redis."""
+    """Cache chat profile in Redis; pass {} to cache that the pair has none."""
     try:
         await get_redis().setex(
             f"chat_profile:{chat_pair_id}",

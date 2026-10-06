@@ -204,6 +204,32 @@ async def test_get_chat_profile_miss():
 
 
 @pytest.mark.asyncio
+async def test_get_chat_profile_known_empty_is_not_a_miss():
+    """{} is the cached "this pair has no profile"; None means ask the DB."""
+    from processor.src.pipeline.cache import get_chat_profile
+    mock_redis = AsyncMock()
+    mock_redis.get = AsyncMock(return_value="{}")
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        result = await get_chat_profile(42)
+
+    assert result == {}
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_set_chat_profile_caches_an_empty_profile():
+    from processor.src.config import PROFILE_CACHE_TTL
+    from processor.src.pipeline.cache import set_chat_profile
+    mock_redis = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await set_chat_profile(7, {})
+
+    mock_redis.setex.assert_awaited_once_with("chat_profile:7", PROFILE_CACHE_TTL, "{}")
+
+
+@pytest.mark.asyncio
 async def test_set_chat_profile_correct_key():
     from processor.src.pipeline.cache import set_chat_profile
     profile = {"glossary": {}, "tone": "formal"}

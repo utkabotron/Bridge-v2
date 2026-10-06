@@ -195,6 +195,47 @@ async def test_translate_node_cache_hit():
     assert result["translation_ms"] == 0
 
 
+async def _translate_with_profile_cache(cached_profile, db_profile):
+    """Run translate_node (cache hit, so no LLM) and return the profile-cache calls."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian")
+    fetch = AsyncMock(return_value=db_profile)
+    store = AsyncMock()
+    with patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value=cached_profile)), \
+         patch("processor.src.pipeline.nodes.set_chat_profile", new=store), \
+         patch("processor.src.db.fetch_chat_profile", new=fetch), \
+         patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value="Привет")):
+        await translate_node(state)
+    return fetch, store
+
+
+@pytest.mark.asyncio
+async def test_translate_node_caches_the_absence_of_a_profile():
+    """Most pairs have no chat_profiles row; without a cached "none" each message hit Postgres."""
+    fetch, store = await _translate_with_profile_cache(cached_profile=None, db_profile=None)
+
+    fetch.assert_awaited_once_with(1)
+    store.assert_awaited_once_with(1, {})
+
+
+@pytest.mark.asyncio
+async def test_translate_node_trusts_a_cached_empty_profile():
+    fetch, store = await _translate_with_profile_cache(cached_profile={}, db_profile={"tone": "x"})
+
+    fetch.assert_not_awaited()
+    store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_translate_node_caches_a_profile_it_loaded():
+    profile = {"tone": "casual", "glossary": {"שלום": "привет"}}
+    fetch, store = await _translate_with_profile_cache(cached_profile=None, db_profile=profile)
+
+    fetch.assert_awaited_once_with(1)
+    store.assert_awaited_once_with(1, profile)
+
+
 @pytest.mark.asyncio
 async def test_translate_node_llm_call():
     """Cache miss should call LLM and store result."""

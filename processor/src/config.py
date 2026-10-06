@@ -118,6 +118,9 @@ MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
 # freshly created pair must not wait out an hour of cached "none".
 PAIRS_CACHE_TTL = int(os.getenv("PAIRS_CACHE_TTL", 3600))
 PAIRS_NEGATIVE_CACHE_TTL = int(os.getenv("PAIRS_NEGATIVE_CACHE_TTL", 60))
+# Per-process copy of a feature flag, in front of its Redis read (feature_flags.is_enabled
+# runs several times per message). set_flag clears it, so a toggle is not delayed.
+FLAG_MEMORY_TTL = int(os.getenv("FLAG_MEMORY_TTL", 5))
 
 # ── Dashboard stats ──────────────────────────────────────
 # /api/stats is polled every 15s by every open dashboard tab. Counting message_events

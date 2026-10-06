@@ -147,15 +147,15 @@ async def translate_node(state: MessageState) -> MessageState:
     lang = state.get("target_language", "Russian")
     chat_pair_id = state.get("chat_pair_id")
 
-    # Load chat profile: Redis cache → PostgreSQL → None
+    # Load chat profile: Redis cache → PostgreSQL. Most pairs have none, so that answer is
+    # cached too ({}) — None means "not cached", not "no profile".
     chat_context = ""
     if chat_pair_id:
         profile = await get_chat_profile(chat_pair_id)
         if profile is None:
             from ..db import fetch_chat_profile
-            profile = await fetch_chat_profile(chat_pair_id)
-            if profile:
-                await set_chat_profile(chat_pair_id, profile)
+            profile = await fetch_chat_profile(chat_pair_id) or {}
+            await set_chat_profile(chat_pair_id, profile)
         if profile:
             chat_context = format_chat_context(profile)
 
