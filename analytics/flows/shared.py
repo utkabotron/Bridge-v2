@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 
 import httpx
+import psycopg2
+import psycopg2.extras
 from prefect import get_run_logger
 
 # Telegram calls put the bot token in the URL, and httpx logs request URLs at INFO.
@@ -13,6 +16,31 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+
+DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
+
+
+@contextmanager
+def db_conn(cursor_factory=psycopg2.extras.RealDictCursor):
+    """One connection per block: commit if it finishes, roll back if it raises, always close.
+
+    Every flow used to repeat connect/cursor/commit/close by hand, and an exception between
+    connect and close leaked the connection (the long-running flow server keeps the process,
+    so leaks add up). `conn.cursor()` returns dict rows; pass cursor_factory=None for tuples.
+    Read-only blocks commit too, which is a no-op.
+    """
+    conn = psycopg2.connect(DB_URL, cursor_factory=cursor_factory)
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass  # the connection is already gone; the original error is the one worth seeing
+        raise
+    finally:
+        conn.close()
 
 
 def esc(s: str) -> str:

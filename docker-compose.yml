@@ -240,8 +240,6 @@ services:
       - PROCESSOR_URL=http://processor:8000
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - BIGQUERY_PROJECT=${BIGQUERY_PROJECT}
-      - BIGQUERY_DATASET=${BIGQUERY_DATASET:-bridge_analytics}
       - PREFECT_API_URL=${PREFECT_API_URL}
       - PREFECT_API_KEY=${PREFECT_API_KEY}
       # Prefect's own metadata DB. On the default sqlite file the concurrent flows
@@ -253,11 +251,8 @@ services:
       - JEV_MODE=${JEV_MODE:-off}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa.json
       - TZ=Asia/Jerusalem
     volumes:
-      # Mount only if file exists locally — skip for local dev without BigQuery
-      - ${GCP_SA_PATH:-/dev/null}:/app/gcp-sa.json:ro
       # Nightly pg_dump lands on the host, outside the Docker volume it backs up.
       - ${BACKUP_HOST_DIR:-./backups}:/backups
     depends_on:

@@ -13,15 +13,12 @@ import json
 import os
 from datetime import date
 
-import psycopg2
-import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import llm
+from .shared import db_conn
 
-
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 ANALYSIS_MODEL = os.getenv("NIGHTLY_MODEL", "gpt-6-luna")
@@ -31,91 +28,88 @@ ANALYSIS_MODEL = os.getenv("NIGHTLY_MODEL", "gpt-6-luna")
 def collect_stats() -> dict:
     """Collect 24h aggregates from message_events."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    stats = {}
+        stats = {}
 
-    # Overall counts
-    cur.execute("""
-        SELECT
-            count(*) AS total_messages,
-            count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
-            count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
-            count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
-            count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
-            avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL) AS avg_translation_ms,
-            max(translation_ms) AS max_translation_ms,
-            count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
-        FROM message_events
-        WHERE created_at >= current_date - interval '1 day'
-          AND created_at < current_date
-    """)
-    stats["overview"] = dict(cur.fetchone())
+        # Overall counts
+        cur.execute("""
+            SELECT
+                count(*) AS total_messages,
+                count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
+                count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
+                count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
+                count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
+                avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL) AS avg_translation_ms,
+                max(translation_ms) AS max_translation_ms,
+                count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
+            FROM message_events
+            WHERE created_at >= current_date - interval '1 day'
+              AND created_at < current_date
+        """)
+        stats["overview"] = dict(cur.fetchone())
 
-    # Failed deliveries by error type
-    cur.execute("""
-        SELECT
-            error_message,
-            count(*) AS count
-        FROM message_events
-        WHERE created_at >= current_date - interval '1 day'
-          AND created_at < current_date
-          AND delivery_status = 'failed'
-          AND error_message IS NOT NULL
-        GROUP BY error_message
-        ORDER BY count DESC
-        LIMIT 20
-    """)
-    stats["errors_by_type"] = [dict(r) for r in cur.fetchall()]
+        # Failed deliveries by error type
+        cur.execute("""
+            SELECT
+                error_message,
+                count(*) AS count
+            FROM message_events
+            WHERE created_at >= current_date - interval '1 day'
+              AND created_at < current_date
+              AND delivery_status = 'failed'
+              AND error_message IS NOT NULL
+            GROUP BY error_message
+            ORDER BY count DESC
+            LIMIT 20
+        """)
+        stats["errors_by_type"] = [dict(r) for r in cur.fetchall()]
 
-    # Hourly volume
-    cur.execute("""
-        SELECT
-            date_trunc('hour', created_at) AS hour,
-            count(*) AS total,
-            count(*) FILTER (WHERE delivery_status = 'failed') AS failed
-        FROM message_events
-        WHERE created_at >= current_date - interval '1 day'
-          AND created_at < current_date
-        GROUP BY 1
-        ORDER BY 1
-    """)
-    rows = cur.fetchall()
-    stats["hourly_volume"] = [
-        {"hour": str(r["hour"]), "total": r["total"], "failed": r["failed"]}
-        for r in rows
-    ]
+        # Hourly volume
+        cur.execute("""
+            SELECT
+                date_trunc('hour', created_at) AS hour,
+                count(*) AS total,
+                count(*) FILTER (WHERE delivery_status = 'failed') AS failed
+            FROM message_events
+            WHERE created_at >= current_date - interval '1 day'
+              AND created_at < current_date
+            GROUP BY 1
+            ORDER BY 1
+        """)
+        rows = cur.fetchall()
+        stats["hourly_volume"] = [
+            {"hour": str(r["hour"]), "total": r["total"], "failed": r["failed"]}
+            for r in rows
+        ]
 
-    # Message types distribution
-    cur.execute("""
-        SELECT message_type, count(*) AS count
-        FROM message_events
-        WHERE created_at >= current_date - interval '1 day'
-          AND created_at < current_date
-        GROUP BY message_type
-        ORDER BY count DESC
-    """)
-    stats["message_types"] = [dict(r) for r in cur.fetchall()]
+        # Message types distribution
+        cur.execute("""
+            SELECT message_type, count(*) AS count
+            FROM message_events
+            WHERE created_at >= current_date - interval '1 day'
+              AND created_at < current_date
+            GROUP BY message_type
+            ORDER BY count DESC
+        """)
+        stats["message_types"] = [dict(r) for r in cur.fetchall()]
 
-    # Direct interactions (bot private chat)
-    cur.execute("""
-        SELECT
-            count(*) AS total,
-            count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
-            count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
-            count(*) FILTER (WHERE status = 'failed') AS failed
-        FROM direct_interactions
-        WHERE created_at >= current_date - interval '1 day'
-          AND created_at < current_date
-    """)
-    stats["direct_interactions"] = dict(cur.fetchone())
-
-    cur.close()
-    conn.close()
+        # Direct interactions (bot private chat)
+        cur.execute("""
+            SELECT
+                count(*) AS total,
+                count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
+                count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
+                count(*) FILTER (WHERE status = 'failed') AS failed
+            FROM direct_interactions
+            WHERE created_at >= current_date - interval '1 day'
+              AND created_at < current_date
+        """)
+        stats["direct_interactions"] = dict(cur.fetchone())
 
     logger.info(
         "Collected stats: %d total, %d failed, %d slow, %d direct",
@@ -132,18 +126,17 @@ def fetch_open_issues() -> list[dict]:
     """Fetch open issues from issues_backlog (last 7 days) to avoid LLM duplicates."""
     logger = get_run_logger()
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT title, description
-            FROM issues_backlog
-            WHERE status = 'open'
-              AND created_at >= now() - interval '7 days'
-            ORDER BY created_at DESC
-        """)
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close()
-        conn.close()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT title, description
+                FROM issues_backlog
+                WHERE status = 'open'
+                  AND created_at >= now() - interval '7 days'
+                ORDER BY created_at DESC
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
         logger.info("Fetched %d open issues for dedup context", len(rows))
         return rows
     except Exception as exc:
@@ -217,100 +210,98 @@ Rules:
 def store_results(stats: dict, analysis: dict) -> int:
     """Store analysis run and detected issues in DB."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
 
-    tokens = analysis.get("tokens_used", 0)
-    # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
-    cost = analysis.get("cost_usd", 0.0)
-    issues = analysis.get("issues", [])
+        tokens = analysis.get("tokens_used", 0)
+        # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
+        cost = analysis.get("cost_usd", 0.0)
+        issues = analysis.get("issues", [])
 
-    cur.execute(
-        """
-        INSERT INTO nightly_analysis_runs (run_date, flow_type, summary, tokens_used, estimated_cost)
-        VALUES (%s, 'problems', %s, %s, %s)
-        ON CONFLICT (run_date, flow_type) DO UPDATE
-            SET summary = EXCLUDED.summary,
-                tokens_used = EXCLUDED.tokens_used,
-                estimated_cost = EXCLUDED.estimated_cost
-        RETURNING id
-        """,
-        (
-            date.today(),
-            json.dumps(
-                {
-                    "stats": stats["overview"],
-                    "issues_total": len(issues),
-                    "issues_critical": len([i for i in issues if i.get("severity") == "critical"]),
-                    "issues_warning": len([i for i in issues if i.get("severity") == "warning"]),
-                    "issues_info": len([i for i in issues if i.get("severity") == "info"]),
-                    "mapped_failure_rate": round(
-                        stats["overview"]["mapped_failed"] / stats["overview"]["mapped_total"] * 100, 2
-                    ) if stats["overview"].get("mapped_total") else 0,
-                },
-                default=str,
-            ),
-            tokens,
-            cost,
-        ),
-    )
-    run_id = cur.fetchone()[0]
-
-    # Remove old issues before inserting fresh ones (UPSERT only updates the run row)
-    cur.execute("DELETE FROM detected_issues WHERE run_id = %s", (run_id,))
-
-    for issue in issues:
         cur.execute(
+            """
+            INSERT INTO nightly_analysis_runs (run_date, flow_type, summary, tokens_used, estimated_cost)
+            VALUES (%s, 'problems', %s, %s, %s)
+            ON CONFLICT (run_date, flow_type) DO UPDATE
+                SET summary = EXCLUDED.summary,
+                    tokens_used = EXCLUDED.tokens_used,
+                    estimated_cost = EXCLUDED.estimated_cost
+            RETURNING id
+            """,
+            (
+                date.today(),
+                json.dumps(
+                    {
+                        "stats": stats["overview"],
+                        "issues_total": len(issues),
+                        "issues_critical": len([i for i in issues if i.get("severity") == "critical"]),
+                        "issues_warning": len([i for i in issues if i.get("severity") == "warning"]),
+                        "issues_info": len([i for i in issues if i.get("severity") == "info"]),
+                        "mapped_failure_rate": round(
+                            stats["overview"]["mapped_failed"] / stats["overview"]["mapped_total"] * 100, 2
+                        ) if stats["overview"].get("mapped_total") else 0,
+                    },
+                    default=str,
+                ),
+                tokens,
+                cost,
+            ),
+        )
+        run_id = cur.fetchone()[0]
+
+        # Remove old issues before inserting fresh ones (UPSERT only updates the run row)
+        cur.execute("DELETE FROM detected_issues WHERE run_id = %s", (run_id,))
+
+        cur.executemany(
             """
             INSERT INTO detected_issues (run_id, severity, category, title, description, suggested_fix)
             VALUES (%s, %s, %s, %s, %s, %s)
             """,
-            (
-                run_id,
-                issue["severity"],
-                issue["category"],
-                issue["title"],
-                issue.get("description", ""),
-                issue.get("suggested_fix", ""),
-            ),
-        )
-
-    # Copy critical issues to persistent backlog (skip duplicates by category+title or fuzzy title match)
-    for issue in issues:
-        if issue["severity"] == "critical":
-            # Extract first 10 words for fuzzy matching
-            first_10_words = " ".join(issue["title"].split()[:10])
-            cur.execute(
-                """SELECT 1 FROM issues_backlog
-                   WHERE status = 'open'
-                     AND lower(category) = lower(%s)
-                     AND (lower(title) = lower(%s)
-                          OR lower(title) LIKE '%%' || lower(%s) || '%%')
-                   LIMIT 1""",
-                (issue["category"], issue["title"], first_10_words),
-            )
-            if cur.fetchone():
-                logger.info("Skipping duplicate backlog issue: %s", issue["title"])
-                continue
-            cur.execute(
-                """
-                INSERT INTO issues_backlog
-                    (source_run_date, severity, category, title, description, suggested_fix)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
+            [
                 (
-                    date.today(),
+                    run_id,
                     issue["severity"],
                     issue["category"],
                     issue["title"],
                     issue.get("description", ""),
                     issue.get("suggested_fix", ""),
-                ),
-            )
+                )
+                for issue in issues
+            ],
+        )
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        # Copy critical issues to persistent backlog (skip duplicates by category+title or fuzzy title match)
+        for issue in issues:
+            if issue["severity"] == "critical":
+                # Extract first 10 words for fuzzy matching
+                first_10_words = " ".join(issue["title"].split()[:10])
+                cur.execute(
+                    """SELECT 1 FROM issues_backlog
+                       WHERE status = 'open'
+                         AND lower(category) = lower(%s)
+                         AND (lower(title) = lower(%s)
+                              OR lower(title) LIKE '%%' || lower(%s) || '%%')
+                       LIMIT 1""",
+                    (issue["category"], issue["title"], first_10_words),
+                )
+                if cur.fetchone():
+                    logger.info("Skipping duplicate backlog issue: %s", issue["title"])
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO issues_backlog
+                        (source_run_date, severity, category, title, description, suggested_fix)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        date.today(),
+                        issue["severity"],
+                        issue["category"],
+                        issue["title"],
+                        issue.get("description", ""),
+                        issue.get("suggested_fix", ""),
+                    ),
+                )
 
     critical_count = len([i for i in issues if i["severity"] == "critical"])
     logger.info("Stored run_id=%d with %d issues (%d critical → backlog)", run_id, len(issues), critical_count)

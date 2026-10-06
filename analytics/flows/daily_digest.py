@@ -19,13 +19,10 @@ import shutil
 from datetime import date, datetime
 
 import httpx
-import psycopg2
-import psycopg2.extras
 from prefect import flow, get_run_logger, task
 
-from .shared import esc, notify_telegram
+from .shared import db_conn, esc, notify_telegram
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
 PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://processor:8000")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -80,100 +77,98 @@ _REMOVED_RE = re.compile(r"(?:removed|dropped) (\d+)")
 def collect_digest() -> dict:
     """Yesterday's numbers, this morning's analyses, the users — one dict for the formatter."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    data: dict = {"date": date.today(), "system": _system_state()}
+    with db_conn() as conn:
+        cur = conn.cursor()
+        data: dict = {"date": date.today(), "system": _system_state()}
 
-    # Yesterday's traffic
-    cur.execute("""
-        SELECT
-            count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
-            count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
-            count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
-            count(*) FILTER (WHERE delivery_status = 'delivered' AND translation_ms > 0
-                             AND NOT translation_failed) AS translated,
-            count(*) FILTER (WHERE delivery_status = 'delivered' AND cache_hit) AS cached,
-            count(*) FILTER (WHERE translation_failed) AS untranslated,
-            count(*) FILTER (WHERE translation_passthrough) AS passthrough,
-            count(*) FILTER (WHERE delivery_status = 'delivered'
-                             AND message_type NOT IN ('chat', 'text')) AS media
-        FROM message_events
-        WHERE created_at >= current_date - interval '1 day' AND created_at < current_date
-    """)
-    data["traffic"] = dict(cur.fetchone())
+        # Yesterday's traffic
+        cur.execute("""
+            SELECT
+                count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
+                count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
+                count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
+                count(*) FILTER (WHERE delivery_status = 'delivered' AND translation_ms > 0
+                                 AND NOT translation_failed) AS translated,
+                count(*) FILTER (WHERE delivery_status = 'delivered' AND cache_hit) AS cached,
+                count(*) FILTER (WHERE translation_failed) AS untranslated,
+                count(*) FILTER (WHERE translation_passthrough) AS passthrough,
+                count(*) FILTER (WHERE delivery_status = 'delivered'
+                                 AND message_type NOT IN ('chat', 'text')) AS media
+            FROM message_events
+            WHERE created_at >= current_date - interval '1 day' AND created_at < current_date
+        """)
+        data["traffic"] = dict(cur.fetchone())
 
-    # This morning's quality run
-    cur.execute("""
-        SELECT summary FROM nightly_analysis_runs
-        WHERE flow_type = 'translation_quality' AND run_date = current_date
-    """)
-    row = cur.fetchone()
-    summary = None
-    if row:
-        summary = row["summary"] if isinstance(row["summary"], dict) else json.loads(row["summary"] or "{}")
-    data["quality"] = summary
-    worst = (summary or {}).get("worst_pair")
-    if worst:
-        cur.execute("SELECT wa_chat_name FROM chat_pairs WHERE id = %s", (worst["key"],))
-        r = cur.fetchone()
-        data["worst_pair_name"] = (r["wa_chat_name"] if r else "") or ""
-    cur.execute("SELECT count(*) AS n FROM prompt_suggestions WHERE status = 'pending'")
-    data["pending_suggestions"] = cur.fetchone()["n"]
+        # This morning's quality run
+        cur.execute("""
+            SELECT summary FROM nightly_analysis_runs
+            WHERE flow_type = 'translation_quality' AND run_date = current_date
+        """)
+        row = cur.fetchone()
+        summary = None
+        if row:
+            summary = row["summary"] if isinstance(row["summary"], dict) else json.loads(row["summary"] or "{}")
+        data["quality"] = summary
+        worst = (summary or {}).get("worst_pair")
+        if worst:
+            cur.execute("SELECT wa_chat_name FROM chat_pairs WHERE id = %s", (worst["key"],))
+            r = cur.fetchone()
+            data["worst_pair_name"] = (r["wa_chat_name"] if r else "") or ""
+        cur.execute("SELECT count(*) AS n FROM prompt_suggestions WHERE status = 'pending'")
+        data["pending_suggestions"] = cur.fetchone()["n"]
 
-    # This morning's problems run: only what deserves attention
-    cur.execute("""
-        SELECT di.severity, di.title
-        FROM detected_issues di
-        JOIN nightly_analysis_runs nar ON nar.id = di.run_id
-        WHERE nar.flow_type = 'problems' AND nar.run_date = current_date
-          AND di.severity IN ('critical', 'warning')
-        ORDER BY CASE di.severity WHEN 'critical' THEN 0 ELSE 1 END, di.id
-    """)
-    data["issues"] = [dict(r) for r in cur.fetchall()]
+        # This morning's problems run: only what deserves attention
+        cur.execute("""
+            SELECT di.severity, di.title
+            FROM detected_issues di
+            JOIN nightly_analysis_runs nar ON nar.id = di.run_id
+            WHERE nar.flow_type = 'problems' AND nar.run_date = current_date
+              AND di.severity IN ('critical', 'warning')
+            ORDER BY CASE di.severity WHEN 'critical' THEN 0 ELSE 1 END, di.id
+        """)
+        data["issues"] = [dict(r) for r in cur.fetchall()]
 
-    # Glossary movement this morning (the context builder writes a history row per change)
-    cur.execute("""
-        SELECT change_summary FROM chat_profile_history
-        WHERE created_at >= current_date
-    """)
-    added = removed = 0
-    for r in cur.fetchall():
-        s = r["change_summary"] or ""
-        added += sum(int(m) for m in _ADDED_RE.findall(s))
-        removed += sum(int(m) for m in _REMOVED_RE.findall(s))
-    data["glossary"] = {"added": added, "removed": removed}
+        # Glossary movement this morning (the context builder writes a history row per change)
+        cur.execute("""
+            SELECT change_summary FROM chat_profile_history
+            WHERE created_at >= current_date
+        """)
+        added = removed = 0
+        for r in cur.fetchall():
+            s = r["change_summary"] or ""
+            added += sum(int(m) for m in _ADDED_RE.findall(s))
+            removed += sum(int(m) for m in _REMOVED_RE.findall(s))
+        data["glossary"] = {"added": added, "removed": removed}
 
-    # Users: who is connected, how many bridges, what went through for them yesterday
-    cur.execute("""
-        SELECT u.tg_user_id, u.tg_username, u.wa_connected,
-               (SELECT count(*) FROM chat_pairs cp WHERE cp.user_id = u.id AND cp.status = 'active') AS pairs,
-               (SELECT count(*) FROM message_events me JOIN chat_pairs cp ON cp.id = me.chat_pair_id
-                WHERE cp.user_id = u.id AND me.delivery_status = 'delivered'
-                  AND me.created_at >= current_date - interval '1 day' AND me.created_at < current_date) AS delivered,
-               (SELECT max(me.created_at) FROM message_events me JOIN chat_pairs cp ON cp.id = me.chat_pair_id
-                WHERE cp.user_id = u.id AND me.delivery_status = 'delivered') AS last_delivered
-        FROM users u
-        WHERE u.is_active
-        ORDER BY delivered DESC, pairs DESC
-    """)
-    data["users"] = [dict(r) for r in cur.fetchall()]
+        # Users: who is connected, how many bridges, what went through for them yesterday
+        cur.execute("""
+            SELECT u.tg_user_id, u.tg_username, u.wa_connected,
+                   (SELECT count(*) FROM chat_pairs cp WHERE cp.user_id = u.id AND cp.status = 'active') AS pairs,
+                   (SELECT count(*) FROM message_events me JOIN chat_pairs cp ON cp.id = me.chat_pair_id
+                    WHERE cp.user_id = u.id AND me.delivery_status = 'delivered'
+                      AND me.created_at >= current_date - interval '1 day' AND me.created_at < current_date) AS delivered,
+                   (SELECT max(me.created_at) FROM message_events me JOIN chat_pairs cp ON cp.id = me.chat_pair_id
+                    WHERE cp.user_id = u.id AND me.delivery_status = 'delivered') AS last_delivered
+            FROM users u
+            WHERE u.is_active
+            ORDER BY delivered DESC, pairs DESC
+        """)
+        data["users"] = [dict(r) for r in cur.fetchall()]
 
-    # Monday: the weekly report, if it has finished
-    cur.execute("""
-        SELECT executive_summary, recommendations FROM weekly_insights
-        WHERE created_at >= current_date ORDER BY created_at DESC LIMIT 1
-    """)
-    row = cur.fetchone()
-    if row:
-        recs = row["recommendations"]
-        if isinstance(recs, str):
-            recs = json.loads(recs or "[]")
-        data["weekly"] = {"summary": row["executive_summary"], "recommendations": recs or []}
-    elif date.today().weekday() == 0:
-        data["weekly"] = {"pending": True}
+        # Monday: the weekly report, if it has finished
+        cur.execute("""
+            SELECT executive_summary, recommendations FROM weekly_insights
+            WHERE created_at >= current_date ORDER BY created_at DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        if row:
+            recs = row["recommendations"]
+            if isinstance(recs, str):
+                recs = json.loads(recs or "[]")
+            data["weekly"] = {"summary": row["executive_summary"], "recommendations": recs or []}
+        elif date.today().weekday() == 0:
+            data["weekly"] = {"pending": True}
 
-    cur.close()
-    conn.close()
     logger.info("Digest collected: %s", {k: v for k, v in data["traffic"].items()})
     return data
 

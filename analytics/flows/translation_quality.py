@@ -20,14 +20,12 @@ import json
 import os
 from datetime import date
 
-import psycopg2
-import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import jev_eval, llm, quality_stats
+from .shared import db_conn
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # The judge must be stronger than the translator it grades. gpt-4.1-mini judged
@@ -59,12 +57,11 @@ def _load_prompt_from_db() -> tuple[str, str]:
         "- Tone: natural, conversational — match the original register.\n"
     )
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT version, content FROM prompt_registry WHERE key = 'translate'")
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        with db_conn(cursor_factory=None) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT version, content FROM prompt_registry WHERE key = 'translate'")
+            row = cur.fetchone()
+
         if row:
             return row[0], row[1]
     except Exception:
@@ -81,57 +78,54 @@ BATCH_SIZE = 10
 def sample_translations() -> list[dict]:
     """Stratified sample from paired chats: 20 short + 20 long delivered translations."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    samples = []
+        samples = []
 
-    # Short messages (< 100 chars original)
-    cur.execute("""
-        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
-               me.delivery_status, me.error_message,
-               me.chat_pair_id, me.message_type, me.prompt_version,
-               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
-               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
-        FROM message_events me
-        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
-        LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= current_date - interval '1 day'
-          AND me.created_at < current_date
-          AND me.original_text IS NOT NULL
-          AND me.translated_text IS NOT NULL
-          AND length(me.original_text) < 100
-          AND me.delivery_status = 'delivered'
-          AND me.chat_pair_id IS NOT NULL
-        ORDER BY random()
-        LIMIT 20
-    """)
-    samples.extend([dict(r) for r in cur.fetchall()])
+        # Short messages (< 100 chars original)
+        cur.execute("""
+            SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
+                   me.delivery_status, me.error_message,
+                   me.chat_pair_id, me.message_type, me.prompt_version,
+                   COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
+                   CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
+            FROM message_events me
+            LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+            LEFT JOIN users u ON cp.user_id = u.id
+            WHERE me.created_at >= current_date - interval '1 day'
+              AND me.created_at < current_date
+              AND me.original_text IS NOT NULL
+              AND me.translated_text IS NOT NULL
+              AND length(me.original_text) < 100
+              AND me.delivery_status = 'delivered'
+              AND me.chat_pair_id IS NOT NULL
+            ORDER BY random()
+            LIMIT 20
+        """)
+        samples.extend([dict(r) for r in cur.fetchall()])
 
-    # Long messages (>= 100 chars original)
-    cur.execute("""
-        SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
-               me.delivery_status, me.error_message,
-               me.chat_pair_id, me.message_type, me.prompt_version,
-               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
-               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
-        FROM message_events me
-        LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
-        LEFT JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= current_date - interval '1 day'
-          AND me.created_at < current_date
-          AND me.original_text IS NOT NULL
-          AND me.translated_text IS NOT NULL
-          AND length(me.original_text) >= 100
-          AND me.delivery_status = 'delivered'
-          AND me.chat_pair_id IS NOT NULL
-        ORDER BY random()
-        LIMIT 20
-    """)
-    samples.extend([dict(r) for r in cur.fetchall()])
-
-    cur.close()
-    conn.close()
+        # Long messages (>= 100 chars original)
+        cur.execute("""
+            SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
+                   me.delivery_status, me.error_message,
+                   me.chat_pair_id, me.message_type, me.prompt_version,
+                   COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
+                   CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
+            FROM message_events me
+            LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+            LEFT JOIN users u ON cp.user_id = u.id
+            WHERE me.created_at >= current_date - interval '1 day'
+              AND me.created_at < current_date
+              AND me.original_text IS NOT NULL
+              AND me.translated_text IS NOT NULL
+              AND length(me.original_text) >= 100
+              AND me.delivery_status = 'delivered'
+              AND me.chat_pair_id IS NOT NULL
+            ORDER BY random()
+            LIMIT 20
+        """)
+        samples.extend([dict(r) for r in cur.fetchall()])
 
     logger.info("Sampled %d translations (target: %d)", len(samples), SAMPLE_SIZE)
     return samples
@@ -145,44 +139,42 @@ def sample_all_translations() -> list[dict]:
     LLM sample does — that join is what produced the phantom 'Unknown' target language.
     """
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-        SELECT me.id, me.original_text, me.translated_text,
-               me.chat_pair_id, me.message_type, me.prompt_version, 'bridge' AS source,
-               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language
-        FROM message_events me
-        JOIN chat_pairs cp ON me.chat_pair_id = cp.id
-        JOIN users u ON cp.user_id = u.id
-        WHERE me.created_at >= current_date - interval '1 day'
-          AND me.created_at < current_date
-          AND me.delivery_status = 'delivered'
-          AND COALESCE(me.original_text, '') <> ''
-          AND COALESCE(me.translated_text, '') <> ''
-        ORDER BY me.created_at
-        LIMIT %s
-    """, (JEV_MAX_PAIRS,))
-    samples = [dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT me.id, me.original_text, me.translated_text,
+                   me.chat_pair_id, me.message_type, me.prompt_version, 'bridge' AS source,
+                   COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language
+            FROM message_events me
+            JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+            JOIN users u ON cp.user_id = u.id
+            WHERE me.created_at >= current_date - interval '1 day'
+              AND me.created_at < current_date
+              AND me.delivery_status = 'delivered'
+              AND COALESCE(me.original_text, '') <> ''
+              AND COALESCE(me.translated_text, '') <> ''
+            ORDER BY me.created_at
+            LIMIT %s
+        """, (JEV_MAX_PAIRS,))
+        samples = [dict(r) for r in cur.fetchall()]
 
-    cur.execute("""
-        SELECT di.id, di.original_text, di.translated_text,
-               NULL::bigint AS chat_pair_id, 'chat' AS message_type, NULL AS prompt_version,
-               COALESCE(di.target_language, 'Unknown') AS target_language,
-               'direct' AS source
-        FROM direct_interactions di
-        WHERE di.created_at >= current_date - interval '1 day'
-          AND di.created_at < current_date
-          AND di.interaction_type = 'translation'
-          AND COALESCE(di.translated_text, '') <> ''
-          AND di.status = 'completed'
-        ORDER BY di.created_at
-        LIMIT %s
-    """, (max(JEV_MAX_PAIRS - len(samples), 0),))
-    samples.extend(dict(r) for r in cur.fetchall())
+        cur.execute("""
+            SELECT di.id, di.original_text, di.translated_text,
+                   NULL::bigint AS chat_pair_id, 'chat' AS message_type, NULL AS prompt_version,
+                   COALESCE(di.target_language, 'Unknown') AS target_language,
+                   'direct' AS source
+            FROM direct_interactions di
+            WHERE di.created_at >= current_date - interval '1 day'
+              AND di.created_at < current_date
+              AND di.interaction_type = 'translation'
+              AND COALESCE(di.translated_text, '') <> ''
+              AND di.status = 'completed'
+            ORDER BY di.created_at
+            LIMIT %s
+        """, (max(JEV_MAX_PAIRS - len(samples), 0),))
+        samples.extend(dict(r) for r in cur.fetchall())
 
-    cur.close()
-    conn.close()
     logger.info("Collected %d translations for Jev", len(samples))
     return samples
 
@@ -294,18 +286,17 @@ def fetch_pending_suggestions() -> list[dict]:
     """Fetch pending prompt suggestions to avoid LLM duplicates."""
     logger = get_run_logger()
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT suggestion, rationale
-            FROM prompt_suggestions
-            WHERE status = 'pending'
-            ORDER BY created_at DESC
-            LIMIT 20
-        """)
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close()
-        conn.close()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT suggestion, rationale
+                FROM prompt_suggestions
+                WHERE status = 'pending'
+                ORDER BY created_at DESC
+                LIMIT 20
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+
         logger.info("Fetched %d pending suggestions for dedup context", len(rows))
         return rows
     except Exception as exc:
@@ -407,27 +398,30 @@ Issue patterns found across {len(evaluations)} samples:
 Worst translation examples (original → translated):
 {json.dumps(worst_examples, indent=2, ensure_ascii=False)}"""
 
-    response = client.chat.completions.create(
-        model=EVAL_MODEL,
-        messages=[
+    # Same path as the judge: EVAL_MODEL is a reasoning model that rejects `temperature` and
+    # `max_tokens`, and a nightly call has no reason to skip the Flex tier.
+    response = llm.complete(client, llm.build_request(
+        EVAL_MODEL,
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         max_tokens=4000,
-        temperature=0,
-    )
+    ), log=logger)
 
-    content = response.choices[0].message.content.strip()
+    content = (response.choices[0].message.content or "").strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
     suggestions = json.loads(content)
-    tokens = response.usage.total_tokens if response.usage else 0
+    tokens = llm.total_tokens(response.usage)
+    cost = llm.usage_cost(EVAL_MODEL, response.usage)
 
-    logger.info("Generated %d prompt suggestions (tokens: %d)", len(suggestions), tokens)
+    logger.info("Generated %d prompt suggestions (tokens: %d, cost $%.3f)", len(suggestions), tokens, cost)
     return {
         "suggestions": suggestions,
         "tokens_used": tokens,
+        "cost_usd": cost,
         "avg_scores": avg_scores,
         "issue_counts": issue_counts,
         "worst_examples": worst_examples,
@@ -445,12 +439,9 @@ def store_quality_results(
 ) -> int:
     """Store evaluations and suggestions in DB."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-
     total_tokens = eval_result.get("tokens_used", 0) + suggestion_result.get("tokens_used", 0)
-    # Judge cost is measured; the (normally disabled) suggestion call is a rough add-on.
-    cost = eval_result.get("cost_usd", 0.0) + suggestion_result.get("tokens_used", 0) * 0.001 / 1000
+    # Both calls report their own measured cost (llm.usage_cost); the suggestion one is 0 while disabled.
+    cost = eval_result.get("cost_usd", 0.0) + suggestion_result.get("cost_usd", 0.0)
 
     summary = {
         "samples_evaluated": len(eval_result.get("evaluations", [])),
@@ -464,29 +455,32 @@ def store_quality_results(
         "worst_pair": suggestion_result.get("worst_pair"),
     }
 
-    cur.execute(
-        """
-        INSERT INTO nightly_analysis_runs (run_date, flow_type, summary, tokens_used, estimated_cost)
-        VALUES (%s, 'translation_quality', %s, %s, %s)
-        ON CONFLICT (run_date, flow_type) DO UPDATE
-            SET summary = EXCLUDED.summary,
-                tokens_used = EXCLUDED.tokens_used,
-                estimated_cost = EXCLUDED.estimated_cost
-        RETURNING id
-        """,
-        (date.today(), json.dumps(summary), total_tokens, cost),
-    )
-    run_id = cur.fetchone()[0]
-
-    # Remove old data before inserting fresh (UPSERT only updates the run row)
-    cur.execute("DELETE FROM translation_evaluations WHERE run_id = %s", (run_id,))
-    cur.execute("DELETE FROM prompt_suggestions WHERE run_id = %s", (run_id,))
-
-    # Store individual evaluations; shadow rows are Jev's comparison data, kept out of reports
+    # Individual evaluations; shadow rows are Jev's comparison data, kept out of reports
     rows = [(ev, False) for ev in eval_result.get("evaluations", [])]
     rows += [(ev, True) for ev in shadow_evaluations or []]
-    for ev, shadow in rows:
+
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
+
         cur.execute(
+            """
+            INSERT INTO nightly_analysis_runs (run_date, flow_type, summary, tokens_used, estimated_cost)
+            VALUES (%s, 'translation_quality', %s, %s, %s)
+            ON CONFLICT (run_date, flow_type) DO UPDATE
+                SET summary = EXCLUDED.summary,
+                    tokens_used = EXCLUDED.tokens_used,
+                    estimated_cost = EXCLUDED.estimated_cost
+            RETURNING id
+            """,
+            (date.today(), json.dumps(summary), total_tokens, cost),
+        )
+        run_id = cur.fetchone()[0]
+
+        # Remove old data before inserting fresh (UPSERT only updates the run row)
+        cur.execute("DELETE FROM translation_evaluations WHERE run_id = %s", (run_id,))
+        cur.execute("DELETE FROM prompt_suggestions WHERE run_id = %s", (run_id,))
+
+        cur.executemany(
             """
             INSERT INTO translation_evaluations
                 (run_id, message_event_id, original_text, translated_text,
@@ -495,49 +489,48 @@ def store_quality_results(
                  source, chat_pair_id, target_language, message_type, prompt_version)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
-            (
-                run_id,
-                ev.get("message_event_id"),
-                ev.get("original_text", "")[:1000],
-                ev.get("translated_text", "")[:1000],
-                ev.get("quality_score"),
-                ev.get("accuracy_score"),
-                ev.get("naturalness_score"),
-                json.dumps(ev.get("issues", [])),
-                ev.get("evaluator", "llm"),
-                shadow,
-                ev.get("quality_expected"),
-                ev.get("confidence"),
-                ev.get("source") or "bridge",
-                ev.get("chat_pair_id"),
-                ev.get("target_language"),
-                ev.get("message_type"),
-                ev.get("prompt_version"),
-            ),
+            [
+                (
+                    run_id,
+                    ev.get("message_event_id"),
+                    ev.get("original_text", "")[:1000],
+                    ev.get("translated_text", "")[:1000],
+                    ev.get("quality_score"),
+                    ev.get("accuracy_score"),
+                    ev.get("naturalness_score"),
+                    json.dumps(ev.get("issues", [])),
+                    ev.get("evaluator", "llm"),
+                    shadow,
+                    ev.get("quality_expected"),
+                    ev.get("confidence"),
+                    ev.get("source") or "bridge",
+                    ev.get("chat_pair_id"),
+                    ev.get("target_language"),
+                    ev.get("message_type"),
+                    ev.get("prompt_version"),
+                )
+                for ev, shadow in rows
+            ],
         )
 
-    # Store prompt suggestions (skip duplicates across all statuses within 30 days)
-    for sug in suggestion_result.get("suggestions", []):
-        cur.execute(
-            """SELECT 1 FROM prompt_suggestions
-               WHERE lower(suggestion) = lower(%s)
-                 AND created_at > now() - interval '30 days'
-               LIMIT 1""",
-            (sug["suggestion"],),
-        )
-        if cur.fetchone():
-            continue
-        cur.execute(
-            """
-            INSERT INTO prompt_suggestions (run_id, suggestion, rationale)
-            VALUES (%s, %s, %s)
-            """,
-            (run_id, sug["suggestion"], sug.get("rationale", "")),
-        )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        # Store prompt suggestions (skip duplicates across all statuses within 30 days)
+        for sug in suggestion_result.get("suggestions", []):
+            cur.execute(
+                """SELECT 1 FROM prompt_suggestions
+                   WHERE lower(suggestion) = lower(%s)
+                     AND created_at > now() - interval '30 days'
+                   LIMIT 1""",
+                (sug["suggestion"],),
+            )
+            if cur.fetchone():
+                continue
+            cur.execute(
+                """
+                INSERT INTO prompt_suggestions (run_id, suggestion, rationale)
+                VALUES (%s, %s, %s)
+                """,
+                (run_id, sug["suggestion"], sug.get("rationale", "")),
+            )
 
     logger.info(
         "Stored run_id=%d: %d evaluations (+%d shadow), %d suggestions",

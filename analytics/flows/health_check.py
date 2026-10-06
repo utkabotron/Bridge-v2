@@ -18,19 +18,16 @@ import shutil
 from datetime import datetime, timedelta, timezone
 
 import httpx
-import psycopg2
-import psycopg2.extras
 import redis
 from prefect import flow, get_run_logger, task
 
-from .shared import notify_telegram
+from .shared import db_conn, notify_telegram
 
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
 PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://processor:8000")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 
 FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", "0.05"))
 FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", "5"))
@@ -90,12 +87,11 @@ def expected_clients() -> int:
     """How many WhatsApp clients should be up, according to the database."""
     logger = get_run_logger()
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("select count(*) from public.users where wa_connected = true and is_active = true")
-        n = cur.fetchone()[0]
-        cur.close()
-        conn.close()
+        with db_conn(cursor_factory=None) as conn:
+            cur = conn.cursor()
+            cur.execute("select count(*) from public.users where wa_connected = true and is_active = true")
+            n = cur.fetchone()[0]
+
         return int(n)
     except Exception as exc:
         logger.error("Could not read expected client count: %s", exc)
@@ -113,15 +109,13 @@ def detect_dropped_sessions() -> list[str]:
     logger = get_run_logger()
     key = "analytics:health:connected_users"
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute(
-            "select tg_user_id, coalesce(tg_username, '') from public.users "
-            "where wa_connected = true and is_active = true"
-        )
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db_conn(cursor_factory=None) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "select tg_user_id, coalesce(tg_username, '') from public.users "
+                "where wa_connected = true and is_active = true"
+            )
+            rows = cur.fetchall()
     except Exception as exc:
         logger.error("Could not read connected users: %s", exc)
         return []
@@ -343,18 +337,16 @@ def check_processor_failures() -> dict:
     """Mapped failure rate over the last 15 minutes."""
     logger = get_run_logger()
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT
-                count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
-                count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
-            FROM message_events
-            WHERE created_at >= now() - interval '15 minutes'
-        """)
-        row = dict(cur.fetchone())
-        cur.close()
-        conn.close()
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT
+                    count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
+                    count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
+                FROM message_events
+                WHERE created_at >= now() - interval '15 minutes'
+            """)
+            row = dict(cur.fetchone())
     except Exception as exc:
         logger.error("DB query for failure rate failed: %s", exc)
         return {"mapped_total": 0, "mapped_failed": 0, "alerted": False}

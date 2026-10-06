@@ -16,9 +16,8 @@ from pathlib import Path
 
 from prefect import flow, get_run_logger, task
 
-from .shared import notify_telegram
+from .shared import DB_URL, notify_telegram
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "/backups"))
 KEEP = int(os.getenv("BACKUP_KEEP", "7"))
 # A dump far smaller than the last one usually means it failed halfway.

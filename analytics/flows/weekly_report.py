@@ -14,15 +14,12 @@ import json
 import os
 from datetime import date, timedelta
 
-import psycopg2
-import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import llm
+from .shared import db_conn
 
-
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # o3 left the main catalogue; gpt-6.1-sol costs the same and halves on Flex.
@@ -33,220 +30,217 @@ ANALYSIS_MODEL = os.getenv("WEEKLY_MODEL", "gpt-6.1-sol")
 def collect_weekly_data() -> dict:
     """Collect extended data: current week + 4 weeks of trends, prompt, backlog, changelog."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    today = date.today()
-    week_ago = today - timedelta(days=7)
-    four_weeks_ago = today - timedelta(days=28)
-    month_ago = today - timedelta(days=30)
-    data: dict = {"period_start": str(week_ago), "period_end": str(today)}
+        today = date.today()
+        week_ago = today - timedelta(days=7)
+        four_weeks_ago = today - timedelta(days=28)
+        month_ago = today - timedelta(days=30)
+        data: dict = {"period_start": str(week_ago), "period_end": str(today)}
 
-    # --- Current week message overview ---
-    cur.execute("""
-        SELECT
-            count(*) AS total_messages,
-            count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
-            count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
-            count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
-            count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
-            round(avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL)::numeric, 0) AS avg_translation_ms,
-            max(translation_ms) AS max_translation_ms,
-            count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
-            count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
-        FROM message_events
-        WHERE created_at >= %s AND created_at < %s
-    """, (week_ago, today))
-    data["messages"] = dict(cur.fetchone())
+        # --- Current week message overview ---
+        cur.execute("""
+            SELECT
+                count(*) AS total_messages,
+                count(*) FILTER (WHERE delivery_status = 'delivered') AS delivered,
+                count(*) FILTER (WHERE delivery_status = 'failed') AS failed,
+                count(*) FILTER (WHERE delivery_status = 'pending') AS pending,
+                count(*) FILTER (WHERE delivery_status = 'skipped') AS skipped,
+                round(avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL)::numeric, 0) AS avg_translation_ms,
+                max(translation_ms) AS max_translation_ms,
+                count(*) FILTER (WHERE translation_ms > 3000) AS slow_translations,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL) AS mapped_total,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'delivered') AS mapped_delivered,
+                count(*) FILTER (WHERE chat_pair_id IS NOT NULL AND delivery_status = 'failed') AS mapped_failed
+            FROM message_events
+            WHERE created_at >= %s AND created_at < %s
+        """, (week_ago, today))
+        data["messages"] = dict(cur.fetchone())
 
-    # --- Nightly problems: daily summaries (this week) ---
-    cur.execute("""
-        SELECT run_date, summary
-        FROM nightly_analysis_runs
-        WHERE flow_type = 'problems'
-          AND run_date >= %s AND run_date < %s
-        ORDER BY run_date
-    """, (week_ago, today))
-    data["problem_runs"] = [
-        {"date": str(r["run_date"]), "summary": r["summary"]}
-        for r in cur.fetchall()
-    ]
-
-    # --- Detected issues (this week) ---
-    cur.execute("""
-        SELECT di.severity, di.category, di.title, di.description
-        FROM detected_issues di
-        JOIN nightly_analysis_runs nar ON nar.id = di.run_id
-        WHERE nar.run_date >= %s AND nar.run_date < %s
-          AND nar.flow_type = 'problems'
-        ORDER BY di.severity, di.category
-    """, (week_ago, today))
-    data["issues"] = [dict(r) for r in cur.fetchall()]
-
-    # --- Translation quality scores: 4 weeks for trends ---
-    cur.execute("""
-        SELECT
-            nar.run_date,
-            round(avg(te.quality_score)::numeric, 2) AS avg_quality,
-            round(avg(te.accuracy_score)::numeric, 2) AS avg_accuracy,
-            round(avg(te.naturalness_score)::numeric, 2) AS avg_naturalness,
-            count(*) AS sample_count
-        FROM translation_evaluations te
-        JOIN nightly_analysis_runs nar ON nar.id = te.run_id
-        WHERE nar.run_date >= %s AND nar.run_date < %s
-          AND NOT te.shadow AND te.source = 'bridge'
-        GROUP BY nar.run_date
-        ORDER BY nar.run_date
-    """, (four_weeks_ago, today))
-    data["daily_scores_4w"] = [
-        {
-            "date": str(r["run_date"]),
-            "quality": float(r["avg_quality"]) if r["avg_quality"] else None,
-            "accuracy": float(r["avg_accuracy"]) if r["avg_accuracy"] else None,
-            "naturalness": float(r["avg_naturalness"]) if r["avg_naturalness"] else None,
-            "samples": r["sample_count"],
-        }
-        for r in cur.fetchall()
-    ]
-
-    # --- Quality breakdowns (4 weeks): the overall average hid the one chat that was
-    # a third bad, and mixed DM/fallback rows into the bridge numbers ---
-    def _slice(sql: str, params: tuple) -> list[dict]:
-        cur.execute(sql, params)
-        return [
-            {k: (float(v) if hasattr(v, "quantize") else v) for k, v in dict(r).items()}
+        # --- Nightly problems: daily summaries (this week) ---
+        cur.execute("""
+            SELECT run_date, summary
+            FROM nightly_analysis_runs
+            WHERE flow_type = 'problems'
+              AND run_date >= %s AND run_date < %s
+            ORDER BY run_date
+        """, (week_ago, today))
+        data["problem_runs"] = [
+            {"date": str(r["run_date"]), "summary": r["summary"]}
             for r in cur.fetchall()
         ]
 
-    slice_where = """
-        FROM translation_evaluations te
-        JOIN nightly_analysis_runs nar ON nar.id = te.run_id
-        WHERE nar.run_date >= %s AND nar.run_date < %s
-          AND NOT te.shadow AND te.quality_score IS NOT NULL
-    """
-    stats = """
-            count(*) AS n,
-            round(avg(te.quality_score)::numeric, 2) AS quality,
-            round(100.0 * avg((te.quality_score <= 3)::int), 1) AS bad_pct
-    """
-    data["quality_by_source_4w"] = _slice(
-        f"SELECT te.source AS key, {stats} {slice_where} GROUP BY te.source ORDER BY n DESC",
-        (four_weeks_ago, today),
-    )
-    data["quality_by_pair_4w"] = _slice(
-        f"""SELECT te.chat_pair_id AS pair, cp.wa_chat_name AS name, {stats}
+        # --- Detected issues (this week) ---
+        cur.execute("""
+            SELECT di.severity, di.category, di.title, di.description
+            FROM detected_issues di
+            JOIN nightly_analysis_runs nar ON nar.id = di.run_id
+            WHERE nar.run_date >= %s AND nar.run_date < %s
+              AND nar.flow_type = 'problems'
+            ORDER BY di.severity, di.category
+        """, (week_ago, today))
+        data["issues"] = [dict(r) for r in cur.fetchall()]
+
+        # --- Translation quality scores: 4 weeks for trends ---
+        cur.execute("""
+            SELECT
+                nar.run_date,
+                round(avg(te.quality_score)::numeric, 2) AS avg_quality,
+                round(avg(te.accuracy_score)::numeric, 2) AS avg_accuracy,
+                round(avg(te.naturalness_score)::numeric, 2) AS avg_naturalness,
+                count(*) AS sample_count
             FROM translation_evaluations te
             JOIN nightly_analysis_runs nar ON nar.id = te.run_id
-            LEFT JOIN chat_pairs cp ON cp.id = te.chat_pair_id
             WHERE nar.run_date >= %s AND nar.run_date < %s
-              AND NOT te.shadow AND te.quality_score IS NOT NULL AND te.source = 'bridge'
-            GROUP BY te.chat_pair_id, cp.wa_chat_name
-            HAVING count(*) >= 5
-            ORDER BY bad_pct DESC, n DESC
-            LIMIT 15""",
-        (four_weeks_ago, today),
-    )
-    data["quality_by_language_4w"] = _slice(
-        f"SELECT te.target_language AS key, {stats} {slice_where} AND te.source = 'bridge' "
-        "GROUP BY te.target_language ORDER BY n DESC",
-        (four_weeks_ago, today),
-    )
-    data["quality_by_type_4w"] = _slice(
-        f"SELECT te.message_type AS key, {stats} {slice_where} AND te.source = 'bridge' "
-        "GROUP BY te.message_type ORDER BY n DESC",
-        (four_weeks_ago, today),
-    )
-    data["quality_by_prompt_version_4w"] = _slice(
-        f"SELECT te.prompt_version AS key, {stats} {slice_where} AND te.source = 'bridge' "
-        "GROUP BY te.prompt_version ORDER BY n DESC",
-        (four_weeks_ago, today),
-    )
+              AND NOT te.shadow AND te.source = 'bridge'
+            GROUP BY nar.run_date
+            ORDER BY nar.run_date
+        """, (four_weeks_ago, today))
+        data["daily_scores_4w"] = [
+            {
+                "date": str(r["run_date"]),
+                "quality": float(r["avg_quality"]) if r["avg_quality"] else None,
+                "accuracy": float(r["avg_accuracy"]) if r["avg_accuracy"] else None,
+                "naturalness": float(r["avg_naturalness"]) if r["avg_naturalness"] else None,
+                "samples": r["sample_count"],
+            }
+            for r in cur.fetchall()
+        ]
 
-    # Issue types this week, summed over the nightly quality runs
-    cur.execute("""
-        SELECT summary FROM nightly_analysis_runs
-        WHERE flow_type = 'translation_quality' AND run_date >= %s AND run_date < %s
-    """, (week_ago, today))
-    issue_totals: dict[str, int] = {}
-    for r in cur.fetchall():
-        summary = r["summary"] if isinstance(r["summary"], dict) else json.loads(r["summary"] or "{}")
-        for k, v in (summary.get("issue_counts") or {}).items():
-            issue_totals[k] = issue_totals.get(k, 0) + int(v)
-    data["issue_counts_week"] = dict(sorted(issue_totals.items(), key=lambda kv: -kv[1]))
+        # --- Quality breakdowns (4 weeks): the overall average hid the one chat that was
+        # a third bad, and mixed DM/fallback rows into the bridge numbers ---
+        def _slice(sql: str, params: tuple) -> list[dict]:
+            cur.execute(sql, params)
+            return [
+                {k: (float(v) if hasattr(v, "quantize") else v) for k, v in dict(r).items()}
+                for r in cur.fetchall()
+            ]
 
-    # --- Direct interactions (bot private chat) ---
-    cur.execute("""
-        SELECT
-            count(*) AS total,
-            count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
-            count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
-            count(*) FILTER (WHERE status = 'failed') AS failed,
-            round(avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL)::numeric, 0) AS avg_translation_ms,
-            round(avg(processing_ms) FILTER (WHERE processing_ms IS NOT NULL)::numeric, 0) AS avg_processing_ms
-        FROM direct_interactions
-        WHERE created_at >= %s AND created_at < %s
-    """, (week_ago, today))
-    data["direct_interactions"] = dict(cur.fetchone())
+        slice_where = """
+            FROM translation_evaluations te
+            JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+            WHERE nar.run_date >= %s AND nar.run_date < %s
+              AND NOT te.shadow AND te.quality_score IS NOT NULL
+        """
+        stats = """
+                count(*) AS n,
+                round(avg(te.quality_score)::numeric, 2) AS quality,
+                round(100.0 * avg((te.quality_score <= 3)::int), 1) AS bad_pct
+        """
+        data["quality_by_source_4w"] = _slice(
+            f"SELECT te.source AS key, {stats} {slice_where} GROUP BY te.source ORDER BY n DESC",
+            (four_weeks_ago, today),
+        )
+        data["quality_by_pair_4w"] = _slice(
+            f"""SELECT te.chat_pair_id AS pair, cp.wa_chat_name AS name, {stats}
+                FROM translation_evaluations te
+                JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+                LEFT JOIN chat_pairs cp ON cp.id = te.chat_pair_id
+                WHERE nar.run_date >= %s AND nar.run_date < %s
+                  AND NOT te.shadow AND te.quality_score IS NOT NULL AND te.source = 'bridge'
+                GROUP BY te.chat_pair_id, cp.wa_chat_name
+                HAVING count(*) >= 5
+                ORDER BY bad_pct DESC, n DESC
+                LIMIT 15""",
+            (four_weeks_ago, today),
+        )
+        data["quality_by_language_4w"] = _slice(
+            f"SELECT te.target_language AS key, {stats} {slice_where} AND te.source = 'bridge' "
+            "GROUP BY te.target_language ORDER BY n DESC",
+            (four_weeks_ago, today),
+        )
+        data["quality_by_type_4w"] = _slice(
+            f"SELECT te.message_type AS key, {stats} {slice_where} AND te.source = 'bridge' "
+            "GROUP BY te.message_type ORDER BY n DESC",
+            (four_weeks_ago, today),
+        )
+        data["quality_by_prompt_version_4w"] = _slice(
+            f"SELECT te.prompt_version AS key, {stats} {slice_where} AND te.source = 'bridge' "
+            "GROUP BY te.prompt_version ORDER BY n DESC",
+            (four_weeks_ago, today),
+        )
 
-    # --- Current translation prompt ---
-    cur.execute("SELECT key, version, content FROM prompt_registry WHERE key = 'translate'")
-    row = cur.fetchone()
-    if row:
-        data["current_prompt"] = {"version": row["version"], "content": row["content"]}
-    else:
-        data["current_prompt"] = None
+        # Issue types this week, summed over the nightly quality runs
+        cur.execute("""
+            SELECT summary FROM nightly_analysis_runs
+            WHERE flow_type = 'translation_quality' AND run_date >= %s AND run_date < %s
+        """, (week_ago, today))
+        issue_totals: dict[str, int] = {}
+        for r in cur.fetchall():
+            summary = r["summary"] if isinstance(r["summary"], dict) else json.loads(r["summary"] or "{}")
+            for k, v in (summary.get("issue_counts") or {}).items():
+                issue_totals[k] = issue_totals.get(k, 0) + int(v)
+        data["issue_counts_week"] = dict(sorted(issue_totals.items(), key=lambda kv: -kv[1]))
 
-    # --- ALL pending prompt suggestions (not just this week) ---
-    cur.execute("""
-        SELECT ps.id, ps.suggestion, ps.rationale, nar.run_date
-        FROM prompt_suggestions ps
-        JOIN nightly_analysis_runs nar ON nar.id = ps.run_id
-        WHERE ps.status = 'pending'
-        ORDER BY ps.created_at DESC
-    """)
-    data["pending_suggestions"] = [
-        {
-            "id": r["id"],
-            "suggestion": r["suggestion"],
-            "rationale": r["rationale"],
-            "from_date": str(r["run_date"]),
-        }
-        for r in cur.fetchall()
-    ]
+        # --- Direct interactions (bot private chat) ---
+        cur.execute("""
+            SELECT
+                count(*) AS total,
+                count(*) FILTER (WHERE interaction_type = 'translation') AS translations,
+                count(*) FILTER (WHERE interaction_type = 'media_analysis') AS analyses,
+                count(*) FILTER (WHERE status = 'failed') AS failed,
+                round(avg(translation_ms) FILTER (WHERE translation_ms IS NOT NULL)::numeric, 0) AS avg_translation_ms,
+                round(avg(processing_ms) FILTER (WHERE processing_ms IS NOT NULL)::numeric, 0) AS avg_processing_ms
+            FROM direct_interactions
+            WHERE created_at >= %s AND created_at < %s
+        """, (week_ago, today))
+        data["direct_interactions"] = dict(cur.fetchone())
 
-    # --- Open issues from backlog ---
-    cur.execute("""
-        SELECT id, source_run_date, severity, category, title, description, suggested_fix
-        FROM issues_backlog
-        WHERE status = 'open'
-        ORDER BY source_run_date DESC
-    """)
-    data["open_backlog"] = [dict(r) for r in cur.fetchall()]
-    # Serialize dates
-    for item in data["open_backlog"]:
-        item["source_run_date"] = str(item["source_run_date"])
+        # --- Current translation prompt ---
+        cur.execute("SELECT key, version, content FROM prompt_registry WHERE key = 'translate'")
+        row = cur.fetchone()
+        if row:
+            data["current_prompt"] = {"version": row["version"], "content": row["content"]}
+        else:
+            data["current_prompt"] = None
 
-    # --- Analytics changelog (last month) ---
-    cur.execute("""
-        SELECT change_date, change_type, description, impact_notes
-        FROM analytics_changelog
-        WHERE change_date >= %s
-        ORDER BY change_date DESC
-    """, (month_ago,))
-    data["changelog"] = [
-        {
-            "date": str(r["change_date"]),
-            "type": r["change_type"],
-            "description": r["description"],
-            "impact": r["impact_notes"],
-        }
-        for r in cur.fetchall()
-    ]
+        # --- ALL pending prompt suggestions (not just this week) ---
+        cur.execute("""
+            SELECT ps.id, ps.suggestion, ps.rationale, nar.run_date
+            FROM prompt_suggestions ps
+            JOIN nightly_analysis_runs nar ON nar.id = ps.run_id
+            WHERE ps.status = 'pending'
+            ORDER BY ps.created_at DESC
+        """)
+        data["pending_suggestions"] = [
+            {
+                "id": r["id"],
+                "suggestion": r["suggestion"],
+                "rationale": r["rationale"],
+                "from_date": str(r["run_date"]),
+            }
+            for r in cur.fetchall()
+        ]
 
-    cur.close()
-    conn.close()
+        # --- Open issues from backlog ---
+        cur.execute("""
+            SELECT id, source_run_date, severity, category, title, description, suggested_fix
+            FROM issues_backlog
+            WHERE status = 'open'
+            ORDER BY source_run_date DESC
+        """)
+        data["open_backlog"] = [dict(r) for r in cur.fetchall()]
+        # Serialize dates
+        for item in data["open_backlog"]:
+            item["source_run_date"] = str(item["source_run_date"])
+
+        # --- Analytics changelog (last month) ---
+        cur.execute("""
+            SELECT change_date, change_type, description, impact_notes
+            FROM analytics_changelog
+            WHERE change_date >= %s
+            ORDER BY change_date DESC
+        """, (month_ago,))
+        data["changelog"] = [
+            {
+                "date": str(r["change_date"]),
+                "type": r["change_type"],
+                "description": r["description"],
+                "impact": r["impact_notes"],
+            }
+            for r in cur.fetchall()
+        ]
 
     logger.info(
         "Collected weekly data: %d messages, %d direct, %d issues, %d quality days (4w), "
@@ -266,20 +260,18 @@ def collect_weekly_data() -> dict:
 def load_previous_insights() -> list[dict]:
     """Load last 4 weekly_insights for continuity and recommendation tracking."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-        SELECT week_start, week_end, executive_summary,
-               deep_analysis, recommendations, prompt_draft,
-               analytics_meta, previous_recommendations_review
-        FROM weekly_insights
-        ORDER BY week_start DESC
-        LIMIT 4
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+        cur.execute("""
+            SELECT week_start, week_end, executive_summary,
+                   deep_analysis, recommendations, prompt_draft,
+                   analytics_meta, previous_recommendations_review
+            FROM weekly_insights
+            ORDER BY week_start DESC
+            LIMIT 4
+        """)
+        rows = cur.fetchall()
 
     insights = []
     for r in rows:
@@ -464,69 +456,65 @@ Rules:
 def store_weekly_insights(data: dict, o3_result: dict) -> int:
     """Store analysis in weekly_insights and update prompt_suggestions based on review."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
 
-    analysis = o3_result["analysis"]
-    tokens = o3_result.get("tokens_used", 0)
-    # o3: ~$2/1M input + $8/1M output (thinking tokens billed as output)
-    cost = o3_result.get("cost_usd", 0.0)
+        analysis = o3_result["analysis"]
+        tokens = o3_result.get("tokens_used", 0)
+        # o3: ~$2/1M input + $8/1M output (thinking tokens billed as output)
+        cost = o3_result.get("cost_usd", 0.0)
 
-    today = date.today()
-    week_start = today - timedelta(days=7)
+        today = date.today()
+        week_start = today - timedelta(days=7)
 
-    cur.execute(
-        """
-        INSERT INTO weekly_insights
-            (week_start, week_end, executive_summary, deep_analysis,
-             recommendations, prompt_draft, analytics_meta,
-             previous_recommendations_review, tokens_used, estimated_cost)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (week_start) DO UPDATE SET
-            week_end = EXCLUDED.week_end,
-            executive_summary = EXCLUDED.executive_summary,
-            deep_analysis = EXCLUDED.deep_analysis,
-            recommendations = EXCLUDED.recommendations,
-            prompt_draft = EXCLUDED.prompt_draft,
-            analytics_meta = EXCLUDED.analytics_meta,
-            previous_recommendations_review = EXCLUDED.previous_recommendations_review,
-            tokens_used = EXCLUDED.tokens_used,
-            estimated_cost = EXCLUDED.estimated_cost
-        RETURNING id
-        """,
-        (
-            week_start,
-            today,
-            analysis.get("executive_summary", ""),
-            json.dumps({
-                "delivery_health": analysis.get("delivery_health", {}),
-                "translation_quality": analysis.get("translation_quality", {}),
-            }),
-            json.dumps(analysis.get("recommendations", [])),
-            analysis.get("prompt_evaluation", {}).get("new_prompt_draft"),
-            json.dumps(analysis.get("analytics_meta", {})),
-            json.dumps(analysis.get("previous_recommendations_review", [])),
-            tokens,
-            cost,
-        ),
-    )
-    insight_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO weekly_insights
+                (week_start, week_end, executive_summary, deep_analysis,
+                 recommendations, prompt_draft, analytics_meta,
+                 previous_recommendations_review, tokens_used, estimated_cost)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (week_start) DO UPDATE SET
+                week_end = EXCLUDED.week_end,
+                executive_summary = EXCLUDED.executive_summary,
+                deep_analysis = EXCLUDED.deep_analysis,
+                recommendations = EXCLUDED.recommendations,
+                prompt_draft = EXCLUDED.prompt_draft,
+                analytics_meta = EXCLUDED.analytics_meta,
+                previous_recommendations_review = EXCLUDED.previous_recommendations_review,
+                tokens_used = EXCLUDED.tokens_used,
+                estimated_cost = EXCLUDED.estimated_cost
+            RETURNING id
+            """,
+            (
+                week_start,
+                today,
+                analysis.get("executive_summary", ""),
+                json.dumps({
+                    "delivery_health": analysis.get("delivery_health", {}),
+                    "translation_quality": analysis.get("translation_quality", {}),
+                }),
+                json.dumps(analysis.get("recommendations", [])),
+                analysis.get("prompt_evaluation", {}).get("new_prompt_draft"),
+                json.dumps(analysis.get("analytics_meta", {})),
+                json.dumps(analysis.get("previous_recommendations_review", [])),
+                tokens,
+                cost,
+            ),
+        )
+        insight_id = cur.fetchone()[0]
 
-    # Update prompt_suggestions based on o3 review
-    reviews = analysis.get("prompt_evaluation", {}).get("suggestion_reviews", [])
-    for review in reviews:
-        suggestion_id = review.get("suggestion_id")
-        verdict = review.get("verdict", "defer")
-        if suggestion_id and verdict in ("apply", "reject"):
-            status = "applied" if verdict == "apply" else "rejected"
-            cur.execute(
-                "UPDATE prompt_suggestions SET status = %s WHERE id = %s AND status = 'pending'",
-                (status, suggestion_id),
-            )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        # Update prompt_suggestions based on o3 review
+        reviews = analysis.get("prompt_evaluation", {}).get("suggestion_reviews", [])
+        for review in reviews:
+            suggestion_id = review.get("suggestion_id")
+            verdict = review.get("verdict", "defer")
+            if suggestion_id and verdict in ("apply", "reject"):
+                status = "applied" if verdict == "apply" else "rejected"
+                cur.execute(
+                    "UPDATE prompt_suggestions SET status = %s WHERE id = %s AND status = 'pending'",
+                    (status, suggestion_id),
+                )
 
     logger.info(
         "Stored weekly insight id=%d, reviewed %d suggestions, cost=$%.4f",

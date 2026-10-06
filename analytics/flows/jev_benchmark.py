@@ -14,43 +14,37 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
-
-import psycopg2
-import psycopg2.extras
 
 from . import jev_eval
-
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
+from .shared import db_conn
 
 
 def load_llm_evaluations(limit: int) -> list[dict]:
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    # One row per message: the same event can be sampled on more than one night.
-    cur.execute("""
-        SELECT * FROM (
-            SELECT DISTINCT ON (te.message_event_id)
-                   te.message_event_id AS id, te.original_text, te.translated_text,
-                   te.quality_score, te.issues_found, te.created_at,
-                   COALESCE(cp.target_language, u.target_language) AS target_language
-            FROM translation_evaluations te
-            JOIN message_events me ON me.id = te.message_event_id
-            JOIN chat_pairs cp ON cp.id = me.chat_pair_id
-            JOIN users u ON u.id = cp.user_id
-            WHERE te.evaluator = 'llm'
-              AND NOT te.shadow
-              AND te.quality_score IS NOT NULL
-              AND COALESCE(te.original_text, '') <> ''
-              AND COALESCE(te.translated_text, '') <> ''
-            ORDER BY te.message_event_id, te.created_at DESC
-        ) latest
-        ORDER BY created_at DESC
-        LIMIT %s
-    """, (limit,))
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        # One row per message: the same event can be sampled on more than one night.
+        cur.execute("""
+            SELECT * FROM (
+                SELECT DISTINCT ON (te.message_event_id)
+                       te.message_event_id AS id, te.original_text, te.translated_text,
+                       te.quality_score, te.issues_found, te.created_at,
+                       COALESCE(cp.target_language, u.target_language) AS target_language
+                FROM translation_evaluations te
+                JOIN message_events me ON me.id = te.message_event_id
+                JOIN chat_pairs cp ON cp.id = me.chat_pair_id
+                JOIN users u ON u.id = cp.user_id
+                WHERE te.evaluator = 'llm'
+                  AND NOT te.shadow
+                  AND te.quality_score IS NOT NULL
+                  AND COALESCE(te.original_text, '') <> ''
+                  AND COALESCE(te.translated_text, '') <> ''
+                ORDER BY te.message_event_id, te.created_at DESC
+            ) latest
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+
     return rows
 
 

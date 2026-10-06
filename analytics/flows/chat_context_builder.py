@@ -22,16 +22,13 @@ import json
 import os
 import sys
 
-import psycopg2
-import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import glossary as glossary_rules
 from . import llm
-from .shared import invalidate_profile_cache
+from .shared import db_conn, invalidate_profile_cache
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 ANALYSIS_MODEL = os.getenv("CONTEXT_MODEL", "gpt-6.1-sol")
@@ -55,57 +52,54 @@ def collect_per_chat_data() -> list[dict]:
     the transliterations it had itself caused.
     """
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    # Get all active chat pairs with their existing profiles
-    cur.execute("""
-        SELECT cp.id AS chat_pair_id,
-               cp.wa_chat_id,
-               coalesce(cp.target_language, u.target_language) as target_language,
-               prof.profile_data,
-               prof.version
-        FROM chat_pairs cp
-        JOIN users u ON u.id = cp.user_id
-        LEFT JOIN chat_profiles prof ON prof.chat_pair_id = cp.id
-        WHERE cp.status = 'active'
-    """)
-    pairs = [dict(r) for r in cur.fetchall()]
-
-    result = []
-    for pair in pairs:
-        has_profile = pair["profile_data"] is not None
-        interval = "1 day" if has_profile else "90 days"
-
+        # Get all active chat pairs with their existing profiles
         cur.execute("""
-            SELECT original_text, sender_name
-            FROM message_events
-            WHERE chat_pair_id = %s
-              AND created_at >= current_date - interval %s
-              AND created_at < current_date
-              AND original_text IS NOT NULL
-              AND original_text != ''
-              AND delivery_status = 'delivered'
-            ORDER BY created_at
-            LIMIT 500
-        """, (pair["chat_pair_id"], interval))
+            SELECT cp.id AS chat_pair_id,
+                   cp.wa_chat_id,
+                   coalesce(cp.target_language, u.target_language) as target_language,
+                   prof.profile_data,
+                   prof.version
+            FROM chat_pairs cp
+            JOIN users u ON u.id = cp.user_id
+            LEFT JOIN chat_profiles prof ON prof.chat_pair_id = cp.id
+            WHERE cp.status = 'active'
+        """)
+        pairs = [dict(r) for r in cur.fetchall()]
 
-        messages = [dict(r) for r in cur.fetchall()]
+        result = []
+        for pair in pairs:
+            has_profile = pair["profile_data"] is not None
+            interval = "1 day" if has_profile else "90 days"
 
-        if len(messages) < (MIN_MESSAGES_EXISTING if has_profile else MIN_MESSAGES):
-            continue
+            cur.execute("""
+                SELECT original_text, sender_name
+                FROM message_events
+                WHERE chat_pair_id = %s
+                  AND created_at >= current_date - interval %s
+                  AND created_at < current_date
+                  AND original_text IS NOT NULL
+                  AND original_text != ''
+                  AND delivery_status = 'delivered'
+                ORDER BY created_at
+                LIMIT 500
+            """, (pair["chat_pair_id"], interval))
 
-        result.append({
-            "chat_pair_id": pair["chat_pair_id"],
-            "wa_chat_id": pair["wa_chat_id"],
-            "target_language": pair.get("target_language") or "Russian",
-            "existing_profile": pair["profile_data"],
-            "existing_version": pair.get("version") or 0,
-            "messages": messages,
-        })
+            messages = [dict(r) for r in cur.fetchall()]
 
-    cur.close()
-    conn.close()
+            if len(messages) < (MIN_MESSAGES_EXISTING if has_profile else MIN_MESSAGES):
+                continue
+
+            result.append({
+                "chat_pair_id": pair["chat_pair_id"],
+                "wa_chat_id": pair["wa_chat_id"],
+                "target_language": pair.get("target_language") or "Russian",
+                "existing_profile": pair["profile_data"],
+                "existing_version": pair.get("version") or 0,
+                "messages": messages,
+            })
 
     logger.info("Collected data for %d chats (of %d active pairs)", len(result), len(pairs))
     return result
@@ -305,9 +299,16 @@ def merge_profiles(existing: dict | None, delta: dict) -> dict:
     return merged
 
 
-def _write_profile(cur, chat_pair_id: int, profile: dict, version: int, tokens: int,
-                   cost: float, change_summary: str) -> None:
-    cur.execute("""
+def _write_profiles(cur, writes: list[tuple]) -> None:
+    """UPSERT profiles and append their history rows, two statements for the whole batch.
+
+    Each write is (chat_pair_id, profile, version, tokens, cost, change_summary). Callers
+    read a pair's current profile before building its write and hand over at most one write
+    per pair, so deferring the writes to the end of the loop cannot change what they read.
+    """
+    if not writes:
+        return
+    cur.executemany("""
         INSERT INTO chat_profiles (chat_pair_id, profile_data, version, tokens_used, estimated_cost, updated_at)
         VALUES (%s, %s, %s, %s, %s, now())
         ON CONFLICT (chat_pair_id) DO UPDATE
@@ -316,11 +317,13 @@ def _write_profile(cur, chat_pair_id: int, profile: dict, version: int, tokens: 
                 tokens_used = chat_profiles.tokens_used + EXCLUDED.tokens_used,
                 estimated_cost = chat_profiles.estimated_cost + EXCLUDED.estimated_cost,
                 updated_at = now()
-    """, (chat_pair_id, json.dumps(profile, ensure_ascii=False), version, tokens, cost))
-    cur.execute("""
+    """, [(pid, json.dumps(profile, ensure_ascii=False), version, tokens, cost)
+          for pid, profile, version, tokens, cost, _ in writes])
+    cur.executemany("""
         INSERT INTO chat_profile_history (chat_pair_id, version, profile_data, change_summary)
         VALUES (%s, %s, %s, %s)
-    """, (chat_pair_id, version, json.dumps(profile, ensure_ascii=False), change_summary))
+    """, [(pid, version, json.dumps(profile, ensure_ascii=False), change_summary)
+          for pid, profile, version, _, _, change_summary in writes])
 
 
 @task(retries=2, name="store-profiles")
@@ -332,59 +335,56 @@ def store_profiles(results: list[dict]) -> int:
         logger.info("No profiles to store")
         return 0
 
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    stored = 0
-    touched: list[int] = []
-    for r in results:
-        chat_pair_id = r["chat_pair_id"]
-        delta = r["delta"]
-        dropped = r.get("dropped") or {}
-        tokens = r.get("tokens_used", 0)
-        messages_analyzed = r.get("messages_analyzed", 0)
+        writes: list[tuple] = []
+        for r in results:
+            chat_pair_id = r["chat_pair_id"]
+            delta = r["delta"]
+            dropped = r.get("dropped") or {}
+            tokens = r.get("tokens_used", 0)
+            messages_analyzed = r.get("messages_analyzed", 0)
 
-        # Skip empty deltas (a validator rejection alone is still worth recording)
-        if not any(delta.get(k) for k in PROFILE_FIELDS) and not dropped:
-            continue
+            # Skip empty deltas (a validator rejection alone is still worth recording)
+            if not any(delta.get(k) for k in PROFILE_FIELDS) and not dropped:
+                continue
 
-        # Load current profile
-        cur.execute(
-            "SELECT profile_data, version FROM chat_profiles WHERE chat_pair_id = %s",
-            (chat_pair_id,),
-        )
-        row = cur.fetchone()
-        existing = dict(row["profile_data"]) if row else None
-        current_version = row["version"] if row else 0
+            # Load current profile
+            cur.execute(
+                "SELECT profile_data, version FROM chat_profiles WHERE chat_pair_id = %s",
+                (chat_pair_id,),
+            )
+            row = cur.fetchone()
+            existing = dict(row["profile_data"]) if row else None
+            current_version = row["version"] if row else 0
 
-        # Merge
-        merged = merge_profiles(existing, delta)
-        merged = glossary_rules.record_dropped(merged, dropped)
-        merged["messages_analyzed"] = (existing or {}).get("messages_analyzed", 0) + messages_analyzed
-        new_version = current_version + 1
+            # Merge
+            merged = merge_profiles(existing, delta)
+            merged = glossary_rules.record_dropped(merged, dropped)
+            merged["messages_analyzed"] = (existing or {}).get("messages_analyzed", 0) + messages_analyzed
+            new_version = current_version + 1
 
-        cost = r.get("cost_usd", 0.0)
+            cost = r.get("cost_usd", 0.0)
 
-        change_parts = []
-        if delta.get("glossary"):
-            change_parts.append(f"+{len(delta['glossary'])} glossary")
-        if dropped:
-            change_parts.append(f"validator dropped {len(dropped)}")
-        if delta.get("members"):
-            change_parts.append(f"+{len(delta['members'])} members")
-        for k in ("chat_type", "chat_description", "tone"):
-            if delta.get(k):
-                change_parts.append(f"updated {k}")
-        change_summary = ", ".join(change_parts) if change_parts else "no changes"
+            change_parts = []
+            if delta.get("glossary"):
+                change_parts.append(f"+{len(delta['glossary'])} glossary")
+            if dropped:
+                change_parts.append(f"validator dropped {len(dropped)}")
+            if delta.get("members"):
+                change_parts.append(f"+{len(delta['members'])} members")
+            for k in ("chat_type", "chat_description", "tone"):
+                if delta.get(k):
+                    change_parts.append(f"updated {k}")
+            change_summary = ", ".join(change_parts) if change_parts else "no changes"
 
-        _write_profile(cur, chat_pair_id, merged, new_version, tokens, cost, change_summary)
-        touched.append(chat_pair_id)
-        stored += 1
+            writes.append((chat_pair_id, merged, new_version, tokens, cost, change_summary))
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        _write_profiles(cur, writes)
 
+    stored = len(writes)
+    touched = [w[0] for w in writes]
     # The processor caches profiles for an hour; a stale copy would keep serving the old glossary.
     invalidate_profile_cache(touched)
 
@@ -399,50 +399,48 @@ def apply_quality_feedback() -> list[dict]:
     Reads this morning's translation-quality run (it finishes half an hour before us).
     """
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-        SELECT me.chat_pair_id, te.original_text, te.translated_text, te.quality_score, te.issues_found
-        FROM translation_evaluations te
-        JOIN nightly_analysis_runs nar ON nar.id = te.run_id
-        JOIN message_events me ON me.id = te.message_event_id
-        WHERE nar.flow_type = 'translation_quality'
-          AND nar.run_date = current_date
-          AND NOT te.shadow
-          AND me.chat_pair_id IS NOT NULL
-    """)
-    by_pair: dict[int, list[dict]] = {}
-    for r in cur.fetchall():
-        issues = r["issues_found"]
-        if isinstance(issues, str):
-            issues = json.loads(issues or "[]")
-        by_pair.setdefault(r["chat_pair_id"], []).append({**dict(r), "issues": issues})
+        cur.execute("""
+            SELECT me.chat_pair_id, te.original_text, te.translated_text, te.quality_score, te.issues_found
+            FROM translation_evaluations te
+            JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+            JOIN message_events me ON me.id = te.message_event_id
+            WHERE nar.flow_type = 'translation_quality'
+              AND nar.run_date = current_date
+              AND NOT te.shadow
+              AND me.chat_pair_id IS NOT NULL
+        """)
+        by_pair: dict[int, list[dict]] = {}
+        for r in cur.fetchall():
+            issues = r["issues_found"]
+            if isinstance(issues, str):
+                issues = json.loads(issues or "[]")
+            by_pair.setdefault(r["chat_pair_id"], []).append({**dict(r), "issues": issues})
 
-    outcomes: list[dict] = []
-    touched: list[int] = []
-    for pair_id, evaluations in by_pair.items():
-        cur.execute("SELECT profile_data, version FROM chat_profiles WHERE chat_pair_id = %s", (pair_id,))
-        row = cur.fetchone()
-        if not row or not (row["profile_data"] or {}).get("glossary"):
-            continue
-        profile = dict(row["profile_data"])
-        hits = glossary_rules.find_hits(evaluations, profile["glossary"])
-        if not hits:
-            continue
-        updated, removed = glossary_rules.apply_flags(profile, hits)
-        summary = f"evaluator flagged {len(hits)}"
-        if removed:
-            summary += f", removed {len(removed)}: " + ", ".join(removed)
-        _write_profile(cur, pair_id, updated, row["version"] + 1, 0, 0.0, summary)
-        touched.append(pair_id)
-        outcomes.append({"chat_pair_id": pair_id, "flagged": sorted(hits), "removed": removed})
-        logger.info("Chat %d: %s", pair_id, summary)
+        outcomes: list[dict] = []
+        writes: list[tuple] = []
+        for pair_id, evaluations in by_pair.items():
+            cur.execute("SELECT profile_data, version FROM chat_profiles WHERE chat_pair_id = %s", (pair_id,))
+            row = cur.fetchone()
+            if not row or not (row["profile_data"] or {}).get("glossary"):
+                continue
+            profile = dict(row["profile_data"])
+            hits = glossary_rules.find_hits(evaluations, profile["glossary"])
+            if not hits:
+                continue
+            updated, removed = glossary_rules.apply_flags(profile, hits)
+            summary = f"evaluator flagged {len(hits)}"
+            if removed:
+                summary += f", removed {len(removed)}: " + ", ".join(removed)
+            writes.append((pair_id, updated, row["version"] + 1, 0, 0.0, summary))
+            outcomes.append({"chat_pair_id": pair_id, "flagged": sorted(hits), "removed": removed})
+            logger.info("Chat %d: %s", pair_id, summary)
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    invalidate_profile_cache(touched)
+        _write_profiles(cur, writes)
+
+    invalidate_profile_cache([w[0] for w in writes])
     return outcomes
 
 
@@ -483,39 +481,38 @@ def prune_glossaries() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     log = logging.getLogger("prune_glossaries")
 
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT prof.chat_pair_id, prof.profile_data, prof.version,
-               coalesce(cp.target_language, u.target_language, 'Russian') AS target_language
-        FROM chat_profiles prof
-        JOIN chat_pairs cp ON cp.id = prof.chat_pair_id
-        JOIN users u ON u.id = cp.user_id
-        ORDER BY prof.chat_pair_id
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT prof.chat_pair_id, prof.profile_data, prof.version,
+                   coalesce(cp.target_language, u.target_language, 'Russian') AS target_language
+            FROM chat_profiles prof
+            JOIN chat_pairs cp ON cp.id = prof.chat_pair_id
+            JOIN users u ON u.id = cp.user_id
+            ORDER BY prof.chat_pair_id
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
-    touched: list[int] = []
-    for row in rows:
-        profile = dict(row["profile_data"] or {})
-        glossary = profile.get("glossary") or {}
-        if not glossary:
-            continue
-        _, dropped = glossary_rules.validate_entries(glossary, row["target_language"], client, log=log)
-        if not dropped:
-            log.info("pair %d: %d entries, nothing to drop", row["chat_pair_id"], len(glossary))
-            continue
-        updated = glossary_rules.record_dropped(profile, dropped)
-        summary = f"prune: validator dropped {len(dropped)}: " + ", ".join(dropped)
-        _write_profile(cur, row["chat_pair_id"], updated, row["version"] + 1, 0, 0.0, summary)
-        touched.append(row["chat_pair_id"])
-        log.info("pair %d: dropped %d of %d — %s", row["chat_pair_id"], len(dropped), len(glossary),
-                 "; ".join(f"{k} ({v})" for k, v in dropped.items()))
+        writes: list[tuple] = []
+        for row in rows:
+            profile = dict(row["profile_data"] or {})
+            glossary = profile.get("glossary") or {}
+            if not glossary:
+                continue
+            _, dropped = glossary_rules.validate_entries(glossary, row["target_language"], client, log=log)
+            if not dropped:
+                log.info("pair %d: %d entries, nothing to drop", row["chat_pair_id"], len(glossary))
+                continue
+            updated = glossary_rules.record_dropped(profile, dropped)
+            summary = f"prune: validator dropped {len(dropped)}: " + ", ".join(dropped)
+            writes.append((row["chat_pair_id"], updated, row["version"] + 1, 0, 0.0, summary))
+            log.info("pair %d: dropped %d of %d — %s", row["chat_pair_id"], len(dropped), len(glossary),
+                     "; ".join(f"{k} ({v})" for k, v in dropped.items()))
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        _write_profiles(cur, writes)
+
+    touched = [w[0] for w in writes]
     invalidate_profile_cache(touched)
     log.info("Done: %d profiles changed", len(touched))
 
