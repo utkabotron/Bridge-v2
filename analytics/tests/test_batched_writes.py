@@ -190,12 +190,14 @@ def _stub_flow(monkeypatch, send):
     return stored
 
 
-def test_the_flow_stores_every_result_in_one_call(monkeypatch):
+def test_the_flow_records_each_summary_right_after_sending_it(monkeypatch):
+    """A deferred write would let a hard kill forget a summary that already reached the
+    group, and the next slot would send it again."""
     stored = _stub_flow(monkeypatch, lambda s: {**s, "sent": s["chat_pair_id"] == 1})
 
     out = dcs.daily_chat_summary.fn()
 
-    assert [[r["chat_pair_id"] for r in batch] for batch in stored] == [[1, 2]]
+    assert [[r["chat_pair_id"] for r in batch] for batch in stored] == [[1], [2]]
     assert out == {"chats_due": 2, "chats_processed": 2, "summaries_sent": 1}
 
 
