@@ -85,9 +85,9 @@ async def handle_qr_event(data: dict) -> None:
 
     from .db import set_wa_connected
 
-    # wa-service writes this flag itself when a client goes ready; doing it here too costs
-    # one statement and covers the case where that write failed.
-    await set_wa_connected(int(user_id), str(user_id))
+    # wa-service writes this flag itself when a client goes ready; doing it here too covers
+    # the case where that write failed.
+    await set_wa_connected(int(user_id))
 
     # Only the terminal event is worth telling the user about: 'authenticated' fires
     # before the chat sync finishes, and the Mini App is already showing live status.
