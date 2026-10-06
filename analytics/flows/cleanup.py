@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import os
 
-import psycopg2
 from prefect import flow, get_run_logger, task
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
+from .shared import db_conn
+
 RETAIN_DAYS = int(os.getenv("RETAIN_MESSAGE_DAYS", "90"))
 
 # (label, SQL query, params)
@@ -50,16 +50,14 @@ _CLEANUP_TASKS = [
 @task(retries=2, name="cleanup-table")
 def cleanup_table(label: str, query: str, params: tuple | None) -> int:
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    if params:
-        cur.execute(query, params)
-    else:
-        cur.execute(query)
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
+        if params:
+            cur.execute(query, params)
+        else:
+            cur.execute(query)
+        deleted = cur.rowcount
+
     logger.info("Deleted %d old %s", deleted, label)
     return deleted
 

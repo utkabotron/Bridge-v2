@@ -14,15 +14,12 @@ import math
 import os
 from datetime import date, datetime, timedelta
 
-import psycopg2
-import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import llm
-from .shared import esc, send_to_chat
+from .shared import db_conn, esc, send_to_chat
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TZ = "Asia/Jerusalem"
 
@@ -36,72 +33,72 @@ DEFAULT_HOUR = 22
 def recompute_schedules() -> int:
     """Recompute optimal send hours for all active chat pairs (every 7 days)."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
 
-    # Check if recompute is needed
-    cur.execute("""
-        SELECT min(computed_at) AS oldest
-        FROM chat_summary_schedule
-    """)
-    row = cur.fetchone()
-    oldest = row["oldest"] if row else None
-
-    # Also check if there are active pairs without a schedule
-    cur.execute("""
-        SELECT count(*) AS missing
-        FROM chat_pairs cp
-        JOIN users u ON u.id = cp.user_id
-        WHERE cp.status = 'active' AND u.is_active = true
-          AND NOT EXISTS (
-              SELECT 1 FROM chat_summary_schedule css WHERE css.chat_pair_id = cp.id
-          )
-    """)
-    missing = cur.fetchone()["missing"]
-
-    if oldest and missing == 0:
-        age_days = (datetime.utcnow() - oldest.replace(tzinfo=None)).days
-        if age_days < SCHEDULE_REFRESH_DAYS:
-            logger.info("Schedules fresh (%d days old), skipping recompute", age_days)
-            cur.close()
-            conn.close()
-            return 0
-
-    # Compute optimal hour for each active chat pair
-    cur.execute("""
-        SELECT cp.id AS chat_pair_id
-        FROM chat_pairs cp
-        JOIN users u ON u.id = cp.user_id
-        WHERE cp.status = 'active' AND u.is_active = true
-    """)
-    pairs = [r["chat_pair_id"] for r in cur.fetchall()]
-
-    updated = 0
-    for pair_id in pairs:
+        # Check if recompute is needed
         cur.execute("""
-            SELECT extract(hour FROM created_at AT TIME ZONE %s)::int AS h
-            FROM message_events
-            WHERE chat_pair_id = %s
-              AND created_at >= now() - interval '30 days'
-              AND delivery_status = 'delivered'
-              AND extract(hour FROM created_at AT TIME ZONE %s) >= 8
-        """, (TZ, pair_id, TZ))
+            SELECT min(computed_at) AS oldest
+            FROM chat_summary_schedule
+        """)
+        row = cur.fetchone()
+        oldest = row["oldest"] if row else None
 
-        hours = [r["h"] for r in cur.fetchall()]
-        sample_size = len(hours)
-
-        if sample_size < 10:
-            optimal_hour = DEFAULT_HOUR
-            mean_h = None
-            std_h = None
-        else:
-            mean_h = sum(hours) / len(hours)
-            variance = sum((h - mean_h) ** 2 for h in hours) / len(hours)
-            std_h = math.sqrt(variance)
-            raw = mean_h + 2 * std_h
-            optimal_hour = max(20, min(23, round(raw)))
-
+        # Also check if there are active pairs without a schedule
         cur.execute("""
+            SELECT count(*) AS missing
+            FROM chat_pairs cp
+            JOIN users u ON u.id = cp.user_id
+            WHERE cp.status = 'active' AND u.is_active = true
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_summary_schedule css WHERE css.chat_pair_id = cp.id
+              )
+        """)
+        missing = cur.fetchone()["missing"]
+
+        if oldest and missing == 0:
+            age_days = (datetime.utcnow() - oldest.replace(tzinfo=None)).days
+            if age_days < SCHEDULE_REFRESH_DAYS:
+                logger.info("Schedules fresh (%d days old), skipping recompute", age_days)
+                return 0
+
+        # Compute optimal hour for each active chat pair
+        cur.execute("""
+            SELECT cp.id AS chat_pair_id
+            FROM chat_pairs cp
+            JOIN users u ON u.id = cp.user_id
+            WHERE cp.status = 'active' AND u.is_active = true
+        """)
+        pairs = [r["chat_pair_id"] for r in cur.fetchall()]
+
+        schedules = []
+        for pair_id in pairs:
+            cur.execute("""
+                SELECT extract(hour FROM created_at AT TIME ZONE %s)::int AS h
+                FROM message_events
+                WHERE chat_pair_id = %s
+                  AND created_at >= now() - interval '30 days'
+                  AND delivery_status = 'delivered'
+                  AND extract(hour FROM created_at AT TIME ZONE %s) >= 8
+            """, (TZ, pair_id, TZ))
+
+            hours = [r["h"] for r in cur.fetchall()]
+            sample_size = len(hours)
+
+            if sample_size < 10:
+                optimal_hour = DEFAULT_HOUR
+                mean_h = None
+                std_h = None
+            else:
+                mean_h = sum(hours) / len(hours)
+                variance = sum((h - mean_h) ** 2 for h in hours) / len(hours)
+                std_h = math.sqrt(variance)
+                raw = mean_h + 2 * std_h
+                optimal_hour = max(20, min(23, round(raw)))
+
+            schedules.append((pair_id, optimal_hour, mean_h, std_h, sample_size))
+
+        cur.executemany("""
             INSERT INTO chat_summary_schedule
                 (chat_pair_id, optimal_hour, optimal_minute, mean_hour, std_hour, sample_size, computed_at)
             VALUES (%s, %s, 0, %s, %s, %s, now())
@@ -112,69 +109,56 @@ def recompute_schedules() -> int:
                     std_hour = EXCLUDED.std_hour,
                     sample_size = EXCLUDED.sample_size,
                     computed_at = now()
-        """, (pair_id, optimal_hour, mean_h, std_h, sample_size))
-        updated += 1
+        """, schedules)
 
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    logger.info("Recomputed schedules for %d chat pairs", updated)
-    return updated
+    logger.info("Recomputed schedules for %d chat pairs", len(schedules))
+    return len(schedules)
 
 
 @task(retries=2, name="find-chats-due-now")
 def find_chats_due_now() -> list[dict]:
     """Find chats whose optimal send time matches the current half-hour slot."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                css.chat_pair_id,
+                css.optimal_hour,
+                css.optimal_minute,
+                cp.tg_chat_id,
+                cp.wa_chat_name,
+                cp.tg_chat_title,
+                COALESCE(cp.target_language, u.target_language) AS target_language,
+                u.tg_user_id
+            FROM chat_summary_schedule css
+            JOIN chat_pairs cp ON cp.id = css.chat_pair_id
+            JOIN users u ON u.id = cp.user_id
+            WHERE cp.status = 'active'
+              AND u.is_active = true
+              AND css.enabled = true
+              AND css.optimal_hour = extract(hour FROM now() AT TIME ZONE %s)::int
+              AND css.optimal_minute = (CASE
+                  WHEN extract(minute FROM now() AT TIME ZONE %s)::int < 30 THEN 0
+                  ELSE 30
+              END)
+              AND NOT EXISTS (
+                  SELECT 1 FROM daily_chat_summaries dcs
+                  WHERE dcs.chat_pair_id = css.chat_pair_id
+                    AND dcs.summary_date = (now() AT TIME ZONE %s)::date
+                    AND dcs.sent = true
+              )
+        """, (TZ, TZ, TZ))
 
-    cur.execute("""
-        SELECT
-            css.chat_pair_id,
-            css.optimal_hour,
-            css.optimal_minute,
-            cp.tg_chat_id,
-            cp.wa_chat_name,
-            cp.tg_chat_title,
-            COALESCE(cp.target_language, u.target_language) AS target_language,
-            u.tg_user_id
-        FROM chat_summary_schedule css
-        JOIN chat_pairs cp ON cp.id = css.chat_pair_id
-        JOIN users u ON u.id = cp.user_id
-        WHERE cp.status = 'active'
-          AND u.is_active = true
-          AND css.enabled = true
-          AND css.optimal_hour = extract(hour FROM now() AT TIME ZONE %s)::int
-          AND css.optimal_minute = (CASE
-              WHEN extract(minute FROM now() AT TIME ZONE %s)::int < 30 THEN 0
-              ELSE 30
-          END)
-          AND NOT EXISTS (
-              SELECT 1 FROM daily_chat_summaries dcs
-              WHERE dcs.chat_pair_id = css.chat_pair_id
-                AND dcs.summary_date = (now() AT TIME ZONE %s)::date
-                AND dcs.sent = true
-          )
-    """, (TZ, TZ, TZ))
-
-    chats = [dict(r) for r in cur.fetchall()]
-
-    cur.close()
-    conn.close()
+        chats = [dict(r) for r in cur.fetchall()]
 
     logger.info("Found %d chats due for summary now", len(chats))
     return chats
 
 
-@task(retries=2, name="collect-chat-messages")
-def collect_chat_messages(chat_info: dict) -> dict | None:
-    """Collect today's messages for a specific chat pair."""
+def _read_chat_messages(cur, chat_info: dict) -> dict | None:
+    """Today's messages and the profile for one chat pair, or None when there is too little to summarize."""
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
     chat_pair_id = chat_info["chat_pair_id"]
 
     # Get messages for today (Asia/Jerusalem timezone)
@@ -199,9 +183,6 @@ def collect_chat_messages(chat_info: dict) -> dict | None:
     profile_row = cur.fetchone()
     profile = profile_row["profile_data"] if profile_row else None
 
-    cur.close()
-    conn.close()
-
     if len(messages) < MIN_MESSAGES:
         logger.info("Chat %d has only %d messages, skipping", chat_pair_id, len(messages))
         return None
@@ -219,6 +200,15 @@ def collect_chat_messages(chat_info: dict) -> dict | None:
         "unique_senders": len(senders),
         "profile": profile,
     }
+
+
+@task(retries=2, name="collect-chat-messages")
+def collect_chat_messages(chats: list[dict]) -> list[dict]:
+    """Collect today's messages for every due chat pair, on one connection."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        collected = [_read_chat_messages(cur, chat_info) for chat_info in chats]
+    return [c for c in collected if c]
 
 
 @task(retries=1, name="generate-summary-with-llm")
@@ -383,56 +373,53 @@ def send_summary_to_chat(summary_data: dict) -> dict:
     }
 
 
-@task(retries=2, name="store-summary")
-def store_summary(result: dict) -> None:
-    """UPSERT summary result into daily_chat_summaries."""
+@task(retries=2, name="store-summaries")
+def store_summaries(results: list[dict]) -> None:
+    """UPSERT the run's summary results into daily_chat_summaries, on one connection."""
+    if not results:
+        return
     logger = get_run_logger()
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
 
-    tokens = result.get("tokens_used", 0)
-    # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output
-    cost = result.get("cost_usd", 0.0)
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
+        cur.executemany("""
+            INSERT INTO daily_chat_summaries
+                (chat_pair_id, summary_date, message_count, unique_senders,
+                 summary_text, plans_extracted, optimal_send_hour,
+                 sent, sent_at, tg_message_id, tokens_used, estimated_cost)
+            VALUES (%s, (now() AT TIME ZONE %s)::date, %s, %s, %s, %s, %s, %s,
+                    CASE WHEN %s THEN now() ELSE NULL END,
+                    %s, %s, %s)
+            ON CONFLICT (chat_pair_id, summary_date) DO UPDATE
+                SET message_count = EXCLUDED.message_count,
+                    unique_senders = EXCLUDED.unique_senders,
+                    summary_text = EXCLUDED.summary_text,
+                    plans_extracted = EXCLUDED.plans_extracted,
+                    optimal_send_hour = EXCLUDED.optimal_send_hour,
+                    sent = EXCLUDED.sent,
+                    sent_at = EXCLUDED.sent_at,
+                    tg_message_id = EXCLUDED.tg_message_id,
+                    tokens_used = EXCLUDED.tokens_used,
+                    estimated_cost = EXCLUDED.estimated_cost
+        """, [
+            (
+                result["chat_pair_id"],
+                TZ,
+                result["message_count"],
+                result["unique_senders"],
+                result.get("summary_text", ""),
+                json.dumps(result.get("plans", []), ensure_ascii=False),
+                result.get("optimal_send_hour"),
+                result.get("sent", False),
+                result.get("sent", False),
+                result.get("tg_message_id"),
+                result.get("tokens_used", 0),
+                result.get("cost_usd", 0.0),
+            )
+            for result in results
+        ])
 
-    cur.execute("""
-        INSERT INTO daily_chat_summaries
-            (chat_pair_id, summary_date, message_count, unique_senders,
-             summary_text, plans_extracted, optimal_send_hour,
-             sent, sent_at, tg_message_id, tokens_used, estimated_cost)
-        VALUES (%s, (now() AT TIME ZONE %s)::date, %s, %s, %s, %s, %s, %s,
-                CASE WHEN %s THEN now() ELSE NULL END,
-                %s, %s, %s)
-        ON CONFLICT (chat_pair_id, summary_date) DO UPDATE
-            SET message_count = EXCLUDED.message_count,
-                unique_senders = EXCLUDED.unique_senders,
-                summary_text = EXCLUDED.summary_text,
-                plans_extracted = EXCLUDED.plans_extracted,
-                optimal_send_hour = EXCLUDED.optimal_send_hour,
-                sent = EXCLUDED.sent,
-                sent_at = EXCLUDED.sent_at,
-                tg_message_id = EXCLUDED.tg_message_id,
-                tokens_used = EXCLUDED.tokens_used,
-                estimated_cost = EXCLUDED.estimated_cost
-    """, (
-        result["chat_pair_id"],
-        TZ,
-        result["message_count"],
-        result["unique_senders"],
-        result.get("summary_text", ""),
-        json.dumps(result.get("plans", []), ensure_ascii=False),
-        result.get("optimal_send_hour"),
-        result.get("sent", False),
-        result.get("sent", False),
-        result.get("tg_message_id"),
-        tokens,
-        cost,
-    ))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    logger.info("Stored summary for chat_pair %d", result["chat_pair_id"])
+    logger.info("Stored summaries for chat_pairs %s", [r["chat_pair_id"] for r in results])
 
 
 @flow(name="daily-chat-summary", log_prints=True)
@@ -450,29 +437,27 @@ def daily_chat_summary():
         logger.info("No chats due for summary right now")
         return {"chats_processed": 0, "summaries_sent": 0}
 
-    sent_count = 0
-    processed = 0
+    # Reads for every due chat share one connection; so do the writes below.
+    chats_data = collect_chat_messages(chats_due)
 
-    for chat_info in chats_due:
-        # Collect messages
-        chat_data = collect_chat_messages(chat_info)
-        if not chat_data:
-            continue
+    results: list[dict] = []
+    try:
+        for chat_data in chats_data:
+            # Generate summary
+            summary = generate_summary_with_llm(chat_data)
+            if not summary:
+                continue
 
-        # Generate summary
-        summary = generate_summary_with_llm(chat_data)
-        if not summary:
-            continue
+            # Send to TG group
+            results.append(send_summary_to_chat(summary))
+    finally:
+        # Stored once at the end, but in a finally: if chat N blows up, the summaries already
+        # sent to chats 1..N-1 are still recorded, and a re-run in the same slot skips them
+        # (find_chats_due_now excludes sent=true) instead of sending them twice.
+        store_summaries(results)
 
-        # Send to TG group
-        result = send_summary_to_chat(summary)
-
-        # Store in DB
-        store_summary(result)
-
-        processed += 1
-        if result.get("sent"):
-            sent_count += 1
+    processed = len(results)
+    sent_count = sum(1 for r in results if r.get("sent"))
 
     logger.info("Processed %d chats, sent %d summaries", processed, sent_count)
     return {

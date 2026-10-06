@@ -6,8 +6,8 @@ import logging
 from types import SimpleNamespace
 
 import pytest
-
-from flows import llm, translation_quality as tq
+from flows import llm
+from flows import translation_quality as tq
 
 EVALS = [
     {"quality_score": 2, "accuracy_score": 2, "naturalness_score": 3, "source": "bridge",

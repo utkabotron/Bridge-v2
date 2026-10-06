@@ -24,11 +24,10 @@ import statistics
 import time
 from datetime import datetime
 
-import psycopg2
-import psycopg2.extras
 from openai import AsyncOpenAI
 
-DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
+from .shared import db_conn
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 DEFAULT_CANDIDATES = ["gpt-4.1-mini", "gpt-6-luna", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5-mini"]
@@ -56,26 +55,24 @@ CONCURRENCY = 6
 
 def load_messages(limit: int, days: int) -> list[dict]:
     """Recent delivered Hebrew messages from paired chats, spread across pairs."""
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("""
-        SELECT me.id, me.chat_pair_id, me.original_text, me.translated_text, me.message_type,
-               coalesce(cp.target_language, u.target_language, 'Russian') AS target_language,
-               prof.profile_data
-        FROM message_events me
-        JOIN chat_pairs cp ON cp.id = me.chat_pair_id
-        JOIN users u ON u.id = cp.user_id
-        LEFT JOIN chat_profiles prof ON prof.chat_pair_id = cp.id
-        WHERE me.created_at >= now() - (%s || ' days')::interval
-          AND me.delivery_status = 'delivered'
-          AND me.message_type IN ('chat', 'text', 'image', 'document')
-          AND length(me.original_text) BETWEEN 20 AND 600
-          AND me.original_text ~ '[א-ת]'
-        ORDER BY random()
-    """, (days,))
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT me.id, me.chat_pair_id, me.original_text, me.translated_text, me.message_type,
+                   coalesce(cp.target_language, u.target_language, 'Russian') AS target_language,
+                   prof.profile_data
+            FROM message_events me
+            JOIN chat_pairs cp ON cp.id = me.chat_pair_id
+            JOIN users u ON u.id = cp.user_id
+            LEFT JOIN chat_profiles prof ON prof.chat_pair_id = cp.id
+            WHERE me.created_at >= now() - (%s || ' days')::interval
+              AND me.delivery_status = 'delivered'
+              AND me.message_type IN ('chat', 'text', 'image', 'document')
+              AND length(me.original_text) BETWEEN 20 AND 600
+              AND me.original_text ~ '[א-ת]'
+            ORDER BY random()
+        """, (days,))
+        rows = [dict(r) for r in cur.fetchall()]
 
     # Round-robin over pairs so one busy chat does not become the whole benchmark
     by_pair: dict[int, list[dict]] = {}
@@ -90,12 +87,11 @@ def load_messages(limit: int, days: int) -> list[dict]:
 
 
 def load_prompt() -> str:
-    conn = psycopg2.connect(DB_URL)
-    cur = conn.cursor()
-    cur.execute("SELECT content FROM prompt_registry WHERE key = 'translate'")
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    with db_conn(cursor_factory=None) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT content FROM prompt_registry WHERE key = 'translate'")
+        row = cur.fetchone()
+
     if not row:
         raise SystemExit("prompt_registry has no 'translate' row — is the processor running?")
     return row[0]
