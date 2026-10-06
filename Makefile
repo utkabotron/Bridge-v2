@@ -44,11 +44,13 @@ lint:
 	cd processor && ruff check src/
 	cd bot && ruff check src/
 	cd analytics && ruff check flows/
+	ruff check shared/
 
 format:
 	cd processor && ruff format src/
 	cd bot && ruff format src/
 	cd analytics && ruff format flows/
+	ruff format shared/
 
 # ── DB ────────────────────────────────────────────────────
 migrate:
@@ -67,7 +69,8 @@ ecr-login:
 
 ecr-push: ecr-login
 	@for svc in wa-service processor bot analytics; do \
-	  docker build -t $(ECR_REGISTRY)/bridge-v2-$$svc:$(TAG) ./$$svc && \
+	  if [ $$svc = wa-service ]; then ctx=./wa-service; df=wa-service/Dockerfile; else ctx=.; df=$$svc/Dockerfile; fi && \
+	  docker build -t $(ECR_REGISTRY)/bridge-v2-$$svc:$(TAG) -f $$df $$ctx && \
 	  docker push $(ECR_REGISTRY)/bridge-v2-$$svc:$(TAG); \
 	done
 

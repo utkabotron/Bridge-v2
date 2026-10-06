@@ -82,15 +82,23 @@ processor и bot НЕ общаются — оба независимо → Postg
 
 ## KEY FILES
 
+### Shared (один источник для processor, analytics и bot)
+- `shared/bridge_shared/` — stdlib-only пакет, копируется в три образа (`COPY shared/bridge_shared /app/bridge_shared`); build context этих сервисов — КОРЕНЬ репо (`context: .`, `dockerfile: <svc>/Dockerfile`, корневой `.dockerignore` — белый список). Правка в `shared/` = пересобрать и выкатить processor, bot, analytics вместе.
+  - `llm.py` — `MODEL_PRICES`, `TRANSCRIBE_PRICES`, `is_reasoning`, `supports_flex`, `chat_request`, `token_cost`
+  - `scripts.py` — регэкспы письменностей (`HEBREW_RE`, `SOURCE_SCRIPT_RE`, `CYRILLIC_RE`, `LATIN_RE`, `TARGET_SCRIPT_RE`)
+  - `chat_context.py` — `format_chat_context` (единственная версия)
+  - `telegram_html.py` — `esc`; `env.py` — `parse_ids`, `admin_tg_ids`
+  - `processor/tests/test_shared.py` — страж: падает, если копия цен/регэкспов/`format_chat_context`/`esc` появится в сервисе
+
 ### Config (все константы здесь, не хардкодить)
-- `processor/src/config.py` — env vars processor (timeouts, TTLs, Redis, DB, Telegram, alerting)
+- `processor/src/config.py` — env vars processor (timeouts, TTLs, Redis, DB, Telegram, alerting); цены моделей — в `shared/bridge_shared/llm.py`
 - `wa-service/src/config.js` — env vars wa-service (Redis, DB, WA client, media, cache)
 
 ### Pipeline
 - `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
 - `processor/src/pipeline/graph.py` — `Pipeline`: validate → translate → format → deliver (обычный Python, стрим `{node: output}` для SSE)
 - `processor/src/alerts.py` — `notify_admins()` (единственная отправка алертов админам) + `SlidingWindow` для порогов «N за окно»
-- `processor/src/llm.py` — ЕДИНСТВЕННЫЙ способ звать OpenAI из processor: форма запроса под семейство модели, таймауты, запись стоимости в `llm_usage`
+- `processor/src/llm.py` — ЕДИНСТВЕННЫЙ способ звать OpenAI из processor (обёртка над `bridge_shared.llm`): таймауты, запись стоимости в `llm_usage`
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
 - `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache

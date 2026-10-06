@@ -42,7 +42,7 @@
 ## E. Дубли
 
 - [x] (06.10) E1. Одна функция `notify_admins` в processor через `telegram_sender` вместо 4 копий; один класс скользящего окна для алертов вместо 3. — Sonnet → сейчас
-- [ ] E2. Общий пакет `shared/` (копируется в образы processor и analytics): таблица цен моделей, `is_reasoning`, `format_chat_context`, регэкспы письменностей, `esc`, разбор `ADMIN_TG_IDS`; bake-off перестаёт держать свою копию. — Opus → сейчас → один источник на каждую вещь, тест сверяет
+- [x] (06.10) E2. Общий пакет `shared/bridge_shared` (копируется в образы processor и analytics): таблица цен моделей, `is_reasoning`, `format_chat_context`, регэкспы письменностей, `esc`, разбор `ADMIN_TG_IDS`; bake-off перестаёт держать свою копию. — Opus → сейчас → один источник на каждую вещь, тест сверяет
 - [x] (06.10) E3. analytics: один `db_conn()` вместо `psycopg2.connect` в каждой задаче; batch-вставки (`executemany`) в quality/problems/context; `daily_chat_summary` не открывает соединение на каждый чат. — Sonnet → сейчас
 - [x] (06.10) E4. `translation_quality.generate_suggestions` зовёт модель мимо `llm.complete` (упадёт на gpt-6, если включить). — Haiku → сейчас
 
