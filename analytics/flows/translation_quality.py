@@ -25,7 +25,7 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
-from . import jev_eval
+from . import jev_eval, quality_stats
 from .shared import esc, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
@@ -83,7 +83,9 @@ def sample_translations() -> list[dict]:
     cur.execute("""
         SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
                me.delivery_status, me.error_message,
-               COALESCE(u.target_language, 'Unknown') AS target_language
+               me.chat_pair_id, me.message_type, me.prompt_version,
+               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
+               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
@@ -102,7 +104,9 @@ def sample_translations() -> list[dict]:
     cur.execute("""
         SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
                me.delivery_status, me.error_message,
-               COALESCE(u.target_language, 'Unknown') AS target_language
+               me.chat_pair_id, me.message_type, me.prompt_version,
+               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
+               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
@@ -121,7 +125,9 @@ def sample_translations() -> list[dict]:
     cur.execute("""
         SELECT me.id, me.original_text, me.translated_text, me.translation_ms,
                me.delivery_status, me.error_message,
-               COALESCE(u.target_language, 'Unknown') AS target_language
+               me.chat_pair_id, me.message_type, me.prompt_version,
+               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language,
+               CASE WHEN me.chat_pair_id IS NULL THEN 'fallback' ELSE 'bridge' END AS source
         FROM message_events me
         LEFT JOIN chat_pairs cp ON me.chat_pair_id = cp.id
         LEFT JOIN users u ON cp.user_id = u.id
@@ -139,6 +145,7 @@ def sample_translations() -> list[dict]:
     cur.execute("""
         SELECT di.id, di.original_text, di.translated_text, di.translation_ms,
                'completed' AS delivery_status, NULL AS error_message,
+               NULL::bigint AS chat_pair_id, 'chat' AS message_type, NULL AS prompt_version,
                COALESCE(di.target_language, 'Unknown') AS target_language,
                'direct' AS source
         FROM direct_interactions di
@@ -172,6 +179,7 @@ def sample_all_translations() -> list[dict]:
 
     cur.execute("""
         SELECT me.id, me.original_text, me.translated_text,
+               me.chat_pair_id, me.message_type, me.prompt_version, 'bridge' AS source,
                COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language
         FROM message_events me
         JOIN chat_pairs cp ON me.chat_pair_id = cp.id
@@ -188,6 +196,7 @@ def sample_all_translations() -> list[dict]:
 
     cur.execute("""
         SELECT di.id, di.original_text, di.translated_text,
+               NULL::bigint AS chat_pair_id, 'chat' AS message_type, NULL AS prompt_version,
                COALESCE(di.target_language, 'Unknown') AS target_language,
                'direct' AS source
         FROM direct_interactions di
@@ -296,6 +305,8 @@ Return ONLY the JSON array, no markdown fences."""
                 ev["target_language"] = batch[idx].get("target_language", "Unknown")
                 ev["sample_key"] = jev_eval.sample_key(batch[idx])
                 ev["evaluator"] = "llm"
+                for field in ("source", "chat_pair_id", "message_type", "prompt_version"):
+                    ev[field] = batch[idx].get(field)
 
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
@@ -333,9 +344,14 @@ def generate_suggestions(evaluations: list[dict], pending_suggestions: list[dict
     """Aggregate error patterns and suggest prompt improvements."""
     logger = get_run_logger()
 
+    breakdown = quality_stats.quality_breakdown(evaluations)
+    # Averages, issue patterns and prompt suggestions come from paired chats only: DM
+    # translations run the other way, and unpaired admin chats are not what the prompt
+    # serves. They used to be 16% of the sample and pulled the headline down to 3.7.
+    evaluations = quality_stats.bridge_only(evaluations)
     if not evaluations:
-        logger.info("No evaluations, skipping suggestion generation")
-        return {"suggestions": [], "tokens_used": 0}
+        logger.info("No bridge evaluations, skipping suggestion generation")
+        return {"suggestions": [], "tokens_used": 0, "breakdown": breakdown, "worst_pair": None}
 
     # Aggregate issue types
     issue_counts: dict[str, int] = {}
@@ -429,6 +445,8 @@ Worst translation examples (original → translated):
         "avg_scores": avg_scores,
         "issue_counts": issue_counts,
         "worst_examples": worst_examples,
+        "breakdown": breakdown,
+        "worst_pair": quality_stats.worst_pair(breakdown),
     }
 
 
@@ -454,6 +472,9 @@ def store_quality_results(
         "issue_counts": suggestion_result.get("issue_counts", {}),
         "suggestions_count": len(suggestion_result.get("suggestions", [])),
         "jev": jev_info or {"mode": "off"},
+        "prompt_version": _load_prompt_from_db()[0],
+        "breakdown": suggestion_result.get("breakdown"),
+        "worst_pair": suggestion_result.get("worst_pair"),
     }
 
     cur.execute(
@@ -483,8 +504,9 @@ def store_quality_results(
             INSERT INTO translation_evaluations
                 (run_id, message_event_id, original_text, translated_text,
                  quality_score, accuracy_score, naturalness_score, issues_found,
-                 evaluator, shadow, quality_expected, confidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 evaluator, shadow, quality_expected, confidence,
+                 source, chat_pair_id, target_language, message_type, prompt_version)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 run_id,
@@ -499,6 +521,11 @@ def store_quality_results(
                 shadow,
                 ev.get("quality_expected"),
                 ev.get("confidence"),
+                ev.get("source") or "bridge",
+                ev.get("chat_pair_id"),
+                ev.get("target_language"),
+                ev.get("message_type"),
+                ev.get("prompt_version"),
             ),
         )
 
@@ -572,6 +599,23 @@ def notify_quality_report(suggestion_result: dict, jev_info: dict | None = None)
         lines.append(f"  Quality: {avg_scores.get('quality', '—')}")
         lines.append(f"  Accuracy: {avg_scores.get('accuracy', '—')}")
         lines.append(f"  Naturalness: {avg_scores.get('naturalness', '—')}\n")
+
+    breakdown = suggestion_result.get("breakdown") or {}
+    by_source = breakdown.get("by_source") or {}
+    if by_source:
+        parts = [
+            f"{esc(src)} {st['quality'] if st['quality'] is not None else '—'} (n={st['n']}, bad {st['bad_pct'] or 0}%)"
+            for src, st in by_source.items()
+        ]
+        lines.append("<b>By source:</b> " + ", ".join(parts))
+    worst = suggestion_result.get("worst_pair")
+    if worst:
+        lines.append(
+            f"⚠️ <b>Worst pair #{worst['key']}:</b> {worst['bad']}/{worst['n']} bad "
+            f"({worst['bad_pct']}%), avg {worst['quality']}"
+        )
+    if by_source or worst:
+        lines.append("")
 
     # Issues
     if issue_counts:

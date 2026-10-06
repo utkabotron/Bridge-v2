@@ -35,7 +35,11 @@ course title, or a holiday in its well-known {target_lang} form.
 NEVER an everyday word, even a culturally flavoured one: activities (basketball, judo, \
 art), school terms (class, after-school care, club, homework), food, greetings, holidays \
 wishes, job titles, family words. Those are translated normally by the translator and \
-must not be pinned."""
+must not be pinned.
+Also reject an entry whose rendering is wrong for the target language: a raw \
+transliteration where an established word exists, or a rendering that reads as an \
+unrelated or offensive word in {target_lang} (e.g. Russian "сука" for סוכה — it must be \
+"сукка")."""
 
 
 def _rendering(info) -> str:

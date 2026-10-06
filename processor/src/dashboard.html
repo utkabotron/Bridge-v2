@@ -456,6 +456,14 @@ function renderReports() {
       const entries=Object.entries(qs.issue_counts).sort((a,b)=>b[1]-a[1]);
       o+=entries.map(([k,v])=>c('y',k)+':'+v).join('  ')+'\n';
     }
+    const bd=qs.breakdown||{};
+    if(bd.by_source){
+      o+=' by source: '+Object.entries(bd.by_source).map(([k,v])=>c('y',k)+' '+(v.quality??'—')+' (n='+v.n+', bad '+(v.bad_pct??0)+'%)').join('  ')+'\n';
+    }
+    if(bd.by_pair&&bd.by_pair.length){
+      o+=' by pair, worst first: '+bd.by_pair.slice(0,6).map(r=>c('w','#'+r.key)+' '+(r.quality??'—')+' bad '+(r.bad_pct??0)+'% n='+r.n).join('  ')+'\n';
+    }
+    if(qs.prompt_version){ o+=' prompt: '+c('c',qs.prompt_version)+'\n'; }
     o+='\n';
   } else {
     o+=' '+c('d','No quality data for this date')+'\n\n';

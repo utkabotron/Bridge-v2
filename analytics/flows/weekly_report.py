@@ -94,7 +94,7 @@ def collect_weekly_data() -> dict:
         FROM translation_evaluations te
         JOIN nightly_analysis_runs nar ON nar.id = te.run_id
         WHERE nar.run_date >= %s AND nar.run_date < %s
-          AND NOT te.shadow
+          AND NOT te.shadow AND te.source = 'bridge'
         GROUP BY nar.run_date
         ORDER BY nar.run_date
     """, (four_weeks_ago, today))
@@ -108,6 +108,71 @@ def collect_weekly_data() -> dict:
         }
         for r in cur.fetchall()
     ]
+
+    # --- Quality breakdowns (4 weeks): the overall average hid the one chat that was
+    # a third bad, and mixed DM/fallback rows into the bridge numbers ---
+    def _slice(sql: str, params: tuple) -> list[dict]:
+        cur.execute(sql, params)
+        return [
+            {k: (float(v) if hasattr(v, "quantize") else v) for k, v in dict(r).items()}
+            for r in cur.fetchall()
+        ]
+
+    slice_where = """
+        FROM translation_evaluations te
+        JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+        WHERE nar.run_date >= %s AND nar.run_date < %s
+          AND NOT te.shadow AND te.quality_score IS NOT NULL
+    """
+    stats = """
+            count(*) AS n,
+            round(avg(te.quality_score)::numeric, 2) AS quality,
+            round(100.0 * avg((te.quality_score <= 3)::int), 1) AS bad_pct
+    """
+    data["quality_by_source_4w"] = _slice(
+        f"SELECT te.source AS key, {stats} {slice_where} GROUP BY te.source ORDER BY n DESC",
+        (four_weeks_ago, today),
+    )
+    data["quality_by_pair_4w"] = _slice(
+        f"""SELECT te.chat_pair_id AS pair, cp.wa_chat_name AS name, {stats}
+            FROM translation_evaluations te
+            JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+            LEFT JOIN chat_pairs cp ON cp.id = te.chat_pair_id
+            WHERE nar.run_date >= %s AND nar.run_date < %s
+              AND NOT te.shadow AND te.quality_score IS NOT NULL AND te.source = 'bridge'
+            GROUP BY te.chat_pair_id, cp.wa_chat_name
+            HAVING count(*) >= 5
+            ORDER BY bad_pct DESC, n DESC
+            LIMIT 15""",
+        (four_weeks_ago, today),
+    )
+    data["quality_by_language_4w"] = _slice(
+        f"SELECT te.target_language AS key, {stats} {slice_where} AND te.source = 'bridge' "
+        "GROUP BY te.target_language ORDER BY n DESC",
+        (four_weeks_ago, today),
+    )
+    data["quality_by_type_4w"] = _slice(
+        f"SELECT te.message_type AS key, {stats} {slice_where} AND te.source = 'bridge' "
+        "GROUP BY te.message_type ORDER BY n DESC",
+        (four_weeks_ago, today),
+    )
+    data["quality_by_prompt_version_4w"] = _slice(
+        f"SELECT te.prompt_version AS key, {stats} {slice_where} AND te.source = 'bridge' "
+        "GROUP BY te.prompt_version ORDER BY n DESC",
+        (four_weeks_ago, today),
+    )
+
+    # Issue types this week, summed over the nightly quality runs
+    cur.execute("""
+        SELECT summary FROM nightly_analysis_runs
+        WHERE flow_type = 'translation_quality' AND run_date >= %s AND run_date < %s
+    """, (week_ago, today))
+    issue_totals: dict[str, int] = {}
+    for r in cur.fetchall():
+        summary = r["summary"] if isinstance(r["summary"], dict) else json.loads(r["summary"] or "{}")
+        for k, v in (summary.get("issue_counts") or {}).items():
+            issue_totals[k] = issue_totals.get(k, 0) + int(v)
+    data["issue_counts_week"] = dict(sorted(issue_totals.items(), key=lambda kv: -kv[1]))
 
     # --- Direct interactions (bot private chat) ---
     cur.execute("""
@@ -259,7 +324,10 @@ You perform deep weekly analysis with full historical context and memory of your
 You receive:
 - Current week's operational data (messages, failures, issues, quality scores)
 - Direct interactions stats (translations and media analysis from bot private chat)
-- 4 weeks of quality score trends
+- 4 weeks of quality score trends (bridge chats only)
+- Quality broken down by chat pair (with names), target language, message type, prompt
+  version and source (bridge vs bot DM vs unpaired fallback), plus this week's issue types.
+  Name the worst pairs by id; never generalise from the overall average alone.
 - The current translation prompt
 - ALL pending prompt improvement suggestions from daily flows
 - Open issues from the persistent backlog
@@ -282,6 +350,7 @@ Return a single JSON object with these exact sections:
     "avg_scores": {"quality": <n>, "accuracy": <n>, "naturalness": <n>},
     "trend": "improving|stable|degrading",
     "per_language_notes": ["..."],
+    "worst_chats": ["pair #<id> <name>: <what is going wrong, from the data>"],
     "recurring_issues": ["..."],
     "impact_of_recent_changes": "..."
   },
