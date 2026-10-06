@@ -358,8 +358,11 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
   DLQ не разбирается, processor молчит, db_write_failed растёт, диск >85%, своп >75%.
   Дедуп алертов — Redis, час.
 - Отказ OpenAI НЕ теряет сообщение: доставляется оригинал с пометкой (`TRANSLATION_UNAVAILABLE_NOTE`).
-- Очередь: `BLMOVE messages:in → messages:processing`, удаление после успеха, возврат
-  зависших при старте. DLQ разбирается автоматически.
+- Очередь: `CONSUMER_WORKERS` (4) воркеров, каждый `BLMOVE messages:in → messages:processing`,
+  удаление после успеха, возврат зависших при старте. Сообщения ОДНОГО чата — строго по одному и
+  в порядке очереди (lock по `user_id:wa_chat_id` в `main._chat_lock`), разные чаты — параллельно.
+  DLQ разбирается автоматически. Худший случай на одно сообщение: 2 попытки LLM × `LLM_TIMEOUT`,
+  Telegram retry_after ≤ `MAX_RETRY_AFTER` (20 с).
 - Миграции: `./infra/migrate.sh` (журнал `schema_migrations`), запускать всегда.
 - Бэкапы: `nightly-backup` → `/home/deploy/backups/pg`, 7 копий, проверка `pg_restore --list`.
 - Python-зависимости: ставятся из `requirements.lock`, не из `.txt`.
