@@ -305,6 +305,22 @@ def test_should_translate_routing():
     assert _should_translate({"delivery_status": "pending", "original_text": "hello"}) == "translate"
 
 
+@pytest.mark.parametrize("text", ["👍", "❤️🙏🏻", "🎉🎉🎉", "15:00", "https://example.com/x"])
+def test_nothing_to_translate_skips_the_llm(text):
+    """A lone 👍 fell outside the old emoji regex and cost two LLM calls to come back as 👍."""
+    from processor.src.pipeline.graph import _should_translate
+
+    assert _should_translate({"delivery_status": "pending", "original_text": text}) == "format"
+
+
+@pytest.mark.parametrize("text", ["תודה 👍", "ок", "Eran the King 👑"])
+def test_words_next_to_emoji_still_translate(text):
+    from processor.src.pipeline.graph import _should_translate
+
+    state = {"delivery_status": "pending", "original_text": text, "target_language": "Hebrew"}
+    assert _should_translate(state) == "translate"
+
+
 # ── fan-out over chat pairs ───────────────────────────────
 
 @pytest.mark.asyncio

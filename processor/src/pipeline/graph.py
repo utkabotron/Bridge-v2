@@ -14,14 +14,6 @@ from langgraph.graph import END, StateGraph
 from ..models.message import MessageState
 from .nodes import deliver_node, format_node, translate_node, validate_node
 
-# Emoji pattern: Unicode emoji ranges + variation selectors + ZWJ sequences
-_EMOJI_RE = re.compile(
-    r'^[\U0001F600-\U0001FAFF\U00002702-\U000027B0\U0000FE00-\U0000FE0F'
-    r'\U0000200D\U000020E3\U00003030\U0000303D\U00002049\U0000203C'
-    r'\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF'
-    r'\U00002600-\U000026FF\U00002700-\U000027BF\s]+$'
-)
-
 _URL_RE = re.compile(r'^https?://\S+$')
 
 
@@ -43,11 +35,14 @@ _TARGET_SCRIPT_RE = {
 
 
 def _is_translatable(text: str) -> bool:
-    """Return False if text is only emojis or a bare URL — no translation needed."""
+    """Return False when there are no words to translate: emoji, digits, a bare URL.
+
+    This used to be an emoji-range regex with gaps — 👍 (U+1F44D) and skin tones fell
+    outside it, so a lone thumbs-up cost two LLM calls (translate + passthrough retry)
+    to come back unchanged. "Has no letter" covers every emoji WhatsApp will ever add.
+    """
     t = text.strip()
-    if not t:
-        return False
-    if _EMOJI_RE.match(t):
+    if not any(ch.isalpha() for ch in t):
         return False
     if _URL_RE.match(t):
         return False
