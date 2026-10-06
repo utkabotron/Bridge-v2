@@ -1,0 +1,70 @@
+# Оптимизация и уборка: план
+
+Источник: замеры на проде и аудит кода 2026-10-06 (сессия после удаления LangChain).
+Отмечать `[x]` по факту выкатки на прод, с датой. Каждая задача: исполнитель → окно
+выкатки → как проверить.
+
+Исполнители: **Haiku 4.5** — механика в одном-двух файлах по точному ТЗ; **Sonnet 5** —
+многофайловые правки с существующими тестами; **Opus 5.5** — межсервисные и хрупкие
+места (wa-service, Redis-auth, планировщик); **Fable 5.1** — очередь, действия на проде,
+финальная проверка и деплой; **ты** — решения, которые принимаешь только ты.
+
+Окна: **сейчас** — без рестарта или рестарт processor/bot/analytics (секунды);
+**ночь N** — плановая выкатка в 01:07 с рестартом wa-service (~45 мин тишины).
+
+## A. Безопасность — сегодня
+
+- [x] A1. (06.10) Вредоносные ключи `backup1..4` в Redis: сохранить копию, удалить. — Fable → сейчас → `redis-cli keys backup*` пусто
+- [ ] A2. Пароль на Redis (`requirepass`), все 4 клиента (processor, wa-service, bot, analytics) берут `REDIS_PASSWORD` из `.env`; пустой = без пароля. — Opus → ночь 1 (с откатом: если health не ok, убрать `REDIS_PASSWORD` и поднять заново) → `redis-cli ping` без пароля → NOAUTH, все health ok
+- [ ] A3. SSH: убрать `PasswordAuthentication yes` из `/etc/ssh/sshd_config.d/50-cloud-init.conf`. — **ты** подтверждаешь, что входишь только по ключу → Fable → `sshd -T | grep passwordauthentication` = no
+- [ ] A4. `~/.ssh/authorized_keys`: 4 записи (одна без подписи, `claude-code@n8n-access`, битый RSA с переносами, `bridge-v2-deploy`). — **ты** говоришь, какие оставить
+- [ ] A5. Публичные порты: 9000 (MinIO, нужен для presigned-ссылок Telegram — оставить), 3100 (docker-proxy, чей?), UFW-правила 3000/8000/2222 без причины. — Haiku: выяснить и предложить → Fable закрывает
+
+## B. Ресурсы сервера
+
+- [x] B1. (06.10, 76% → 46%) `docker builder prune` — 15.5 ГБ кэша сборки. — Fable → сейчас → `df -h /` < 50%
+- [ ] B2. `MAX_PARALLEL_INIT` не пробрасывается в compose → wa-service всегда поднимает клиентов по одному. — Haiku → ночь 1 → в логах wa-service два клиента инициализируются одновременно, 4/4 ready быстрее 45 мин
+- [ ] B3. Кэш Chromium в `.wwebjs_auth/session-*/Default/Cache` (2.2 ГБ) чистить при старте wa-service (entrypoint). — Sonnet → ночь 2 → том `wa_sessions` < 500 МБ
+- [ ] B4. Prefect (313 МБ) → лёгкий планировщик (APScheduler), flows становятся обычными функциями, `get_run_logger` → logging. — Opus → отдельный день → analytics < 100 МБ, все 9 задач отработали по расписанию сутки
+
+## C. Чужие чаты не ходят через систему — главный выигрыш
+
+- [ ] C1. wa-service: проверять «есть ли активный мост» ДО скачивания медиа и публикации; кэш пар в Redis (1 ч, включая отрицательный ответ), сброс кэша в роутах создания/паузы/удаления пары; сообщения без моста не публикуются вовсе. — Opus → ночь 2 → `message_events` без `skipped`-строк, MinIO не растёт на чужих фото
+- [ ] C2. Дедуп сообщения ДО скачивания медиа; проверить, что при двух наших пользователях в одной группе второй не теряет сообщение (дедуп по `wa_message_id` общий). — Sonnet → ночь 2 → тест на двух получателей
+- [ ] C3. processor: кэш пар (Redis 1 ч) вместо запроса в Postgres на каждое сообщение; убрать повторный запрос в `validate_node` и дедуп-SELECT на ветку (есть guard в upsert). — Sonnet → сейчас → на одно сообщение ≤ 1 запрос к Postgres до доставки
+- [ ] C4. Отрицательный кэш профиля чата; кэш feature-флагов в процессе на 5 с. — Haiku → сейчас
+
+## D. Очередь не блокируется одним сообщением
+
+- [ ] D1. processor: N воркеров (4) над `messages:in`, порядок сохраняется внутри одного чата (lock по `wa_chat_id`), `messages:processing` и возврат зависших как прежде. — Fable → сейчас (рестарт processor) → два медленных чата не задерживают третий
+- [ ] D2. Худший случай блокировки: `LLM_MAX_RETRIES` 2 → 1, `MAX_RETRY_AFTER` 60 → 20. — Fable (вместе с D1)
+
+## E. Дубли
+
+- [ ] E1. Одна функция `notify_admins` в processor через `telegram_sender` вместо 4 копий; один класс скользящего окна для алертов вместо 3. — Sonnet → сейчас
+- [ ] E2. Общий пакет `shared/` (копируется в образы processor и analytics): таблица цен моделей, `is_reasoning`, `format_chat_context`, регэкспы письменностей, `esc`, разбор `ADMIN_TG_IDS`; bake-off перестаёт держать свою копию. — Opus → сейчас → один источник на каждую вещь, тест сверяет
+- [ ] E3. analytics: один `db_conn()` вместо `psycopg2.connect` в каждой задаче; batch-вставки (`executemany`) в quality/problems/context; `daily_chat_summary` не открывает соединение на каждый чат. — Sonnet → сейчас
+- [ ] E4. `translation_quality.generate_suggestions` зовёт модель мимо `llm.complete` (упадёт на gpt-6, если включить). — Haiku → сейчас
+
+## F. Мёртвый код
+
+- [ ] F1. Выгрузка в BigQuery: flow, `google-cloud-bigquery`, env и том в compose, `.env.example`. — Sonnet → сейчас
+- [ ] F2. Флаг `direct_chat_enabled`: удалить строку (миграция), убрать из CLAUDE.md и дашборда. — Haiku → сейчас
+- [ ] F3. Эндпоинты `/api/config`, `/api/dlq/retry`; роуты wa-service `/disconnect`, `/reconnect`; функции `count_users`, `bold`, `get_history`, `split_object_url`, константа `REDIS_RETRY_LIMIT`. — Sonnet → сейчас / ночь 2 (wa-service)
+- [ ] F4. Таблица `onboarding_sessions` и её состояния: убрать записи из bot и wa-service, миграция drop. — Sonnet → ночь 2
+- [ ] F5. Колонка `users.wa_session_id`: убрать запись, миграция drop. — Haiku → сейчас
+- [ ] F6. `langdetect` → регэксп письменности (уже есть), убрать зависимость. — Haiku → сейчас
+- [ ] F7. `.env.example`: `LANGCHAIN_*`, `WA_SERVICE_PORT`, `BOT_PORT`. — Haiku → сейчас
+- [ ] F8. Дашборд: `/api/stats` — 7 подзапросов на пользователя по всей таблице каждые 15 с → кэш 60 с + окно 30 дней. — Haiku → сейчас
+
+## Порядок
+
+1. Сейчас: A1, B1 (Fable) · E4, F2, F5, F6, F7, F8, C4 (Haiku) · C3, E1, E3, F1, F3-processor (Sonnet) · E2 (Opus)
+2. Ночь 1 (06→07.10, 01:07): уже запланированная выкатка wa-service + A2 + B2
+3. Ночь 2 (07→08.10): C1, C2, B3, F3-wa-service, F4
+4. После C: D1, D2 (Fable, рестарт только processor)
+5. Отдельный день: B4
+6. Ждут тебя: A3, A4
+
+Проверка всего блока: утренний дайджест и `wa-health-check` молчат, `message_events`
+за сутки содержит только доставленные, диск < 50%, память wa-service не выросла.
