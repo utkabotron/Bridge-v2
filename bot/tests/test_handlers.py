@@ -299,8 +299,9 @@ def _translate_resp(translated="שלום", language="Hebrew", ms=150):
 
 
 @pytest.mark.asyncio
-async def test_direct_text_answers_in_hebrew_with_an_english_button():
-    """Russian is what gets typed, so the profile language (Russian by default) is no use."""
+async def test_russian_text_answers_in_hebrew_with_the_other_buttons():
+    """The default is Russian, but a Russian text falls through to Hebrew — Russian into
+    Russian answers nothing."""
     from bot.src.handlers.translate import handle_direct_text
 
     preview_msg = AsyncMock()
@@ -322,10 +323,9 @@ async def test_direct_text_answers_in_hebrew_with_an_english_button():
 
     buttons = kwargs["reply_markup"].inline_keyboard[0]
     labels = [b.text for b in buttons]
-    assert "✓ עברית" in labels
-    assert "English" in labels
-    # The language already on screen is inert; the other one retranslates.
-    assert [b.callback_data for b in buttons] == ["noop", "tr:en"]
+    assert labels == ["Русский", "✓ עברית", "English"]
+    # The language already on screen is inert; the others retranslate.
+    assert [b.callback_data for b in buttons] == ["tr:ru", "noop", "tr:en"]
 
 
 @pytest.mark.asyncio
@@ -353,7 +353,7 @@ async def test_language_button_retranslates_the_message_it_replies_to():
 
     kwargs = query.message.edit_text.call_args.kwargs
     assert "Hi, when are we meeting?" in query.message.edit_text.call_args[0][0]
-    assert [b.callback_data for b in kwargs["reply_markup"].inline_keyboard[0]] == ["tr:he", "noop"]
+    assert [b.callback_data for b in kwargs["reply_markup"].inline_keyboard[0]] == ["tr:ru", "tr:he", "noop"]
 
 
 @pytest.mark.asyncio
@@ -465,3 +465,36 @@ async def test_direct_text_quotes_the_source_so_the_buttons_can_find_it():
     params = update.message.reply_text.call_args.kwargs["reply_parameters"]
     assert params.message_id == 777
     assert params.allow_sending_without_reply is True
+
+
+# ── default language of a pasted text ─────────────────────
+
+def test_default_language_is_russian_unless_the_text_already_is():
+    from bot.src.config import default_direct_language
+
+    assert default_direct_language("שלום, מה שלומך?") == "ru"          # Hebrew → Russian
+    assert default_direct_language("hello there") == "ru"              # English → Russian
+    assert default_direct_language("Привет, как дела?") == "he"        # Russian → Hebrew
+    assert default_direct_language("Привет שלום") == "ru"              # mixed: something to translate
+    assert default_direct_language("👍 12:30") == "ru"
+
+
+@pytest.mark.asyncio
+async def test_pasted_hebrew_is_translated_into_russian_by_default():
+    from bot.src.handlers.translate import handle_direct_text
+
+    preview_msg = AsyncMock()
+    update = _make_update(user_id=42, text="שלום")
+    update.message.reply_text = AsyncMock(return_value=preview_msg)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"translated": "Привет", "target_language": "Russian", "translation_ms": 150}
+
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=mock_resp) as post, \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await handle_direct_text(update, MagicMock())
+
+    assert post.call_args.kwargs["json"]["target_language"] == "Russian"
+    keyboard = preview_msg.edit_text.call_args.kwargs["reply_markup"]
+    labels = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert labels == ["✓ Русский", "עברית", "English"]

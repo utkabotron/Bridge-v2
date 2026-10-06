@@ -10,7 +10,7 @@ from telegram.error import BadRequest
 from ..utils import http_client
 from telegram.ext import ContextTypes
 from ..utils.telegram_format import esc, italic
-from ..config import DIRECT_LANGUAGES, DIRECT_LANG_BY_NAME, DIRECT_LANG_DEFAULT
+from ..config import DIRECT_LANGUAGES, DIRECT_LANG_BY_NAME, default_direct_language
 from ..db import is_whitelisted
 from ..templates.messages import render
 
@@ -109,8 +109,8 @@ async def handle_direct_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ),
     )
 
-    # Phase 2: the default language, with a button for the other one.
-    language = DIRECT_LANGUAGES[DIRECT_LANG_DEFAULT][0]
+    # Phase 2: Russian unless the text already is; buttons switch to the others.
+    language = DIRECT_LANGUAGES[default_direct_language(text)][0]
     data, error = await _translate(text, user_id, language)
     if error:
         await _edit(preview_msg, error)
