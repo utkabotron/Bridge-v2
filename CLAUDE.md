@@ -94,7 +94,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
-- `processor/src/media_analyzer.py` — OpenAI GPT-4.1-mini vision + Whisper + PyPDF
+- `processor/src/media_analyzer.py` — OpenAI vision (`OPENAI_MODEL`) + `gpt-transcribe` + PyPDF
 - `processor/src/feature_flags.py` — DB → Redis cache 60s → env fallback
 - `processor/src/db.py` — asyncpg pool (command_timeout=10)
 
@@ -252,7 +252,7 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | wa-health-check | */15 * * * * | — |
 | daily-cleanup | 0 3 * * * | — |
 | nightly-problems | 0 4 * * * | gpt-4.1-mini |
-| translation-quality | 30 4 * * * | gpt-4.1-mini |
+| translation-quality | 30 4 * * * | gpt-6.1-sol (судья, `EVAL_MODEL`) |
 | chat-context-builder | 0 5 * * * | gpt-4.1 + web_search |
 | weekly-report | 0 5 * * 1 | o3 |
 | daily-chat-summary | */30 * * * * | gpt-4.1-mini |
@@ -363,7 +363,7 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
 - Бакет медиа приватный; ссылки наружу только presigned (`processor/src/s3.py`), объекты живут 90 дней.
 - wa-service port 3000: expose-only, NOT published. Access via nginx.
 - Media format: `*Sender*\n\noriginal\n\ntranslated`. Media sent natively (sendPhoto/etc), NOT in formatted_text.
-- Голосовые = тип `ptt` (не `voice`!) → `sendVoice` + авто-транскрипт Whisper отдельным reply.
+- Голосовые = тип `ptt` (не `voice`!) → `sendVoice` + авто-транскрипт `gpt-transcribe` (`TRANSCRIBE_MODEL`; whisper-1 отключают 26.02.2027) отдельным reply. На шуме возвращает пусто → «(empty audio)», не галлюцинирует.
 - Локации → `sendLocation`, контакты (vcard) → разбор в имя+телефоны, опросы → вопрос+варианты.
   Всё это мимо LLM: раньше уходило в перевод как текст.
 - Цитаты/правки → реальный reply в Telegram через `reply_parameters` (поиск `tg_message_id`

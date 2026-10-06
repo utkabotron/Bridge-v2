@@ -74,16 +74,22 @@ async def analyze_image(image_bytes: bytes, mime: str, target_lang: str) -> str:
         return data["choices"][0]["message"]["content"].strip()
 
 
-# ── Audio transcription (Whisper + translation) ──────────
+# ── Audio transcription (speech-to-text + translation) ───
+
+# whisper-1 is deprecated (shutdown 2027-02-26). gpt-transcribe is OpenAI's replacement,
+# 25% cheaper, and on short clips it does not misdetect the language the way whisper did
+# (a 4-second Russian note came back as Polish gibberish). Env override for a quick rollback.
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-transcribe")
+
 
 async def transcribe_audio(audio_bytes: bytes, filename: str, target_lang: str) -> str:
-    """Transcribe audio via Whisper, then translate if needed."""
-    # Step 1: Whisper transcription
+    """Transcribe audio, then translate if needed."""
+    # Step 1: transcription
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(
             f"{OPENAI_BASE}/audio/transcriptions",
             headers=_headers(),
-            data={"model": "whisper-1"},
+            data={"model": TRANSCRIBE_MODEL},
             files={"file": (filename, audio_bytes)},
         )
         r.raise_for_status()
