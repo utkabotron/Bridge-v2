@@ -11,6 +11,7 @@ from typing import Any, Optional
 import asyncpg
 
 from .config import DATABASE_URL, DB_POOL_MIN, DB_POOL_MAX, DB_COMMAND_TIMEOUT
+from .pipeline.prompts import PROMPT_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -203,17 +204,26 @@ async def insert_message_event(state: dict[str, Any], return_id: bool = False) -
     pool = await get_pool()
     returning = "returning id" if return_id else ""
     try:
+        # Provenance (migration 019): which prompt made this translation and how, so the
+        # nightly evaluation can be grouped by version and failures stop hiding as "".
+        translated = state.get("translation_ms") is not None and not state.get("translation_failed")
         query = f"""
             insert into public.message_events
               (wa_message_id, chat_pair_id, sender_name, original_text, translated_text,
                message_type, media_s3_key, translation_ms, delivery_status, error_message,
-               tg_message_id)
-            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+               tg_message_id, prompt_version, cache_hit, translation_passthrough,
+               translation_failed, translation_error)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             on conflict (wa_message_id, chat_pair_id) do update
               set delivery_status = excluded.delivery_status,
                   translated_text = excluded.translated_text,
                   error_message   = excluded.error_message,
-                  tg_message_id   = excluded.tg_message_id
+                  tg_message_id   = excluded.tg_message_id,
+                  prompt_version  = excluded.prompt_version,
+                  cache_hit       = excluded.cache_hit,
+                  translation_passthrough = excluded.translation_passthrough,
+                  translation_failed      = excluded.translation_failed,
+                  translation_error       = excluded.translation_error
               where message_events.delivery_status != 'delivered'
             {returning}
             """
@@ -229,6 +239,11 @@ async def insert_message_event(state: dict[str, Any], return_id: bool = False) -
             state.get("delivery_status", "pending"),
             state.get("error"),
             state.get("tg_message_id"),
+            PROMPT_VERSION if translated else None,
+            state.get("cache_hit") if translated else None,
+            bool(state.get("translation_passthrough")),
+            bool(state.get("translation_failed")),
+            (state.get("translation_error") or None),
         )
         if return_id:
             row = await pool.fetchrow(query, *params)
