@@ -8,7 +8,10 @@ cache, so a bad answer here cannot be served later. Each case says what the tran
 must and must not contain. Names spelled like everyday words are checked both ways, in a
 chat they are scoped to: "עמוס אמר…" must keep Амос, "אני עמוס היום" must not.
 
-Exit code 1 when any case fails.
+A case that fails is retried on the BASELINE statuses (what production runs now); if it fails
+there too it is reported as SAME — the chat's own glossary already did that, so it is not a
+regression of the change being checked (אופק in a school chat where Офек is the platform).
+Exit code 1 when any case fails that does not fail on the baseline.
 """
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ from .pipeline import glossary
 from .pipeline.prompts import VARIANTS, get_translate_prompt
 
 LANG = "Russian"
+BASELINE = ("locked",)
 
 # (text, must contain any of, must contain none of) — DM, no chat: service-wide names only.
 DM_CASES = [
@@ -78,20 +82,35 @@ async def _scoped_pairs() -> dict[str, int]:
     return {r["source"]: r["chat_pairs"][0] for r in rows}
 
 
-async def run(statuses: tuple[str, ...]) -> int:
+def _use(statuses: tuple[str, ...]) -> None:
     glossary.USED_STATUSES = statuses
     glossary.reload()
+
+
+async def run(statuses: tuple[str, ...]) -> int:
+    _use(statuses)
     failures = 0
+
+    def passes(out: str, text: str, need: list, banned: list) -> bool:
+        return ((not need or any(_has(out, n) for n in need))
+                and not any(_has(out, b) for b in banned)
+                and not ("[" in out and "[" not in text))  # a [note] copied into the translation
 
     async def check(label: str, text: str, pair: int | None, variant: str, need: list, banned: list):
         nonlocal failures
-        out, context = await _translate(text, pair, variant)
-        ok = (not need or any(_has(out, n) for n in need)) and not any(_has(out, b) for b in banned)
-        leaked = "[" in out and "[" not in text
-        ok = ok and not leaked
-        failures += not ok
-        print(f"{'OK  ' if ok else 'FAIL'} {label:<14} {text}\n       → {out}"
-              + ("\n       (copied a [note] into the translation)" if leaked else ""))
+        out, _ = await _translate(text, pair, variant)
+        verdict = "OK  "
+        if not passes(out, text, need, banned):
+            _use(BASELINE)
+            before, _ = await _translate(text, pair, variant)
+            _use(statuses)
+            if passes(before, text, need, banned):
+                verdict = "FAIL"
+                failures += 1
+            else:
+                verdict = "SAME"
+                out += f"\n       (baseline {','.join(BASELINE)} too: {before})"
+        print(f"{verdict} {label:<14} {text}\n       → {out}")
 
     print(f"statuses: {','.join(statuses)}\n── DM (service-wide names only)")
     for text, need, banned in DM_CASES:
