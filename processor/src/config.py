@@ -45,6 +45,9 @@ TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 
 # ── Alerting ─────────────────────────────────────────────
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+# Model for everything outside the bridge A/B: bot DM translation and media analysis.
+# OPENAI_MODEL stays variant A of the A/B, so promoting a model here does not touch it.
+DIRECT_MODEL = os.getenv("DIRECT_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 # Users whose chats always get A/B variant B while the flag is on — the admin dogfoods the
 # candidate in every chat instead of half of them. Defaults to the admins.
 AB_ALWAYS_B_USERS = [int(x) for x in os.getenv("AB_ALWAYS_B_USERS", "").split(",") if x.strip()] or ADMIN_TG_IDS

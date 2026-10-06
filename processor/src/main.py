@@ -33,7 +33,7 @@ from .config import (
     FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
     TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
     OPENAI_BILLING_URL,
-    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE, REVOKE_NOTE,
+    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
 )
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
@@ -759,7 +759,7 @@ async def translate_text(body: TranslateRequest):
         return JSONResponse({"error": "Translation is temporarily disabled"}, status_code=503)
     from .pipeline.nodes import get_llm
     from .pipeline.cache import get_cached, set_cached
-    from .pipeline.prompts import get_translate_prompt
+    from .pipeline.prompts import PROMPT_VERSION, get_translate_prompt
 
     text = body.text.strip()
     if not text:
@@ -778,7 +778,7 @@ async def translate_text(body: TranslateRequest):
         lang = TARGET_LANGUAGE
 
     # Cache check
-    cached = await get_cached(text, lang)
+    cached = await get_cached(text, lang, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
     if cached:
         if body.user_id:
             await insert_direct_translation(body.user_id, text, cached, lang, 0, True)
@@ -791,11 +791,14 @@ async def translate_text(body: TranslateRequest):
         SystemMessage(content=get_translate_prompt(lang)),
         HumanMessage(content=text),
     ]
-    response = await get_llm().ainvoke(messages)
+    # DM translation is outside the bridge A/B: DIRECT_MODEL, cached under its own version.
+    response = await get_llm(DIRECT_MODEL).ainvoke(
+        messages, config={"tags": ["direct", f"model-{DIRECT_MODEL}"]},
+    )
     translation_ms = int((time.monotonic() - t0) * 1000)
     translated = response.content.strip()
 
-    await set_cached(text, lang, translated)
+    await set_cached(text, lang, translated, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
 
     if body.user_id:
         await insert_direct_translation(body.user_id, text, translated, lang, translation_ms, False)

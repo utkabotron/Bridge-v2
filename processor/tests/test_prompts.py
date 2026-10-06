@@ -97,3 +97,12 @@ async def test_register_prompt_is_silent_when_the_version_is_unchanged():
     pool.fetchrow = AsyncMock(return_value={"version": PROMPT_VERSION})
     await register_prompt(pool)
     assert not [c for c in pool.execute.await_args_list if "analytics_changelog" in c.args[0]]
+
+
+def test_media_payload_limit_follows_the_model_family(monkeypatch):
+    """gpt-6 rejects max_tokens and temperature; gpt-4.1 rejects nothing but knows no reasoning_effort."""
+    from processor.src import media_analyzer as ma
+    monkeypatch.setattr(ma, "DIRECT_MODEL", "gpt-6-luna")
+    assert ma._completion_limit(2000) == {"max_completion_tokens": 2000, "reasoning_effort": "none"}
+    monkeypatch.setattr(ma, "DIRECT_MODEL", "gpt-4.1-mini")
+    assert ma._completion_limit(2000) == {"max_tokens": 2000}

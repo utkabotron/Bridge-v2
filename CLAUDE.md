@@ -94,7 +94,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
-- `processor/src/media_analyzer.py` — OpenAI vision (`OPENAI_MODEL`) + `gpt-transcribe` + PyPDF
+- `processor/src/media_analyzer.py` — OpenAI vision (`DIRECT_MODEL`) + `gpt-transcribe` + PyPDF
 - `processor/src/feature_flags.py` — DB → Redis cache 60s → env fallback
 - `processor/src/db.py` — asyncpg pool (command_timeout=10)
 
@@ -136,6 +136,9 @@ processor и bot НЕ общаются — оба независимо → Postg
 Ночные «добавьте правило в промпт» выключены (`PROMPT_SUGGESTIONS_ENABLED=false`); промпт
 меняется только через A/B → `/weekly-improve` (продвижение B → A описано в скилле). Разовая чистка:
 `docker compose exec analytics python -m flows.chat_context_builder --prune-glossaries`.
+
+**Модели processor:** `OPENAI_MODEL` — вариант A моста (A/B); `DIRECT_MODEL` — личка бота
+(`/translate`) и анализ медиа, по умолчанию = `OPENAI_MODEL`; `TRANSCRIBE_MODEL` — голосовые.
 
 **Jev:** нужен `TYPESAFE_API_KEY` в `.env`, без него любой режим = off. `shadow` пишет строки
 `translation_evaluations` с `shadow=true` — читатели таблицы ОБЯЗАНЫ фильтровать `NOT shadow`
