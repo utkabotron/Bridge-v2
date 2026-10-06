@@ -370,6 +370,7 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
 - Все сервисы работают под непривилегированным пользователем. Том `wa_sessions` принадлежит
   uid 1000 — при пересоздании тома нужен `chown -R 1000:1000` (см. wa-service/Dockerfile).
 - `MINIO_ROOT_USER/PASSWORD` и `INTERNAL_API_TOKEN` обязательны в `.env` — compose падает без них.
+- `REDIS_PASSWORD` в `.env` — пароль Redis для всех 4 клиентов (пусто = без auth). Смена требует `docker compose up -d` ВСЕХ сервисов разом. Ручной доступ: `docker compose exec redis sh -c 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli'`. Redis слушает только 127.0.0.1; в 02–07.2026 был открыт наружу без пароля (червь писал ключи `backup*`) — НЕ публиковать порт.
 - Бакет медиа приватный; ссылки наружу только presigned (`processor/src/s3.py`), объекты живут 90 дней.
 - wa-service port 3000: expose-only, NOT published. Access via nginx.
 - Media format: `*Sender*\n\noriginal\n\ntranslated`. Media sent natively (sendPhoto/etc), NOT in formatted_text.
