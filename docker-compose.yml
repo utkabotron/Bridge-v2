@@ -10,14 +10,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    # Bind to loopback only. Redis has no auth; on a public-IP VPS an open 6379 lets anyone
-    # FLUSHALL the whole pipeline. Containers reach it over the compose network by name.
+    # Bind to loopback only: on a public-IP VPS an open 6379 lets anyone FLUSHALL the whole
+    # pipeline (in 2026 a worm wrote cron payloads into it). Containers reach it over the
+    # compose network by name.
     ports:
       - "127.0.0.1:6379:6379"
+    # Password from .env. Unset/empty gives `requirepass ""`, which Redis treats as no
+    # password (default user stays `nopass`), so a missing .env line cannot lock every
+    # client out. Exec form with redis-server first on purpose: the image's entrypoint drops
+    # to the unprivileged redis user only then — an `sh -c` wrapper would run it as root.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-}"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # `redis-cli ping` exits 0 even on NOAUTH, so check for PONG. Pass -a only when a
+      # password is set: AUTH "" against a passwordless Redis is an error. `$$` defers the
+      # expansion to the container's shell.
+      test: ["CMD-SHELL", "redis-cli $${REDIS_PASSWORD:+-a \"$$REDIS_PASSWORD\" --no-auth-warning} ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -120,6 +131,7 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
       - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       - AWS_REGION=${AWS_REGION:-us-east-1}
@@ -172,6 +184,7 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -214,6 +227,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DATABASE_URL=${DATABASE_URL:-postgresql://bridge:bridge@postgres:5432/bridge}
       - WA_SERVICE_URL=http://wa-service:3000
       - WA_SERVICE_PUBLIC_URL=${WA_SERVICE_PUBLIC_URL:-http://localhost:3000}
@@ -240,6 +254,7 @@ services:
       - PROCESSOR_URL=http://processor:8000
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - PREFECT_API_URL=${PREFECT_API_URL}
       - PREFECT_API_KEY=${PREFECT_API_KEY}
       # Prefect's own metadata DB. On the default sqlite file the concurrent flows

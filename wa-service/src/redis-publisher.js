@@ -2,7 +2,7 @@ const Redis = require('ioredis');
 const crypto = require('crypto');
 const { serializedMsgId } = require('./message-id');
 const {
-  REDIS_HOST, REDIS_PORT, REDIS_DB,
+  REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD,
   REDIS_RETRY_DELAY_BASE, REDIS_RETRY_DELAY_MAX,
   DEDUP_TTL, CHAT_PAIRS_CACHE_TTL,
 } = require('./config');
@@ -11,6 +11,7 @@ const redis = new Redis({
   host: REDIS_HOST,
   port: REDIS_PORT,
   db: REDIS_DB,
+  password: REDIS_PASSWORD,
   // NEVER give up: returning null puts ioredis into a terminal "end" state and it
   // never reconnects — the single wa-service replica would then silently drop every
   // message until a manual restart. Retry forever with a capped backoff instead.

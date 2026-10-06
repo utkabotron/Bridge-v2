@@ -8,6 +8,9 @@ import os
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
+# Empty/unset = no AUTH, matching a Redis started with an empty requirepass: a missing .env
+# line must leave the queue reachable rather than lock every client out.
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 BRPOP_TIMEOUT = int(os.getenv("BRPOP_TIMEOUT", 5))
 # MUST stay strictly greater than BRPOP_TIMEOUT. redis-py 8.x applies socket_timeout to
 # blocking commands too, so an equal (or unset — it then defaults to something shorter than
@@ -23,6 +26,7 @@ def redis_kwargs(**overrides) -> dict:
         "host": REDIS_HOST,
         "port": REDIS_PORT,
         "db": REDIS_DB,
+        "password": REDIS_PASSWORD,
         "decode_responses": True,
         "socket_timeout": REDIS_SOCKET_TIMEOUT,
         "socket_connect_timeout": REDIS_CONNECT_TIMEOUT,
