@@ -18,11 +18,11 @@ import time
 
 from bridge_shared.glossary_match import GlossaryIndex
 
-from ..config import GLOSSARY_REFRESH_SECONDS
+from ..config import GLOSSARY_REFRESH_SECONDS, GLOSSARY_USED_STATUSES
 
 logger = logging.getLogger(__name__)
 
-USED_STATUSES = ("verified", "locked")
+USED_STATUSES = GLOSSARY_USED_STATUSES
 
 _lock = asyncio.Lock()
 _signature: tuple | None = None

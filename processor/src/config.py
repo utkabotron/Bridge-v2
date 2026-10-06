@@ -127,6 +127,10 @@ PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
 # Service glossary (pipeline/glossary.py) lives in memory; this is how often a message may
 # check whether the tables changed. /api/glossary edits apply at once regardless.
 GLOSSARY_REFRESH_SECONDS = int(os.getenv("GLOSSARY_REFRESH_SECONDS", 60))
+# Statuses that reach the prompt. `verified` is off until names that are also everyday words
+# are handled: with them on, "אני עמוס היום" came out "Я сегодня Амос" (docs/glossary-plan.md).
+GLOSSARY_USED_STATUSES = tuple(
+    s.strip() for s in os.getenv("GLOSSARY_USED_STATUSES", "locked").split(",") if s.strip())
 MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
 # Active pairs of a WhatsApp chat, looked up for every message (pipeline/cache.py). Pair
 # changes made outside the processor (wa-service, bot) do not invalidate the key yet, so
