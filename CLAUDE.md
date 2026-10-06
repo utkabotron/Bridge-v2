@@ -144,7 +144,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 **Словарь имён сервиса** (`glossary` + `glossary_override`, миграция 025, план — `docs/glossary-plan.md`):
 одно чтение имени на весь сервис, ключ — иврит/латиница как в сообщениях (`glossary_match.key_of`).
 Статусы: candidate → proposed (ждёт одобрения) → verified / locked (ручная) / rejected; в промпт —
-статусы `GLOSSARY_USED_STATUSES` (сейчас по умолчанию только `locked`), и только найденные в тексте.
+статусы `GLOSSARY_USED_STATUSES` (по умолчанию `verified,locked`), и только найденные в тексте.
 Имя, которое пишется как обычное слово (`also_word`: עמוס «занят», אופק «горизонт»), — ТОЛЬКО в чатах
 из `chat_pairs`; однозначные и locked — везде, включая DM. Без этого «אני עמוס היום» → «Я сегодня Амос».
 Перед включением статуса: `docker compose exec processor python -m src.glossary_check --statuses verified,locked`
