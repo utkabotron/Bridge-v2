@@ -138,6 +138,9 @@ services:
       # to turn without rebuilding the image.
       - WA_WEB_VERSION=${WA_WEB_VERSION:-}
       - MAX_CONCURRENT_CLIENTS=${MAX_CONCURRENT_CLIENTS:-10}
+      # Clients initialise one at a time on purpose: three Chromiums at once took 3 GiB of
+      # the VPS's 3.8 and OOM-killed the box (2026-04-24). Raise only with more RAM.
+      - MAX_PARALLEL_INIT=${MAX_PARALLEL_INIT:-1}
     volumes:
       - wa_sessions:/app/.wwebjs_auth
     healthcheck:

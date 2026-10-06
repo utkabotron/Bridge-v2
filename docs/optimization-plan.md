@@ -18,12 +18,12 @@
 - [ ] A2. Пароль на Redis (`requirepass`), все 4 клиента (processor, wa-service, bot, analytics) берут `REDIS_PASSWORD` из `.env`; пустой = без пароля. — Opus → ночь 1 (с откатом: если health не ok, убрать `REDIS_PASSWORD` и поднять заново) → `redis-cli ping` без пароля → NOAUTH, все health ok
 - [ ] A3. SSH: убрать `PasswordAuthentication yes` из `/etc/ssh/sshd_config.d/50-cloud-init.conf`. — **ты** подтверждаешь, что входишь только по ключу → Fable → `sshd -T | grep passwordauthentication` = no
 - [ ] A4. `~/.ssh/authorized_keys`: 4 записи (одна без подписи, `claude-code@n8n-access`, битый RSA с переносами, `bridge-v2-deploy`). — **ты** говоришь, какие оставить
-- [ ] A5. Публичные порты: 9000 (MinIO, нужен для presigned-ссылок Telegram — оставить), 3100 (docker-proxy, чей?), UFW-правила 3000/8000/2222 без причины. — Haiku: выяснить и предложить → Fable закрывает
+- [x] A5. (06.10) Публичные порты: 9000 — MinIO, нужен для presigned-ссылок Telegram, оставлен; 3100 — `fieldtracker-bot`, другой проект на этом VPS, не наш; UFW-правила 3000/8000/2222 удалены (на хосте там ничего не слушало). — Fable
 
 ## B. Ресурсы сервера
 
 - [x] B1. (06.10, 76% → 46%) `docker builder prune` — 15.5 ГБ кэша сборки. — Fable → сейчас → `df -h /` < 50%
-- [ ] B2. `MAX_PARALLEL_INIT` не пробрасывается в compose → wa-service всегда поднимает клиентов по одному. — Haiku → ночь 1 → в логах wa-service два клиента инициализируются одновременно, 4/4 ready быстрее 45 мин
+- [x] B2. (06.10, код; на прод — ночь 1) `MAX_PARALLEL_INIT` проброшен в compose, но значение остаётся 1 намеренно: 3 Chromium параллельно = 3 ГБ из 3.8, OOM 24.04.2026 (память проекта). 45 мин на старт — ограничение RAM, не баг; быстрее только с апгрейдом VPS. — Fable
 - [ ] B3. Кэш Chromium в `.wwebjs_auth/session-*/Default/Cache` (2.2 ГБ) чистить при старте wa-service (entrypoint). — Sonnet → ночь 2 → том `wa_sessions` < 500 МБ
 - [ ] B4. Prefect (313 МБ) → лёгкий планировщик (APScheduler), flows становятся обычными функциями, `get_run_logger` → logging. — Opus → отдельный день → analytics < 100 МБ, все 9 задач отработали по расписанию сутки
 
