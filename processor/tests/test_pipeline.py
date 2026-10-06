@@ -133,6 +133,34 @@ async def test_validate_node_skips_russian_text_without_media_from_admin_chat():
     assert result["delivery_status"] == "skipped"
 
 
+@pytest.mark.parametrize("text,is_russian", [
+    ("привет как дела", True),
+    ("", True),            # caption-less media: the media gate decides, not the language
+    ("👍", True),          # no letters, nothing worth forwarding
+    ("12:30", True),
+    ("hello how are you", False),
+    ("שלום, מה שלומך?", False),
+    ("привет, מה שלומך", False),  # mixed with a source script still gets forwarded
+])
+def test_admin_fallback_language_gate(text, is_russian):
+    from processor.src.pipeline.nodes import _is_russian_text
+
+    assert _is_russian_text(text) is is_russian
+
+
+@pytest.mark.asyncio
+async def test_validate_node_forwards_non_russian_text_when_fallback_enabled():
+    from processor.src.pipeline.nodes import validate_node
+
+    state = _base_state(user_id=100, original_text="hello how are you today")
+    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
+         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+        result = await validate_node(state)
+
+    assert result.get("fallback_to_admins") is True
+
+
 # ── translate_node ────────────────────────────────────────
 
 @pytest.mark.asyncio

@@ -12,9 +12,6 @@ import os
 import re
 import time
 
-
-from langdetect import detect, LangDetectException
-
 from ..config import (
     AB_ALWAYS_B_USERS, OPENAI_MODEL,
     TRANSLATION_UNAVAILABLE_NOTE,
@@ -43,6 +40,17 @@ async def _fetch_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
 
 # ── Node: validate ────────────────────────────────────────
 
+def _is_russian_text(text: str) -> bool:
+    """Cyrillic with none of the source scripts — all the admin fallback needs to know.
+
+    Text with no letters at all (a bare emoji, digits) counts as Russian too: there is
+    nothing in it to forward, and the old language detector gave up on it the same way.
+    """
+    if not any(ch.isalpha() for ch in text):
+        return True
+    return bool(_CYRILLIC_RE.search(text)) and not _SRC_SCRIPT_RE.search(text)
+
+
 async def validate_node(state: MessageState) -> MessageState:
     """Resolve chat_pair_id, tg_chat_id, target_language from DB.
 
@@ -65,19 +73,15 @@ async def validate_node(state: MessageState) -> MessageState:
         if ADMIN_NO_PAIR_FALLBACK and state["user_id"] in admin_ids:
             has_media = bool(state.get("media_s3_url")) or bool(state.get("media_failed"))
             text = state.get("original_text", "").strip()
-            lang = "ru"
-            if text:
-                try:
-                    lang = detect(text)
-                except LangDetectException:
-                    lang = "ru"
+            is_russian = _is_russian_text(text)
 
             # Forward an unpaired admin chat into the bot on any media or any non-Russian
-            # text. A caption-less video/photo has empty original_text, which langdetect
-            # would read as Russian and drop — so media must bypass the language gate.
+            # text. A caption-less video/photo has empty original_text, which reads as
+            # Russian and would be dropped — so media must bypass the language gate.
             # Russian-only text with no media still falls through to skipped.
-            if has_media or lang != "ru":
-                logger.info("Admin no-pair fallback (media=%s, lang=%s) → send to admins", has_media, lang)
+            if has_media or not is_russian:
+                logger.info("Admin no-pair fallback (media=%s, russian=%s) → send to admins",
+                            has_media, is_russian)
                 return {**state, "chat_pair_id": None, "tg_chat_id": None,
                         "target_language": "Russian",
                         "fallback_to_admins": True}
