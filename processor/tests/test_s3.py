@@ -76,8 +76,7 @@ def test_missing_credentials_degrade_instead_of_breaking_delivery(monkeypatch):
 
 
 def test_bare_bucket_key_accepted():
-    from processor.src.s3 import presign_get, split_object_url
+    from processor.src.s3 import presign_get
 
     url = presign_get("bridge-media/191440421/file.ogg", endpoint="http://minio:9000")
     assert urlparse(url).path == "/bridge-media/191440421/file.ogg"
-    assert split_object_url(OBJ) == ("bridge-media", "191440421/1784051345094_x.jpeg")

@@ -56,7 +56,3 @@ async def subscribe() -> asyncio.Queue:
 
 def unsubscribe(q: asyncio.Queue) -> None:
     _subscribers.discard(q)
-
-
-def get_history() -> list[dict]:
-    return list(_history)

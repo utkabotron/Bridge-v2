@@ -54,13 +54,6 @@ def _encode_path(path: str) -> str:
     return "/".join(quote(seg, safe="~") for seg in path.split("/"))
 
 
-def split_object_url(url: str) -> tuple[str, str]:
-    """Return (bucket, key) from a path-style object URL."""
-    path = urlparse(url).path.lstrip("/")
-    bucket, _, key = path.partition("/")
-    return bucket, key
-
-
 def presign_get(
     object_url: str,
     endpoint: str | None = None,

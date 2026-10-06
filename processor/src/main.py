@@ -105,28 +105,6 @@ app = FastAPI(title="Bridge v2 — Processor", version="2.0.0", lifespan=lifespa
 
 # ── Health ────────────────────────────────────────────────
 
-# Substring matching on "TOKEN"/"SECRET" let DATABASE_URL (with its password),
-# LANGCHAIN_API_KEY and ADMIN_TG_IDS through. Redact by shape instead: anything that
-# looks like a credential or a URL with userinfo never leaves this endpoint.
-_CONFIG_SECRET_MARKERS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "DATABASE_URL", "DSN", "ADMIN_TG_IDS")
-
-
-@app.get("/api/config")
-async def api_config():
-    """Current configuration (debug endpoint) with credentials redacted."""
-    from . import config as _cfg
-
-    out = {}
-    for k, v in vars(_cfg).items():
-        if not k.isupper() or k.startswith("_") or callable(v):
-            continue
-        if any(marker in k for marker in _CONFIG_SECRET_MARKERS):
-            out[k] = "***redacted***" if v else None
-        else:
-            out[k] = v
-    return out
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "processor"}
@@ -582,32 +560,6 @@ async def api_dlq():
         await r.aclose()
 
 
-@app.post("/api/dlq/retry")
-async def api_dlq_retry():
-    """Move all DLQ messages back to messages:in for reprocessing."""
-    r = aioredis.Redis(**redis_kwargs())
-    # Atomic per item: pop from DLQ, unwrap the {"payload": ...} envelope, and requeue in
-    # one server-side script so a crash between pop and push can't lose the message.
-    lua = """
-    local item = redis.call('RPOP', KEYS[1])
-    if not item then return nil end
-    local payload = item
-    local ok, entry = pcall(cjson.decode, item)
-    if ok and type(entry) == 'table' and entry['payload'] ~= nil then
-      payload = cjson.encode(entry['payload'])
-    end
-    redis.call('LPUSH', KEYS[2], payload)
-    return 1
-    """
-    try:
-        count = 0
-        while await r.eval(lua, 2, "messages:dlq", "messages:in") is not None:
-            count += 1
-        return {"retried": count}
-    finally:
-        await r.aclose()
-
-
 # ── Feature Flags API ────────────────────────────────────
 
 @app.get("/api/flags")
@@ -925,7 +877,7 @@ def _surrogate_id(payload: dict) -> str:
 
 
 async def _dlq_push(r, payload, error: str, attempts: int = 0) -> None:
-    """Envelope a message into the DLQ ({"payload": ...}) matching /api/dlq/retry.
+    """Envelope a message into the DLQ ({"payload": ...}), the shape _dlq_retry_loop reads.
 
     `attempts` rides along so the auto-retry task can give up on a message that keeps
     failing instead of cycling it between the queues forever.
