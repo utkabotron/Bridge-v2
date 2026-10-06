@@ -8,16 +8,17 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
 import re
 import time
+
+from bridge_shared.scripts import CYRILLIC_RE, SOURCE_SCRIPT_RE, target_script_re
 
 from ..config import (
     AB_ALWAYS_B_USERS, OPENAI_MODEL,
     TRANSLATION_UNAVAILABLE_NOTE,
     VOICE_AUTO_TRANSCRIBE, VOICE_TRANSCRIPT_TITLE,
     MEDIA_FAILED_NOTE, EDITED_MARK, OWN_MESSAGE_PREFIX,
-    ADMIN_NO_PAIR_FALLBACK,
+    ADMIN_NO_PAIR_FALLBACK, ADMIN_TG_IDS,
 )
 from ..llm import chat as llm_chat
 from ..models.message import MessageState
@@ -44,7 +45,7 @@ def _is_russian_text(text: str) -> bool:
     """
     if not any(ch.isalpha() for ch in text):
         return True
-    return bool(_CYRILLIC_RE.search(text)) and not _SRC_SCRIPT_RE.search(text)
+    return bool(CYRILLIC_RE.search(text)) and not SOURCE_SCRIPT_RE.search(text)
 
 
 async def validate_node(state: MessageState) -> MessageState:
@@ -69,8 +70,7 @@ async def validate_node(state: MessageState) -> MessageState:
 
         # Fallback to admins only for admin's own WA messages, and only when explicitly
         # enabled — otherwise an unpaired chat is simply skipped.
-        admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
-        if ADMIN_NO_PAIR_FALLBACK and state["user_id"] in admin_ids:
+        if ADMIN_NO_PAIR_FALLBACK and state["user_id"] in ADMIN_TG_IDS:
             has_media = bool(state.get("media_s3_url")) or bool(state.get("media_failed"))
             text = state.get("original_text", "").strip()
             is_russian = _is_russian_text(text)
@@ -103,15 +103,7 @@ async def validate_node(state: MessageState) -> MessageState:
 # source back untranslated (prompt rule 3 misfiring, or a lazy reply at temperature 0),
 # and translate_node delivered it — a message worthless to a reader who does not read the
 # source script. These are the worst-scoring translations we produce. Detect the echo and
-# give the model one corrective turn before giving up.
-_SRC_SCRIPT_RE = re.compile(r"[֐-׿؀-ۿ܀-ݏ]")  # Hebrew, Arabic, Syriac
-_CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
-_LATIN_RE = re.compile(r"[A-Za-z]")
-_TGT_SCRIPT_RE = {
-    "russian": _CYRILLIC_RE, "ukrainian": _CYRILLIC_RE,
-    "english": _LATIN_RE, "spanish": _LATIN_RE, "french": _LATIN_RE,
-    "german": _LATIN_RE, "portuguese": _LATIN_RE,
-}
+# give the model one corrective turn before giving up. Script regexes: bridge_shared.scripts.
 
 
 def _looks_untranslated(original: str, translated: str, target_language: str) -> bool:
@@ -129,10 +121,10 @@ def _looks_untranslated(original: str, translated: str, target_language: str) ->
     t = translated.strip()
     if t == o:
         return True
-    tgt_re = _TGT_SCRIPT_RE.get((target_language or "").strip().lower())
+    tgt_re = target_script_re(target_language)
     if tgt_re is None:
         return False  # cannot reason about scripts for this target language
-    return bool(_SRC_SCRIPT_RE.search(t)) and not tgt_re.search(t)
+    return bool(SOURCE_SCRIPT_RE.search(t)) and not tgt_re.search(t)
 
 
 # ── Node: translate ───────────────────────────────────────
@@ -669,13 +661,10 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
 
 
 async def _deliver_to_admins(state: MessageState) -> MessageState:
-    """Send message to all admin Telegram IDs from ADMIN_TG_IDS env."""
+    """Send message to all admin Telegram IDs (config.ADMIN_TG_IDS)."""
     from ..telegram_sender import send_message
 
-    raw_ids = os.getenv("ADMIN_TG_IDS", "")
-    admin_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
-
-    if not admin_ids:
+    if not ADMIN_TG_IDS:
         logger.warning("fallback_to_admins=True but ADMIN_TG_IDS is empty")
         result = {**state, "delivery_status": "failed", "error": "no_admin_ids"}
         await _persist_event(result)
@@ -685,7 +674,7 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
     text = f"[WA: {chat_name}]\n{state.get('formatted_text', '')}"
 
     errors = []
-    for admin_id in admin_ids:
+    for admin_id in ADMIN_TG_IDS:
         ok, error, _, _ = await send_message(
             chat_id=admin_id,
             text=text,
@@ -702,7 +691,7 @@ async def _deliver_to_admins(state: MessageState) -> MessageState:
         result = {**state, "delivery_status": "failed", "error": "; ".join(errors)}
     else:
         result = {**state, "delivery_status": "delivered"}
-        logger.info("Fallback message sent to %d admins", len(admin_ids))
+        logger.info("Fallback message sent to %d admins", len(ADMIN_TG_IDS))
 
     await _persist_event(result)
     return result

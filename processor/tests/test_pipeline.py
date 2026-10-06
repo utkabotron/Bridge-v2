@@ -1,8 +1,6 @@
 """Unit tests for the pipeline nodes and their order."""
 from __future__ import annotations
 
-import os
-
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -107,7 +105,7 @@ async def test_validate_node_skips_unpaired_admin_chat_by_default():
                         media_s3_url="https://s3/bridge-media/vid.mp4")
     with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", False), \
-         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+         patch("processor.src.pipeline.nodes.ADMIN_TG_IDS", [100]):
         result = await validate_node(state)
 
     assert result.get("fallback_to_admins") is not True
@@ -124,7 +122,7 @@ async def test_validate_node_forwards_captionless_media_when_fallback_enabled():
                         media_s3_url="https://s3/bridge-media/vid.mp4")
     with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
-         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+         patch("processor.src.pipeline.nodes.ADMIN_TG_IDS", [100]):
         result = await validate_node(state)
 
     assert result.get("fallback_to_admins") is True
@@ -140,7 +138,7 @@ async def test_validate_node_skips_russian_text_without_media_from_admin_chat():
                         original_text="привет как дела у тебя сегодня всё хорошо надеюсь")
     with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
-         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+         patch("processor.src.pipeline.nodes.ADMIN_TG_IDS", [100]):
         result = await validate_node(state)
 
     assert result.get("fallback_to_admins") is not True
@@ -169,7 +167,7 @@ async def test_validate_node_forwards_non_russian_text_when_fallback_enabled():
     state = _base_state(user_id=100, original_text="hello how are you today")
     with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
-         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+         patch("processor.src.pipeline.nodes.ADMIN_TG_IDS", [100]):
         result = await validate_node(state)
 
     assert result.get("fallback_to_admins") is True

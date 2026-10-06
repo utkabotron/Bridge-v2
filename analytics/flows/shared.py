@@ -1,4 +1,8 @@
-"""Shared utilities for analytics flows."""
+"""Shared utilities for analytics flows.
+
+Not to be confused with bridge_shared (shared/ at the repo root): that is what analytics
+shares with the processor and the bot; this is what the flows share with each other.
+"""
 from __future__ import annotations
 
 import logging
@@ -8,6 +12,10 @@ from contextlib import contextmanager
 import httpx
 import psycopg2
 import psycopg2.extras
+from bridge_shared.env import admin_tg_ids
+# Re-exported for the flows: the processor's escaping, quotes included — the copy that
+# lived here left " and ' alone.
+from bridge_shared.telegram_html import esc as esc
 from prefect import get_run_logger
 
 # Telegram calls put the bot token in the URL, and httpx logs request URLs at INFO.
@@ -15,7 +23,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+ADMIN_TG_IDS = admin_tg_ids()
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 
@@ -41,11 +49,6 @@ def db_conn(cursor_factory=psycopg2.extras.RealDictCursor):
         raise
     finally:
         conn.close()
-
-
-def esc(s: str) -> str:
-    """Escape HTML special chars in LLM-generated text."""
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def notify_telegram(text: str, timeout: int = 10) -> int:
