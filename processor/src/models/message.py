@@ -31,6 +31,10 @@ class MessageState(TypedDict):
     # [{name, phones}] parsed from a shared vCard.
     contacts: Optional[list]
 
+    # Set by the consumer once it has looked the chat's pairs up (and found none), so
+    # validate does not repeat the lookup.
+    pairs_resolved: bool
+
     # Resolved by validate node
     chat_pair_id: Optional[int]
     tg_chat_id: Optional[int]

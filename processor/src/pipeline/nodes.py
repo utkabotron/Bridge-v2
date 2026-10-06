@@ -22,20 +22,16 @@ from ..config import (
 from ..llm import chat as llm_chat
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
-from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
+from .cache import (
+    get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile,
+    lookup_chat_pairs, invalidate_chat_pairs,
+)
 from .prompts import VARIANTS, choose_variant, get_translate_prompt, format_chat_context
 
 logger = logging.getLogger(__name__)
 
 # Media types eligible for the Analyze button (no video in v1)
 _ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "ptt", "document"}
-
-
-# ── DB helpers (lazy import to avoid circular deps) ──────
-
-async def _fetch_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
-    from ..db import fetch_active_chat_pairs
-    return await fetch_active_chat_pairs(user_id, wa_chat_id)
 
 
 # ── Node: validate ────────────────────────────────────────
@@ -52,16 +48,20 @@ def _is_russian_text(text: str) -> bool:
 
 
 async def validate_node(state: MessageState) -> MessageState:
-    """Resolve chat_pair_id, tg_chat_id, target_language from DB.
+    """Resolve chat_pair_id, tg_chat_id, target_language.
 
     The consumer resolves the pairs itself to fan a group message out to every active
-    pair of that chat, and hands each run its own pre-resolved pair — in that case this
-    node is a pass-through instead of a second identical query.
+    pair of that chat, and hands each run its own pre-resolved pair — or `pairs_resolved`
+    when the chat has none — so this node is a pass-through instead of a second lookup.
+    The lookup below is for a state that arrives with neither.
     """
     if state.get("chat_pair_id"):
         return state
 
-    pairs = await _fetch_chat_pairs(state["user_id"], state["wa_chat_id"])
+    if state.get("pairs_resolved"):
+        pairs = []
+    else:
+        pairs = await lookup_chat_pairs(state["user_id"], state["wa_chat_id"])
     pair = pairs[0] if pairs else None
 
     if not pair:
@@ -583,7 +583,7 @@ async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
 
     # Auto-migrate supergroup: update chat_pairs and retry
     if not ok and migrate_id:
-        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        await _migrate_chat_pair(state, migrate_id)
         ok, error, _, tg_msg_id = await send_message(
             chat_id=migrate_id,
             text=state["formatted_text"],
@@ -637,7 +637,7 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
 
     # Auto-migrate supergroup
     if not ok and migrate_id:
-        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        await _migrate_chat_pair(state, migrate_id)
         ok, error, _, tg_msg_id = await send_message(
             chat_id=migrate_id,
             text=state["formatted_text"],
@@ -722,6 +722,9 @@ async def _pause_dead_chat(state: MessageState, error: str | None) -> None:
         return
 
     owner_tg_id = await pause_chat_pair(chat_pair_id)
+    # The cached lookup still lists this pair; without this every later message retries the
+    # dead chat (and trips the failure-rate alert) until the entry expires.
+    await invalidate_chat_pairs(state.get("user_id"), state.get("wa_chat_id") or "")
     logger.warning("Paused chat_pair %s — Telegram chat unreachable: %s", chat_pair_id, error)
     if not owner_tg_id:
         return  # already paused by an earlier message — do not notify twice
@@ -737,8 +740,9 @@ async def _pause_dead_chat(state: MessageState, error: str | None) -> None:
     )
 
 
-async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> None:
+async def _migrate_chat_pair(state: MessageState, new_tg_chat_id: int) -> None:
     """Update chat_pairs tg_chat_id when Telegram group migrates to supergroup."""
+    chat_pair_id = state.get("chat_pair_id")
     if not chat_pair_id:
         return
     import asyncpg
@@ -767,6 +771,8 @@ async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> N
             logger.error("Failed to merge chat_pair %s into %s: %s", chat_pair_id, target_id, exc)
     except Exception as exc:
         logger.error("Failed to migrate chat_pair %s: %s", chat_pair_id, exc)
+    # The cached lookup holds the old tg_chat_id (or a pair that was just merged away).
+    await invalidate_chat_pairs(state.get("user_id"), state.get("wa_chat_id") or "")
 
 
 async def _persist_event(state: MessageState) -> None:

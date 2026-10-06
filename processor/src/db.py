@@ -86,6 +86,27 @@ async def fetch_active_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+async def fetch_delivered_pair_ids(wa_message_id: str) -> set[int | None]:
+    """Pairs this WhatsApp message already reached (None = the pair-less admin fallback).
+
+    One query for the whole fan-out. A failure (DB down/timeout) must NOT drop the
+    message: report nothing delivered and let it be processed.
+    """
+    try:
+        pool = await get_pool()
+        rows = await pool.fetch(
+            """
+            select chat_pair_id from public.message_events
+            where wa_message_id = $1 and delivery_status = 'delivered'
+            """,
+            wa_message_id,
+        )
+        return {row["chat_pair_id"] for row in rows}
+    except Exception as exc:
+        logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, exc)
+        return set()
+
+
 async def merge_chat_pairs(stale_id: int, target_id: int) -> None:
     """Fold a stale chat_pair into the pair that already holds its new tg_chat_id.
 

@@ -225,3 +225,142 @@ async def test_set_chat_profile_error_is_silent():
 
     with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
         await set_chat_profile(7, {})  # must not raise
+
+
+# ── chat pairs cache ──────────────────────────────────────
+
+PAIRS = [{"id": 11, "tg_chat_id": -1001, "target_language": "Hebrew"}]
+
+
+def test_pairs_key_format():
+    """The key wa-service documents (CLAUDE.md) and is expected to DEL on pair changes."""
+    from processor.src.pipeline.cache import _pairs_key
+    assert _pairs_key(100, "123@g.us") == "chat_pairs:user:100:chat:123@g.us"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_pairs_tells_empty_from_unknown():
+    from processor.src.pipeline.cache import get_chat_pairs
+    mock_redis = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        mock_redis.get = AsyncMock(return_value=json.dumps(PAIRS))
+        assert await get_chat_pairs(100, "123@g.us") == PAIRS
+        mock_redis.get = AsyncMock(return_value="[]")
+        assert await get_chat_pairs(100, "123@g.us") == []  # known: no pair
+        mock_redis.get = AsyncMock(return_value=None)
+        assert await get_chat_pairs(100, "123@g.us") is None  # unknown: ask the DB
+        mock_redis.get = AsyncMock(return_value="not json")
+        assert await get_chat_pairs(100, "123@g.us") is None
+        mock_redis.get = AsyncMock(return_value='{"id": 1}')  # not a list
+        assert await get_chat_pairs(100, "123@g.us") is None
+        mock_redis.get = AsyncMock(side_effect=Exception("redis down"))
+        assert await get_chat_pairs(100, "123@g.us") is None
+
+
+@pytest.mark.asyncio
+async def test_set_chat_pairs_caches_empty_briefly_and_pairs_for_the_full_ttl():
+    from processor.src.config import PAIRS_CACHE_TTL, PAIRS_NEGATIVE_CACHE_TTL
+    from processor.src.pipeline.cache import set_chat_pairs
+    mock_redis = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await set_chat_pairs(100, "123@g.us", PAIRS)
+        await set_chat_pairs(100, "123@g.us", [])
+
+    (key, ttl, value), (_, neg_ttl, neg_value) = [c.args for c in mock_redis.setex.await_args_list]
+    assert key == "chat_pairs:user:100:chat:123@g.us"
+    assert (ttl, json.loads(value)) == (PAIRS_CACHE_TTL, PAIRS)
+    assert (neg_ttl, json.loads(neg_value)) == (PAIRS_NEGATIVE_CACHE_TTL, [])
+    assert PAIRS_NEGATIVE_CACHE_TTL < PAIRS_CACHE_TTL
+
+
+@pytest.mark.asyncio
+async def test_set_chat_pairs_error_is_silent():
+    from processor.src.pipeline.cache import set_chat_pairs
+    mock_redis = AsyncMock()
+    mock_redis.setex = AsyncMock(side_effect=Exception("redis down"))
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await set_chat_pairs(100, "123@g.us", PAIRS)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_lookup_chat_pairs_hit_skips_the_database():
+    from processor.src.pipeline.cache import lookup_chat_pairs
+    fetch = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_chat_pairs", new=AsyncMock(return_value=PAIRS)), \
+         patch("processor.src.db.fetch_active_chat_pairs", new=fetch):
+        assert await lookup_chat_pairs(100, "123@g.us") == PAIRS
+
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lookup_chat_pairs_empty_answer_is_a_hit_too():
+    """Every unbridged chat of a connected account would otherwise hit Postgres per message."""
+    from processor.src.pipeline.cache import lookup_chat_pairs
+    fetch = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.db.fetch_active_chat_pairs", new=fetch):
+        assert await lookup_chat_pairs(100, "123@c.us") == []
+
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lookup_chat_pairs_miss_queries_once_and_caches_the_answer():
+    from processor.src.pipeline.cache import lookup_chat_pairs
+    fetch = AsyncMock(return_value=[])
+    store = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_chat_pairs", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.cache.set_chat_pairs", new=store), \
+         patch("processor.src.db.fetch_active_chat_pairs", new=fetch):
+        assert await lookup_chat_pairs(100, "123@c.us") == []
+
+    fetch.assert_awaited_once_with(100, "123@c.us")
+    store.assert_awaited_once_with(100, "123@c.us", [])  # the empty answer is cached too
+
+
+@pytest.mark.asyncio
+async def test_invalidate_chat_pairs_private_chat_deletes_the_users_key():
+    from processor.src.pipeline.cache import invalidate_chat_pairs
+    mock_redis = AsyncMock()
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await invalidate_chat_pairs(100, "972501234567@c.us")
+
+    mock_redis.delete.assert_awaited_once_with("chat_pairs:user:100:chat:972501234567@c.us")
+
+
+@pytest.mark.asyncio
+async def test_invalidate_chat_pairs_group_clears_every_users_copy():
+    """A group's fan-out is cached under whichever user_id won the dedup race."""
+    from processor.src.pipeline.cache import invalidate_chat_pairs
+
+    async def scan_iter(match, count):
+        assert match == "chat_pairs:user:*:chat:123@g.us"
+        for key in ("chat_pairs:user:100:chat:123@g.us", "chat_pairs:user:200:chat:123@g.us"):
+            yield key
+
+    mock_redis = AsyncMock()
+    mock_redis.scan_iter = scan_iter
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await invalidate_chat_pairs(100, "123@g.us")
+
+    mock_redis.delete.assert_awaited_once_with(
+        "chat_pairs:user:100:chat:123@g.us", "chat_pairs:user:200:chat:123@g.us",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalidate_chat_pairs_error_is_silent():
+    from processor.src.pipeline.cache import invalidate_chat_pairs
+    mock_redis = AsyncMock()
+    mock_redis.delete = AsyncMock(side_effect=Exception("redis down"))
+
+    with patch("processor.src.pipeline.cache.get_redis", return_value=mock_redis):
+        await invalidate_chat_pairs(100, "123@c.us")  # must not raise

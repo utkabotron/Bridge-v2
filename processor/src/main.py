@@ -39,7 +39,8 @@ from .config import (
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
-from .db import get_pool, fetch_active_chat_pairs, insert_direct_translation, insert_direct_media_analysis
+from .pipeline.cache import lookup_chat_pairs
+from .db import get_pool, fetch_delivered_pair_ids, insert_direct_translation, insert_direct_media_analysis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1053,7 +1054,7 @@ async def _process_message(r, raw: str) -> None:
         # Every active pair of this chat gets its own run: a WhatsApp group message is
         # seen by several clients but dedup keeps only one copy, so fanning out here is
         # what stops the pairs that did not win the dedup race from starving.
-        pairs = await fetch_active_chat_pairs(user_id, state["wa_chat_id"])
+        pairs = await lookup_chat_pairs(user_id, state["wa_chat_id"])
     except Exception as exc:
         # Failure in parse/build/lookup/emit — the popped message would otherwise vanish.
         _counter["failed"] += 1
@@ -1062,7 +1063,7 @@ async def _process_message(r, raw: str) -> None:
         return
 
     # No pair → a single pair-less run, so validate_node still decides between the
-    # admin fallback and "skipped".
+    # admin fallback and "skipped" (it must not look the pairs up a second time).
     branches = [
         {
             **state,
@@ -1071,11 +1072,18 @@ async def _process_message(r, raw: str) -> None:
             "target_language": pair.get("target_language") or "Russian",
         }
         for pair in pairs
-    ] or [state]
+    ] or [{**state, "pairs_resolved": True}]
+
+    # A message that comes back through the DLQ or the in-flight list may already have
+    # reached some of its pairs (a fan-out that failed halfway). The upsert in
+    # insert_message_event only guards the row, and runs after Telegram was called, so
+    # without this check those pairs would get a second copy. Fresh messages skip the
+    # query: wa-service dedup has them covered.
+    delivered = await fetch_delivered_pair_ids(wa_message_id) if _is_requeued(payload) else set()
 
     for branch in branches:
         chat_pair_id = branch.get("chat_pair_id")
-        if await _already_delivered(wa_message_id, chat_pair_id):
+        if chat_pair_id in delivered:
             _counter["skipped"] += 1
             logger.info("Dedup skip: %s already delivered to pair %s", wa_message_id, chat_pair_id)
             continue
@@ -1126,24 +1134,20 @@ async def _handle_revoke(payload: dict) -> None:
             logger.warning("Revoke note failed for %s: %s", wa_message_id, exc)
 
 
-async def _already_delivered(wa_message_id: str, chat_pair_id: int | None) -> bool:
-    """True if this message was already delivered to this pair.
+def _is_requeued(payload: dict) -> bool:
+    """True for a message that already went through the pipeline once: a DLQ retry, or one
+    recovered from the in-flight list after a crash."""
+    return bool(payload.get("_dlq_attempts") or payload.get("_requeued"))
 
-    A lookup failure (DB down/timeout) must NOT drop the message — process it.
-    """
+
+def _mark_requeued(raw: str) -> str:
+    """Flag a recovered in-flight message so _process_message checks what it already reached."""
     try:
-        pool = await get_pool()
-        existing = await pool.fetchval(
-            """
-            SELECT delivery_status FROM message_events
-            WHERE wa_message_id = $1 AND chat_pair_id IS NOT DISTINCT FROM $2
-            """,
-            wa_message_id, chat_pair_id,
-        )
-        return existing == "delivered"
-    except Exception as exc:
-        logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, exc)
-        return False
+        payload = json.loads(raw)
+        payload["_requeued"] = True
+        return json.dumps(payload, default=str)
+    except (json.JSONDecodeError, TypeError):
+        return raw
 
 
 async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_id: str) -> None:
@@ -1240,7 +1244,7 @@ async def _requeue_inflight(r) -> None:
         if not stranded:
             return
         for raw in stranded:
-            await r.rpush("messages:in", raw)
+            await r.rpush("messages:in", _mark_requeued(raw))
             await r.lrem(PROCESSING_QUEUE, 1, raw)
         logger.warning("Recovered %d in-flight message(s) from a previous run", len(stranded))
     except Exception as exc:
