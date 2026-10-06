@@ -811,8 +811,44 @@ def test_format_node_quotes_the_replied_message_when_threading_is_unavailable():
     assert "во сколько встреча?" in inline["formatted_text"]
     assert "Dana" in inline["formatted_text"]
 
-    threaded = format_node(_base_state(quoted=quoted, reply_to_message_id=555))
+    threaded = format_node(_base_state(quoted=quoted, quote_threaded=True))
     assert "во сколько встреча?" not in threaded["formatted_text"]
+
+
+@pytest.mark.asyncio
+async def test_reply_found_in_telegram_drops_the_inline_quote():
+    """format_node runs before the reply target is known; deliver must not send both."""
+    from processor.src.pipeline.nodes import deliver_node, format_node
+
+    quoted = {"wa_message_id": "abc", "body": "во сколько встреча?", "sender": "Dana"}
+    state = format_node(_base_state(quoted=quoted, chat_pair_id=7, tg_chat_id=-100500))
+    assert "во сколько встреча?" in state["formatted_text"]
+
+    send_message = AsyncMock(return_value=(True, None, None, 999))
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(4242, 77))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.send_message", new=send_message):
+        await deliver_node(state)
+
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["reply_to_message_id"] == 4242
+    assert "во сколько встреча?" not in kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_reply_not_in_telegram_keeps_the_inline_quote():
+    from processor.src.pipeline.nodes import deliver_node, format_node
+
+    quoted = {"wa_message_id": "abc", "body": "во сколько встреча?", "sender": "Dana"}
+    state = format_node(_base_state(quoted=quoted, chat_pair_id=7, tg_chat_id=-100500))
+
+    send_message = AsyncMock(return_value=(True, None, None, 999))
+    with patch("processor.src.db.find_delivered_event", new=AsyncMock(return_value=(None, None))), \
+         patch("processor.src.db.insert_message_event", new=AsyncMock(return_value=None)), \
+         patch("processor.src.telegram_sender.send_message", new=send_message):
+        await deliver_node(state)
+
+    assert "во сколько встреча?" in send_message.await_args.kwargs["text"]
 
 
 # ── Stage 3: not paying to translate what is already readable ──

@@ -360,9 +360,10 @@ def format_node(state: MessageState) -> MessageState:
         header.append(esc(EDITED_MARK))
 
     # Quoted message: Telegram's own reply threading does the work when we know the
-    # original's message_id; this preview is the fallback when we don't.
+    # original's message_id; this preview is the fallback when we don't. The target is
+    # only known in deliver_node, which re-runs this node once it finds one.
     quoted = state.get("quoted") or {}
-    if quoted.get("body") and not state.get("reply_to_message_id"):
+    if quoted.get("body") and not state.get("quote_threaded"):
         preview = quoted["body"].strip().replace("\n", " ")[:120]
         who = quoted.get("sender")
         prefix = f"{who}: " if who else ""
@@ -432,6 +433,11 @@ async def deliver_node(state: MessageState) -> MessageState:
     tg_target, target_event_id = await _resolve_reply_target(state)
     state = {**state, "reply_to_message_id": tg_target, "edit_target_event_id": target_event_id}
 
+    # The reply already shows the quoted message — an inline preview on top of it says
+    # the same thing twice.
+    if not state.get("quote_threaded") and await _quote_is_threaded(state, tg_target):
+        state = format_node({**state, "quote_threaded": True})
+
     # A location has no text worth translating; send it as a real map pin.
     if state.get("location"):
         return await _deliver_location(state, tg_chat_id)
@@ -478,6 +484,24 @@ async def _resolve_reply_target(state: MessageState) -> tuple[int | None, int | 
     if not target_wa_id:
         return None, None
     return await find_delivered_event(target_wa_id, chat_pair_id)
+
+
+async def _quote_is_threaded(state: MessageState, tg_target: int | None) -> bool:
+    """Whether the quoted message is in Telegram, so the reply shows it natively.
+
+    For a plain reply the resolved target *is* the quote. An edit resolves to the message
+    it revises, so the quote is looked up on its own — the rewritten text must match the
+    original, which was sent without the preview.
+    """
+    quoted_wa_id = (state.get("quoted") or {}).get("wa_message_id")
+    if not quoted_wa_id:
+        return False
+    if not state.get("is_edited"):
+        return bool(tg_target)
+
+    from ..db import find_delivered_event
+    quote_tg, _ = await find_delivered_event(quoted_wa_id, state["chat_pair_id"])
+    return bool(quote_tg)
 
 
 def _analyze_markup(event_id: int) -> dict:

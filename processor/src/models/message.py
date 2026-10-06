@@ -67,6 +67,8 @@ class MessageState(TypedDict):
     reply_to_message_id: Optional[int]
     # message_events.id of that same message — lets an edited photo keep its Analyze button.
     edit_target_event_id: Optional[int]
+    # The quoted message exists in Telegram, so the reply itself shows the quote.
+    quote_threaded: bool
     tg_message_id: Optional[int]
     delivery_status: str       # pending | delivered | failed | skipped
     error: Optional[str]
