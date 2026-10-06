@@ -1,10 +1,16 @@
-"""Unit tests for the LangGraph pipeline nodes."""
+"""Unit tests for the pipeline nodes and their order."""
 from __future__ import annotations
 
 import os
 
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
+
+
+def _completion(text: str):
+    """What src/llm.chat returns, minus the bookkeeping the nodes do not read."""
+    from processor.src.llm import Completion
+    return Completion(text=text, model="test-model")
 
 
 def _base_state(**overrides):
@@ -154,38 +160,38 @@ async def test_translate_node_llm_call():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian")
 
-    mock_response = MagicMock()
-    mock_response.content = "Привет, как дела?"
-
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()), \
          patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
          patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
          patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
-         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
-
-        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
+         patch("processor.src.pipeline.nodes.llm_chat", new=AsyncMock(return_value=_completion("Привет, как дела?"))) as chat:
         result = await translate_node(state)
 
     assert result["translated_text"] == "Привет, как дела?"
     assert result["cache_hit"] is False
     assert result["translation_ms"] >= 0
+    messages = chat.await_args.args[0]
+    assert messages[0]["role"] == "system" and messages[1] == {"role": "user", "content": state["original_text"].strip()}
+    assert chat.await_args.kwargs["purpose"] == "translate"
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flag_on,pair,expected_version,expected_model", [
     (True, 29, "v2.10@gpt-6-luna", "gpt-6-luna"),
-    (True, 12, "v2.10", None),
-    (False, 29, "v2.10", None),
+    (True, 12, "v2.10", "default"),
+    (False, 29, "v2.10", "default"),
 ])
 async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_on, pair, expected_version, expected_model):
     """Odd pairs get variant B while the flag is on; the version rides along for the evaluation."""
     from processor.src.pipeline.nodes import translate_node
 
+    from processor.src.config import OPENAI_MODEL
+    if expected_model == "default":
+        expected_model = OPENAI_MODEL
+
     state = _base_state(chat_pair_id=pair, tg_chat_id=-100, target_language="Russian")
-    mock_response = MagicMock()
-    mock_response.content = "Привет, как дела?"
 
     with patch("processor.src.feature_flags.is_enabled", new=AsyncMock(return_value=flag_on)), \
          patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)) as get_cached, \
@@ -194,13 +200,13 @@ async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_o
          patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
          patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
          patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
-         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
-        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
+         patch("processor.src.pipeline.nodes.llm_chat", new=AsyncMock(return_value=_completion("Привет"))) as chat:
         result = await translate_node(state)
 
     assert result["prompt_version"] == expected_version
-    mock_llm.assert_called_with(expected_model)
-    assert f"prompt-{expected_version}" in mock_llm.return_value.ainvoke.await_args.kwargs["config"]["tags"]
+    assert chat.await_args.kwargs["model"] == expected_model
+    # The version is recorded with the call, so llm_usage splits cost by A/B variant.
+    assert chat.await_args.kwargs["tag"] == expected_version
     # The cache is partitioned by version, so A and B never serve each other's translations.
     assert get_cached.await_args.kwargs["version"] == expected_version
     assert set_cached.await_args.kwargs["version"] == expected_version
@@ -227,11 +233,7 @@ async def test_translate_node_retries_when_model_echoes_source():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
                         original_text="שלום, מה שלומך?")
-    echo = MagicMock()
-    echo.content = "שלום, מה שלומך?"
-    good = MagicMock()
-    good.content = "Привет, как дела?"
-    ainvoke = AsyncMock(side_effect=[echo, good])
+    chat = AsyncMock(side_effect=[_completion("שלום, מה שלומך?"), _completion("Привет, как дела?")])
 
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
@@ -239,12 +241,15 @@ async def test_translate_node_retries_when_model_echoes_source():
          patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
          patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
          patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
-         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
-
-        mock_llm.return_value.ainvoke = ainvoke
+         patch("processor.src.pipeline.nodes.llm_chat", new=chat):
         result = await translate_node(state)
 
-    assert ainvoke.await_count == 2
+    assert chat.await_count == 2
+    # The retry replays the echo as the assistant turn and asks again
+    retry = chat.await_args_list[1].args[0]
+    assert retry[-2] == {"role": "assistant", "content": "שלום, מה שלומך?"}
+    assert retry[-1]["role"] == "user" and "NOT translated" in retry[-1]["content"]
+    assert chat.await_args_list[1].kwargs["purpose"] == "translate_retry"
     assert result["translated_text"] == "Привет, как дела?"
     assert result["translation_passthrough"] is False
     set_cached.assert_awaited()  # the corrected result is cache-worthy
@@ -257,9 +262,7 @@ async def test_translate_node_flags_and_skips_cache_on_persistent_passthrough():
 
     state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian",
                         original_text="שלום, מה שלומך?")
-    echo = MagicMock()
-    echo.content = "שלום, מה שלומך?"
-    ainvoke = AsyncMock(side_effect=[echo, echo])
+    chat = AsyncMock(side_effect=[_completion("שלום, מה שלומך?"), _completion("שלום, מה שלומך?")])
 
     with patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
@@ -267,12 +270,10 @@ async def test_translate_node_flags_and_skips_cache_on_persistent_passthrough():
          patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()) as set_cached_global, \
          patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
          patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
-         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
-
-        mock_llm.return_value.ainvoke = ainvoke
+         patch("processor.src.pipeline.nodes.llm_chat", new=chat):
         result = await translate_node(state)
 
-    assert ainvoke.await_count == 2
+    assert chat.await_count == 2
     assert result["translated_text"] == "שלום, מה שלומך?"
     assert result["translation_passthrough"] is True
     set_cached.assert_not_awaited()
@@ -336,6 +337,58 @@ def test_should_translate_routing():
 
     # Normal → translate
     assert _should_translate({"delivery_status": "pending", "original_text": "hello"}) == "translate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routed,expected_steps", [
+    ("translate", ["validate", "translate", "format", "deliver"]),
+    ("format", ["validate", "format", "deliver"]),
+    ("deliver", ["validate", "deliver"]),
+])
+async def test_pipeline_runs_the_steps_the_route_asks_for(routed, expected_steps):
+    """LangGraph used to run these; the plain pipeline keeps its {node: output} stream."""
+    from processor.src.pipeline import graph
+
+    calls = []
+
+    def step(name, *, is_async=True):
+        def record(state):
+            calls.append(name)
+            return {**state, f"seen_{name}": True}
+
+        async def record_async(state):
+            return record(state)
+        return record_async if is_async else record
+
+    steps = {
+        "validate": step("validate"),
+        "translate": step("translate"),
+        "format": step("format", is_async=False),  # format_node is synchronous
+        "deliver": step("deliver"),
+    }
+    with patch.object(graph.Pipeline, "steps", steps), \
+         patch.object(graph, "_should_translate", return_value=routed):
+        chunks = [chunk async for chunk in graph.pipeline.astream(_base_state())]
+
+    assert calls == expected_steps
+    assert [next(iter(c)) for c in chunks] == expected_steps
+    final = next(iter(chunks[-1].values()))
+    assert all(final.get(f"seen_{s}") for s in expected_steps)  # each step saw the previous ones
+
+
+@pytest.mark.asyncio
+async def test_pipeline_merges_partial_node_outputs():
+    from processor.src.pipeline import graph
+
+    async def partial(state):
+        return {"delivery_status": "delivered"}
+
+    steps = {name: partial for name in ("validate", "translate", "format", "deliver")}
+    with patch.object(graph.Pipeline, "steps", steps), \
+         patch.object(graph, "_should_translate", return_value="deliver"):
+        final = await graph.pipeline.ainvoke(_base_state())
+    assert final["delivery_status"] == "delivered"
+    assert final["original_text"] == _base_state()["original_text"]
 
 
 @pytest.mark.parametrize("text", ["👍", "❤️🙏🏻", "🎉🎉🎉", "15:00", "https://example.com/x"])
@@ -450,10 +503,7 @@ async def test_translate_node_degrades_when_llm_fails():
     """
     from processor.src.pipeline.nodes import translate_node
 
-    llm = MagicMock()
-    llm.ainvoke = AsyncMock(side_effect=RuntimeError("openai unavailable"))
-
-    with patch("processor.src.pipeline.nodes.get_llm", return_value=llm), \
+    with patch("processor.src.pipeline.nodes.llm_chat", new=AsyncMock(side_effect=RuntimeError("openai unavailable"))), \
          patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
          patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value=None)):

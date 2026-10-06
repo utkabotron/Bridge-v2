@@ -3,7 +3,7 @@
 Starts two concurrent tasks:
 1. FastAPI HTTP server (health + metrics + dashboard endpoints)
 2. Redis BRPOP consumer loop — pops messages from "messages:in" and
-   runs them through the LangGraph pipeline.
+   runs them through the pipeline (pipeline/graph.py).
 """
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 import uvicorn
@@ -33,7 +33,7 @@ from .config import (
     FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
     TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
     OPENAI_BILLING_URL,
-    COSTS_CACHE_TTL, LANGCHAIN_PROJECT, TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
+    TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
 )
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
@@ -661,86 +661,43 @@ async def api_profiles():
 # ── Costs API (LangSmith) ────────────────────────────────
 
 # Fallback costs per token (USD) when LangSmith doesn't provide cost
-_FALLBACK_COSTS = {
-    "gpt-4.1-mini": {"input": 0.40 / 1_000_000, "output": 1.60 / 1_000_000},
-    "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
-}
-_DEFAULT_FALLBACK = {"input": 0.40 / 1_000_000, "output": 1.60 / 1_000_000}
-
-# In-memory cache: {days: (timestamp, data)}
-_costs_cache: dict[int, tuple[float, dict]] = {}
-_COSTS_CACHE_TTL = COSTS_CACHE_TTL
-
-
-def _fetch_costs_sync(days: int) -> dict:
-    """Synchronous LangSmith query — runs in thread."""
-    from langsmith import Client
-
-    client = Client()
-    project = LANGCHAIN_PROJECT
-    start = datetime.now(timezone.utc) - timedelta(days=days)
-
-    by_day: dict[str, dict] = defaultdict(lambda: {"cost": 0.0, "tokens": 0, "runs": 0})
-    total_cost = 0.0
-    total_tokens = 0
-    total_runs = 0
-
-    for run in client.list_runs(
-        project_name=project,
-        run_type="llm",
-        is_root=False,
-        start_time=start,
-    ):
-        day_key = run.start_time.strftime("%Y-%m-%d") if run.start_time else "unknown"
-        tokens = (run.total_tokens or 0)
-        cost = run.total_cost
-        if cost is None or cost == 0:
-            model = (run.extra or {}).get("metadata", {}).get("ls_model_name", "")
-            fb = _FALLBACK_COSTS.get(model, _DEFAULT_FALLBACK)
-            cost = (run.prompt_tokens or 0) * fb["input"] + (run.completion_tokens or 0) * fb["output"]
-        cost = float(cost)
-
-        total_cost += cost
-        total_tokens += tokens
-        total_runs += 1
-        by_day[day_key]["cost"] += cost
-        by_day[day_key]["tokens"] += tokens
-        by_day[day_key]["runs"] += 1
-
-    by_day_list = sorted(
-        [{"date": k, "cost": round(v["cost"], 4), "tokens": v["tokens"], "runs": v["runs"]} for k, v in by_day.items()],
-        key=lambda x: x["date"],
-        reverse=True,
-    )
-
-    return {
-        "period_days": days,
-        "total_cost": round(total_cost, 4),
-        "total_tokens": total_tokens,
-        "total_runs": total_runs,
-        "by_day": by_day_list,
-    }
-
-
 @app.get("/api/costs")
 async def api_costs(days: int = Query(default=7, ge=1, le=90)):
-    """LangSmith LLM cost data, cached for 15 min."""
-    now = time.monotonic()
-    if days in _costs_cache:
-        ts, data = _costs_cache[days]
-        if now - ts < _COSTS_CACHE_TTL:
-            return data
+    """Processor LLM spend per day, from the llm_usage ledger (src/llm.py writes it).
 
-    try:
-        data = await asyncio.to_thread(_fetch_costs_sync, days)
-        _costs_cache[days] = (now, data)
-        return data
-    except Exception as exc:
-        logger.error("LangSmith costs fetch error: %s", exc)
-        # Return stale cache if available
-        if days in _costs_cache:
-            return _costs_cache[days][1]
-        return JSONResponse({"error": str(exc)}, status_code=502)
+    Same shape LangSmith used to give the dashboard, plus a split by purpose and model.
+    """
+    from .db import get_pool
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT (created_at AT TIME ZONE 'Asia/Jerusalem')::date AS day,
+               sum(cost_usd) AS cost, sum(tokens_in + tokens_out) AS tokens, count(*) AS runs
+        FROM llm_usage
+        WHERE created_at >= now() - make_interval(days => $1)
+        GROUP BY 1 ORDER BY 1 DESC
+    """, days)
+    split = await pool.fetch("""
+        SELECT purpose, model, sum(cost_usd) AS cost, count(*) AS runs
+        FROM llm_usage
+        WHERE created_at >= now() - make_interval(days => $1)
+        GROUP BY 1, 2 ORDER BY 3 DESC
+    """, days)
+    by_day = [
+        {"date": r["day"].isoformat(), "cost": round(float(r["cost"]), 4),
+         "tokens": int(r["tokens"] or 0), "runs": r["runs"]}
+        for r in rows
+    ]
+    return {
+        "period_days": days,
+        "total_cost": round(sum(d["cost"] for d in by_day), 4),
+        "total_tokens": sum(d["tokens"] for d in by_day),
+        "total_runs": sum(d["runs"] for d in by_day),
+        "by_day": by_day,
+        "by_purpose": [
+            {"purpose": r["purpose"], "model": r["model"], "cost": round(float(r["cost"]), 4), "runs": r["runs"]}
+            for r in split
+        ],
+    }
 
 
 # ── Translation API ───────────────────────────────────────
@@ -757,7 +714,7 @@ async def translate_text(body: TranslateRequest):
     from .feature_flags import is_enabled
     if not await is_enabled("translation_enabled"):
         return JSONResponse({"error": "Translation is temporarily disabled"}, status_code=503)
-    from .pipeline.nodes import get_llm
+    from .llm import chat as llm_chat
     from .pipeline.cache import get_cached, set_cached
     from .pipeline.prompts import PROMPT_VERSION, get_translate_prompt
 
@@ -784,19 +741,14 @@ async def translate_text(body: TranslateRequest):
             await insert_direct_translation(body.user_id, text, cached, lang, 0, True)
         return {"original": text, "translated": cached, "target_language": lang, "cache_hit": True}
 
-    # LLM translation
-    from langchain_core.messages import HumanMessage, SystemMessage
+    # LLM translation. DM is outside the bridge A/B: DIRECT_MODEL, cached under its own version.
     t0 = time.monotonic()
     messages = [
-        SystemMessage(content=get_translate_prompt(lang)),
-        HumanMessage(content=text),
+        {"role": "system", "content": get_translate_prompt(lang)},
+        {"role": "user", "content": text},
     ]
-    # DM translation is outside the bridge A/B: DIRECT_MODEL, cached under its own version.
-    response = await get_llm(DIRECT_MODEL).ainvoke(
-        messages, config={"tags": ["direct", f"model-{DIRECT_MODEL}"]},
-    )
+    translated = (await llm_chat(messages, model=DIRECT_MODEL, purpose="direct_translate")).text
     translation_ms = int((time.monotonic() - t0) * 1000)
-    translated = response.content.strip()
 
     await set_cached(text, lang, translated, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
 
@@ -1209,7 +1161,7 @@ async def _already_delivered(wa_message_id: str, chat_pair_id: int | None) -> bo
 
 
 async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_id: str) -> None:
-    """Run the LangGraph pipeline for one (message, chat pair) branch."""
+    """Run the pipeline for one (message, chat pair) branch."""
 
     try:
         final_state = None

@@ -4,10 +4,7 @@ redis==8.1.0  # pinned: 8.x changed blocking-command timeouts (see config.redis_
 asyncpg>=0.29.0
 sqlalchemy[asyncio]>=2.0.0
 psycopg2-binary>=2.9.9
-langchain>=0.2.0
-langchain-openai>=0.1.0
-langgraph>=0.1.0
-langsmith>=0.1.0
+openai>=1.68.0  # direct SDK (src/llm.py); LangChain/LangGraph/LangSmith removed 2026-10-06
 pydantic>=2.7.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0

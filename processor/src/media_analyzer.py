@@ -1,41 +1,28 @@
-"""Media analysis: image (GPT vision), audio (Whisper), document (pypdf).
+"""Media analysis: image (vision), audio (speech-to-text + translation), document (pypdf).
 
-All functions return the analysis text or raise on failure.
+All functions return the analysis text or raise on failure. Model calls go through
+src/llm.py, which shapes the request for the model family and records the cost.
 """
 from __future__ import annotations
 
 import base64
 import io
 import logging
-import os
 from typing import Optional
 
-import httpx
-
-from .config import DIRECT_MODEL
+from . import llm
+from .config import (
+    AUDIO_ANALYSIS_TIMEOUT,
+    DIRECT_MODEL,
+    DOCUMENT_ANALYSIS_TIMEOUT,
+    IMAGE_ANALYSIS_TIMEOUT,
+    TRANSCRIBE_MODEL,
+)
 
 logger = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE = "https://api.openai.com/v1"
 
-
-def _headers() -> dict:
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-
-
-def _completion_limit(max_tokens: int) -> dict:
-    """Output cap in the form the model family accepts.
-
-    Reasoning models (gpt-5/6, o-series) reject `max_tokens` and `temperature`; they take
-    `max_completion_tokens`, and a caption or a document needs no thinking.
-    """
-    if DIRECT_MODEL.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
-        return {"max_completion_tokens": max_tokens, "reasoning_effort": "none"}
-    return {"max_tokens": max_tokens}
-
-
-# ── Image analysis (GPT-4.1-mini vision) ────────────────
+# ── Image analysis (vision) ──────────────────────────────
 
 async def analyze_image(image_bytes: bytes, mime: str, target_lang: str) -> str:
     """Translate text in image or describe if no text."""
@@ -65,9 +52,8 @@ async def analyze_image(image_bytes: bytes, mime: str, target_lang: str) -> str:
         f"and the translation on the next line. Never mix name and translation on the same line."
     )
 
-    payload = {
-        "model": DIRECT_MODEL,
-        "messages": [
+    result = await llm.chat(
+        [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
@@ -77,44 +63,23 @@ async def analyze_image(image_bytes: bytes, mime: str, target_lang: str) -> str:
                 ],
             },
         ],
-        **_completion_limit(2000),
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{OPENAI_BASE}/chat/completions", json=payload, headers=_headers())
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        model=DIRECT_MODEL, purpose="image", max_tokens=2000, timeout=IMAGE_ANALYSIS_TIMEOUT,
+    )
+    return result.text
 
 
 # ── Audio transcription (speech-to-text + translation) ───
 
-# whisper-1 is deprecated (shutdown 2027-02-26). gpt-transcribe is OpenAI's replacement,
-# 25% cheaper, and on short clips it does not misdetect the language the way whisper did
-# (a 4-second Russian note came back as Polish gibberish). Env override for a quick rollback.
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-transcribe")
-
-
 async def transcribe_audio(audio_bytes: bytes, filename: str, target_lang: str) -> str:
     """Transcribe audio, then translate if needed."""
-    # Step 1: transcription
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(
-            f"{OPENAI_BASE}/audio/transcriptions",
-            headers=_headers(),
-            data={"model": TRANSCRIBE_MODEL},
-            files={"file": (filename, audio_bytes)},
-        )
-        r.raise_for_status()
-        transcript = r.json().get("text", "").strip()
-
+    transcript = await llm.transcribe(
+        audio_bytes, filename, model=TRANSCRIBE_MODEL, timeout=AUDIO_ANALYSIS_TIMEOUT,
+    )
     if not transcript:
         return "(empty audio)"
 
-    # Step 2: Translate transcript via LLM
-    payload = {
-        "model": DIRECT_MODEL,
-        "messages": [
+    result = await llm.chat(
+        [
             {
                 "role": "system",
                 "content": (
@@ -124,14 +89,10 @@ async def transcribe_audio(audio_bytes: bytes, filename: str, target_lang: str) 
             },
             {"role": "user", "content": transcript},
         ],
-        **_completion_limit(1000),
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{OPENAI_BASE}/chat/completions", json=payload, headers=_headers())
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        model=DIRECT_MODEL, purpose="voice_translate", max_tokens=1000,
+        timeout=AUDIO_ANALYSIS_TIMEOUT,
+    )
+    return result.text
 
 
 # ── Document analysis (PDF/text) ─────────────────────────
@@ -149,9 +110,8 @@ async def analyze_document(
     if len(text) > max_chars:
         text = text[:max_chars] + "\n...(truncated)"
 
-    payload = {
-        "model": DIRECT_MODEL,
-        "messages": [
+    result = await llm.chat(
+        [
             {
                 "role": "system",
                 "content": (
@@ -163,14 +123,9 @@ async def analyze_document(
             },
             {"role": "user", "content": text},
         ],
-        **_completion_limit(3000),
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{OPENAI_BASE}/chat/completions", json=payload, headers=_headers())
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        model=DIRECT_MODEL, purpose="document", max_tokens=3000, timeout=DOCUMENT_ANALYSIS_TIMEOUT,
+    )
+    return result.text
 
 
 def _extract_document_text(doc_bytes: bytes, filename: str, mime: str) -> Optional[str]:

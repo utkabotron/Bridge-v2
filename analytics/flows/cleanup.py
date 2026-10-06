@@ -1,6 +1,6 @@
 """Prefect flow: daily cleanup of old data.
 
-- Delete message_events older than 90 days
+- Delete message_events and llm_usage rows older than 90 days
 - Remove orphaned onboarding_sessions (done > 7 days ago)
 
 Deploy:
@@ -22,6 +22,11 @@ _CLEANUP_TASKS = [
     (
         "message_events",
         "delete from public.message_events where created_at < now() - interval '%s days'",
+        (RETAIN_DAYS,),
+    ),
+    (
+        "llm_usage",
+        "delete from public.llm_usage where created_at < now() - interval '%s days'",
         (RETAIN_DAYS,),
     ),
     (

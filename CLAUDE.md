@@ -33,7 +33,7 @@ Bridge v2 — WhatsApp→Telegram мост с AI-переводом. Монор�
 | Сервис | Стек | Порт | Примечание |
 |--------|------|------|------------|
 | wa-service | Node 20, whatsapp-web.js, Express, ioredis, pg | 3000 | expose-only, не published |
-| processor | Python 3.12, FastAPI, LangGraph, asyncpg | 8000 | published |
+| processor | Python 3.12, FastAPI, openai SDK, asyncpg | 8000 | published |
 | bot | Python 3.12, python-telegram-bot, asyncpg | 8001 | polling, нет health endpoint |
 | analytics | Python 3.12, Prefect, OpenAI | 4200 | — |
 
@@ -63,7 +63,7 @@ WhatsApp msg → wa-service handleIncomingMessage()
   └─ LPUSH "messages:in"
        ↓
 processor consume_loop (BRPOP)
-  └─ LangGraph: validate → translate → format → deliver
+  └─ pipeline: validate → translate → format → deliver
        ├─ deliver OK → message_events (delivered)
        ├─ no pair → message_events (skipped)
        ├─ no text → skip translate → format → deliver
@@ -88,7 +88,8 @@ processor и bot НЕ общаются — оба независимо → Postg
 
 ### Pipeline
 - `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
-- `processor/src/pipeline/graph.py` — LangGraph StateGraph
+- `processor/src/pipeline/graph.py` — `Pipeline`: validate → translate → format → deliver (обычный Python, стрим `{node: output}` для SSE)
+- `processor/src/llm.py` — ЕДИНСТВЕННЫЙ способ звать OpenAI из processor: форма запроса под семейство модели, таймауты, запись стоимости в `llm_usage`
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
 - `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
@@ -181,7 +182,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 | POST | /api/dlq/retry | — | Retry all DLQ → messages:in |
 | GET | /api/flags | — | Feature flags list |
 | PATCH | /api/flags/{name} | — | Toggle flag `{"enabled": bool}` |
-| GET | /api/costs?days= | — | LangSmith costs (15m cache) |
+| GET | /api/costs?days= | — | LLM costs по дням и по назначению из `llm_usage` |
 | GET | /api/profiles | — | Chat profiles with glossaries |
 | POST | /translate | translation_enabled | Text translation |
 | POST | /analyze | media_analysis_enabled | Media analysis by event_id |
@@ -247,6 +248,8 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 011 | feature_flags |
 | 018 | translation_evaluations += evaluator, shadow, quality_expected, confidence (Jev) |
 | 019 | message_events += prompt_version, cache_hit, translation_passthrough/failed/error; translation_evaluations += source (bridge/direct/fallback), chat_pair_id, target_language, message_type, prompt_version |
+| 020 | feature_flags += prompt_ab_enabled |
+| 021 | llm_usage — журнал каждого вызова модели из processor (purpose, model, tag, tokens, cost_usd, ms), 90 дней |
 
 ## ANALYTICS FLOWS
 
@@ -393,4 +396,4 @@ QR → выбор WA-чата → выбор TG-группы → `POST /chat-pai
 - Nginx: reverse proxy, basic auth for /dashboard /api/* /events, SSE proxy_buffering off
 - SSL: certbot, auto-renewal cron 0 3 * * *
 - Logs: json-file, max-size 10m, max-file 3
-- LangSmith: LANGCHAIN_TRACING_V2=true, project bridge-v2-prod
+- LLM-расходы: таблица `llm_usage` (processor) + `estimated_cost` в таблицах ночных flow (analytics). LangChain/LangGraph/LangSmith удалены 2026-10-06 — НЕ возвращать: тексты чатов уходили третьей стороне

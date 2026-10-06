@@ -1,15 +1,21 @@
 """
-LangGraph StateGraph for the message processing pipeline.
+The message processing pipeline.
 
 Flow:
   validate ──(has tg_chat?)──► translate ──► format ──► deliver
+             │                └─(nothing to translate)─► format
              └─(no pair)──────────────────────────────► deliver
+
+Four steps and one branch. LangGraph ran this until 2026-10-06; a straight line did not
+need a graph engine, and dropping it took nine packages and a quarter of the processor's
+memory with it. Pipeline.astream keeps LangGraph's contract — one {node: output} dict per
+step — so the consumer loop, the SSE events and the dashboard did not change.
 """
 from __future__ import annotations
 
+import inspect
 import re
-
-from langgraph.graph import END, StateGraph
+from collections.abc import AsyncIterator
 
 from ..models.message import MessageState
 from .nodes import deliver_node, format_node, translate_node, validate_node
@@ -84,27 +90,43 @@ def _should_translate(state: MessageState) -> str:
     return "translate"
 
 
-def build_graph() -> StateGraph:
-    graph = StateGraph(MessageState)
+class Pipeline:
+    """validate → translate → format → deliver, streamed one step at a time."""
 
-    graph.add_node("validate", validate_node)
-    graph.add_node("translate", translate_node)
-    graph.add_node("format", format_node)
-    graph.add_node("deliver", deliver_node)
+    steps = {
+        "validate": validate_node,
+        "translate": translate_node,
+        "format": format_node,
+        "deliver": deliver_node,
+    }
 
-    graph.set_entry_point("validate")
+    async def _run(self, name: str, state: MessageState) -> MessageState:
+        out = self.steps[name](state)
+        if inspect.isawaitable(out):
+            out = await out
+        # Merge, as LangGraph did: a node may return only the keys it changed.
+        return {**state, **(out or {})}
 
-    graph.add_conditional_edges(
-        "validate",
-        _should_translate,
-        {"translate": "translate", "format": "format", "deliver": "deliver"},
-    )
-    graph.add_edge("translate", "format")
-    graph.add_edge("format", "deliver")
-    graph.add_edge("deliver", END)
+    async def astream(self, state: MessageState, stream_mode: str = "updates") -> AsyncIterator[dict]:
+        state = await self._run("validate", state)
+        yield {"validate": state}
 
-    return graph.compile()
+        route = _should_translate(state)
+        if route == "translate":
+            state = await self._run("translate", state)
+            yield {"translate": state}
+        if route in ("translate", "format"):
+            state = await self._run("format", state)
+            yield {"format": state}
+
+        state = await self._run("deliver", state)
+        yield {"deliver": state}
+
+    async def ainvoke(self, state: MessageState) -> MessageState:
+        async for chunk in self.astream(state):
+            state = next(iter(chunk.values()))
+        return state
 
 
-# Singleton — compiled once at import
-pipeline = build_graph()
+# Singleton
+pipeline = Pipeline()

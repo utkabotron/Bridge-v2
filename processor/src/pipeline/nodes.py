@@ -1,7 +1,7 @@
-"""LangGraph node functions for the message pipeline.
+"""Node functions for the message pipeline (run in order by graph.Pipeline).
 
-Each node receives MessageState, mutates a copy, and returns it.
-LangSmith traces every node automatically via LANGCHAIN_TRACING_V2=true.
+Each node receives MessageState, mutates a copy, and returns it. Model calls go through
+src/llm.py, which records model, tokens and cost of each one in llm_usage.
 """
 from __future__ import annotations
 
@@ -11,57 +11,27 @@ import logging
 import os
 import re
 import time
-from typing import Any
 
 
 from langdetect import detect, LangDetectException
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from ..config import (
-    AB_ALWAYS_B_USERS,
-    LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE,
+    AB_ALWAYS_B_USERS, OPENAI_MODEL,
+    TRANSLATION_UNAVAILABLE_NOTE,
     VOICE_AUTO_TRANSCRIBE, VOICE_TRANSCRIPT_TITLE,
     MEDIA_FAILED_NOTE, EDITED_MARK, OWN_MESSAGE_PREFIX,
     ADMIN_NO_PAIR_FALLBACK,
 )
+from ..llm import chat as llm_chat
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
 from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
-from .prompts import PROMPT_VERSION, VARIANTS, choose_variant, get_translate_prompt, format_chat_context
+from .prompts import VARIANTS, choose_variant, get_translate_prompt, format_chat_context
 
 logger = logging.getLogger(__name__)
 
-# Shared LLM instance — model pinned for reproducibility
-_llm: Any = None
-
 # Media types eligible for the Analyze button (no video in v1)
 _ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "ptt", "document"}
-
-
-_llms: dict[str, ChatOpenAI] = {}
-
-
-def get_llm(model: str | None = None) -> ChatOpenAI:
-    """One client per model. The A/B variant may run a different model than OPENAI_MODEL."""
-    model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    if model not in _llms:
-        kwargs: dict = {
-            "model": model,
-            "tags": ["bridge-v2", f"prompt-{PROMPT_VERSION}", f"model-{model}"],
-            # Unbounded, the SDK waits 600s and langchain retries twice, so one sick
-            # request could hold the single-threaded consumer for half an hour while
-            # every user's messages queued behind it.
-            "timeout": LLM_TIMEOUT,
-            "max_retries": LLM_MAX_RETRIES,
-        }
-        if model.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
-            # Reasoning models reject `temperature`; a chat message needs no thinking.
-            kwargs["reasoning_effort"] = "none"
-        else:
-            kwargs["temperature"] = 0
-        _llms[model] = ChatOpenAI(**kwargs)
-    return _llms[model]
 
 
 # ── DB helpers (lazy import to avoid circular deps) ──────
@@ -215,13 +185,12 @@ async def translate_node(state: MessageState) -> MessageState:
     # LLM call — traced by LangSmith automatically
     t0 = time.monotonic()
     messages = [
-        SystemMessage(content=get_translate_prompt(lang, chat_context, variant)),
-        HumanMessage(content=text),
+        {"role": "system", "content": get_translate_prompt(lang, chat_context, variant)},
+        {"role": "user", "content": text},
     ]
-    llm_config = {"tags": [f"prompt-{version}", f"variant-{variant}"]}
-    llm = get_llm(VARIANTS[variant]["model"])  # after the cache: a hit never needs a client
+    model = VARIANTS[variant]["model"] or OPENAI_MODEL
     try:
-        response = await llm.ainvoke(messages, config=llm_config)
+        translated = (await llm_chat(messages, model=model, purpose="translate", tag=version)).text
     except Exception as exc:
         # An OpenAI outage used to raise here, escape the graph and send the message to a
         # dead-letter queue nobody drained — so the whole bridge went quiet and stayed
@@ -239,8 +208,6 @@ async def translate_node(state: MessageState) -> MessageState:
             "prompt_version": version,
         }
 
-    translated = response.content.strip()
-
     # If the model echoed the source instead of translating, give it one corrective turn.
     # Most passthroughs are a lazy reply the model fixes when told the previous output was
     # untranslated; if it still refuses we deliver what we have but never cache it.
@@ -248,15 +215,15 @@ async def translate_node(state: MessageState) -> MessageState:
     if _looks_untranslated(text, translated, lang):
         logger.warning("Translation passthrough (lang=%s, src_len=%d) — retrying once", lang, len(text))
         retry_messages = messages + [
-            AIMessage(content=translated),
-            HumanMessage(content=(
+            {"role": "assistant", "content": translated},
+            {"role": "user", "content": (
                 f"Your reply was NOT translated into {lang} — it repeated the source text. "
                 f"Translate EVERY word into {lang} now, leaving nothing in the original "
                 f"language. Output only the {lang} translation."
-            )),
+            )},
         ]
         try:
-            retried = (await llm.ainvoke(retry_messages, config=llm_config)).content.strip()
+            retried = (await llm_chat(retry_messages, model=model, purpose="translate_retry", tag=version)).text
         except Exception as exc:
             logger.error("Passthrough retry failed (%s) — keeping first result", exc)
             retried = ""

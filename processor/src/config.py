@@ -45,9 +45,14 @@ TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 
 # ── Alerting ─────────────────────────────────────────────
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+# Bridge translation model — variant A of the prompt/model A/B (prompts.VARIANTS).
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 # Model for everything outside the bridge A/B: bot DM translation and media analysis.
 # OPENAI_MODEL stays variant A of the A/B, so promoting a model here does not touch it.
-DIRECT_MODEL = os.getenv("DIRECT_MODEL") or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+DIRECT_MODEL = os.getenv("DIRECT_MODEL") or OPENAI_MODEL
+# whisper-1 is deprecated (shutdown 2027-02-26). gpt-transcribe is OpenAI's replacement,
+# 25% cheaper, and on short clips it does not misdetect the language the way whisper did.
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-transcribe")
 # Users whose chats always get A/B variant B while the flag is on — the admin dogfoods the
 # candidate in every chat instead of half of them. Defaults to the admins.
 AB_ALWAYS_B_USERS = [int(x) for x in os.getenv("AB_ALWAYS_B_USERS", "").split(",") if x.strip()] or ADMIN_TG_IDS
@@ -107,7 +112,6 @@ REVOKE_NOTE = os.getenv("REVOKE_NOTE", "🗑 Сообщение удалено �
 TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
 MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
-COSTS_CACHE_TTL = int(os.getenv("COSTS_CACHE_TTL", 900))
 
 # ── Media analysis ───────────────────────────────────────
 IMAGE_ANALYSIS_TIMEOUT = int(os.getenv("IMAGE_ANALYSIS_TIMEOUT", 60))
@@ -120,5 +124,23 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 # so links built on this endpoint must be presigned — see src/s3.py.
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000")
 
-# ── LangSmith ───────────────────────────────────────────
-LANGCHAIN_PROJECT = os.getenv("LANGCHAIN_PROJECT", "bridge-v2")
+# ── LLM pricing (src/llm.py writes every call's cost to llm_usage) ──
+# $/1M tokens (input, output) — developers.openai.com/api/docs/pricing, 2026-10-06
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "gpt-6-astra": (10.00, 50.00),
+    "gpt-6.1-sol": (2.00, 10.00),
+    "gpt-6-luna": (0.10, 0.50),
+    "gpt-5.6-luna": (0.20, 1.20),
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5-mini": (0.25, 2.00),
+    "gpt-4.1": (2.00, 8.00),
+    "gpt-4.1-mini": (0.40, 1.60),
+    "gpt-4o-mini": (0.15, 0.60),
+}
+# $/minute of audio
+TRANSCRIBE_PRICES: dict[str, float] = {
+    "gpt-transcribe": 0.0045,
+    "gpt-4o-transcribe": 0.006,
+    "gpt-4o-mini-transcribe": 0.003,
+    "whisper-1": 0.006,
+}
