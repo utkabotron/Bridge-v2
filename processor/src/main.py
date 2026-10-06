@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -27,18 +26,19 @@ from .config import (
     BRPOP_TIMEOUT, redis_kwargs,
     DLQ_RETRY_INTERVAL, DLQ_RETRY_BATCH, DLQ_MAX_ATTEMPTS, PROCESSING_QUEUE,
     DLQ_ALERT_THRESHOLD, DLQ_ALERT_COOLDOWN,
-    ADMIN_TG_IDS as _CFG_ADMIN_TG_IDS,
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
-    FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
-    FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
+    FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD, FAILURE_RATE_MIN_MSGS,
     TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
     OPENAI_BILLING_URL,
     TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
+    STATS_WINDOW_DAYS, STATS_CACHE_TTL,
 )
+from .alerts import SlidingWindow, notify_admins
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
-from .db import get_pool, fetch_active_chat_pairs, insert_direct_translation, insert_direct_media_analysis
+from .pipeline.cache import lookup_chat_pairs
+from .db import get_pool, fetch_delivered_pair_ids, insert_direct_translation, insert_direct_media_analysis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,14 +54,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 async def _validate_bot_token() -> None:
     """Check that the Telegram bot token is valid on startup."""
-    from .telegram_sender import BOT_TOKEN
+    from .telegram_sender import BASE_URL, BOT_TOKEN, get_client
     if not BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN is not set")
         return
-    import httpx as _httpx
     try:
-        async with _httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+        r = await get_client().get(f"{BASE_URL}/getMe")
         if r.status_code == 200:
             data = r.json()
             logger.info("Bot token valid: @%s (id=%s)", data["result"].get("username"), data["result"].get("id"))
@@ -105,28 +103,6 @@ app = FastAPI(title="Bridge v2 — Processor", version="2.0.0", lifespan=lifespa
 
 # ── Health ────────────────────────────────────────────────
 
-# Substring matching on "TOKEN"/"SECRET" let DATABASE_URL (with its password),
-# LANGCHAIN_API_KEY and ADMIN_TG_IDS through. Redact by shape instead: anything that
-# looks like a credential or a URL with userinfo never leaves this endpoint.
-_CONFIG_SECRET_MARKERS = ("TOKEN", "SECRET", "KEY", "PASSWORD", "DATABASE_URL", "DSN", "ADMIN_TG_IDS")
-
-
-@app.get("/api/config")
-async def api_config():
-    """Current configuration (debug endpoint) with credentials redacted."""
-    from . import config as _cfg
-
-    out = {}
-    for k, v in vars(_cfg).items():
-        if not k.isupper() or k.startswith("_") or callable(v):
-            continue
-        if any(marker in k for marker in _CONFIG_SECRET_MARKERS):
-            out[k] = "***redacted***" if v else None
-        else:
-            out[k] = v
-    return out
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "processor"}
@@ -151,157 +127,85 @@ _counter = {"processed": 0, "failed": 0, "skipped": 0, "dlq": 0}
 # being cancelled mid-pipeline.
 _shutting_down = asyncio.Event()
 
-# ── 401 alert ────────────────────────────────────────────
-_unauth_times: deque = deque()  # timestamps of recent 401 errors
-_UNAUTH_WINDOW = UNAUTH_WINDOW
-_UNAUTH_THRESHOLD = UNAUTH_THRESHOLD
-_unauth_alert_sent = False  # send once per window
-
-ADMIN_TG_IDS = _CFG_ADMIN_TG_IDS
-
-
-async def _alert_admins_unauthorized() -> None:
-    """Send a Telegram alert to admins when repeated 401 errors are detected."""
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-    text = (
-        "🚨 <b>401 Unauthorized spike detected</b>\n\n"
-        f"≥{_UNAUTH_THRESHOLD} Telegram API 401 errors in the last 15 min.\n"
-        "Possible causes: bot removed from chats, or token invalid.\n"
-        "Check logs: <code>docker compose logs processor | grep 401</code>"
-    )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send 401 alert to admin %s: %s", admin_id, exc)
-
-
-def _track_unauth_error() -> None:
-    """Record a 401 error and trigger alert if threshold exceeded."""
-    global _unauth_alert_sent
-    now = time.monotonic()
-    _unauth_times.append(now)
-    # evict old entries outside window
-    while _unauth_times and _unauth_times[0] < now - _UNAUTH_WINDOW:
-        _unauth_times.popleft()
-    if len(_unauth_times) >= _UNAUTH_THRESHOLD and not _unauth_alert_sent:
-        _unauth_alert_sent = True
-        logger.critical("401 threshold reached (%d errors in 15 min) — alerting admins", len(_unauth_times))
-        asyncio.create_task(_alert_admins_unauthorized())
-    # reset flag after window expires (allow re-alerting next window)
-    if _unauth_alert_sent and len(_unauth_times) == 0:
-        _unauth_alert_sent = False
-
-# ── Failure rate alert ────────────────────────────────────
-_delivery_times: deque = deque()  # (monotonic_ts, is_failed) for mapped msgs
-_FAILURE_RATE_WINDOW = FAILURE_RATE_WINDOW
-_FAILURE_RATE_THRESHOLD = _CFG_FAILURE_RATE_THRESHOLD
-_FAILURE_RATE_MIN_MSGS = _CFG_FAILURE_RATE_MIN_MSGS
-_failure_rate_alert_sent = False
-
-
-async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
-    """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-    text = (
-        "\U0001F6A8 <b>High failure rate detected</b>\n\n"
-        f"Mapped failure rate: <b>{rate:.1%}</b> ({failed}/{total} messages)\n"
-        f"Threshold: {_FAILURE_RATE_THRESHOLD:.0%} over {_FAILURE_RATE_WINDOW // 60} min window.\n"
-        "Check logs: <code>docker compose logs processor --tail 100</code>"
-    )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send failure rate alert to admin %s: %s", admin_id, exc)
-
+# ── Admin alerts ─────────────────────────────────────────
+# Each tracker counts events in a sliding window and alerts once per incident (see
+# alerts.SlidingWindow); the _alert_admins_* functions only compose the text, and
+# notify_admins does the sending.
+_unauth_window = SlidingWindow(UNAUTH_WINDOW)
+_delivery_window = SlidingWindow(FAILURE_RATE_WINDOW)  # hit = a failed delivery
+# An untranslated message still counts as delivered, so the failure-rate alert never saw
+# it: on 30.09 the OpenAI balance ran out and every message went untranslated for 12h
+# without a word to the admins.
+_translation_window = SlidingWindow(TRANSLATION_FAIL_WINDOW, cooldown=TRANSLATION_ALERT_COOLDOWN)
 
 # Suppress repeat DLQ alerts: the loop runs every few minutes and a backlog clears slowly.
 _last_dlq_alert = 0.0
 
 
-async def _alert_admins_dlq(depth: int) -> None:
-    """Warn admins that dead-lettered messages are piling up."""
-    global _last_dlq_alert
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    if time.time() - _last_dlq_alert < DLQ_ALERT_COOLDOWN:
-        return
-
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-
-    _last_dlq_alert = time.time()
-    text = (
-        "\U0001F4EC <b>Dead-letter queue is filling up</b>\n\n"
-        f"Messages waiting: <b>{depth}</b>\n"
-        "They are retried automatically; this means the retries keep failing.\n"
-        "Check: <code>docker compose logs processor --tail 100</code>"
+async def _alert_admins_unauthorized() -> None:
+    """Send a Telegram alert to admins when repeated 401 errors are detected."""
+    await notify_admins(
+        "🚨 <b>401 Unauthorized spike detected</b>\n\n"
+        f"≥{UNAUTH_THRESHOLD} Telegram API 401 errors in the last 15 min.\n"
+        "Possible causes: bot removed from chats, or token invalid.\n"
+        "Check logs: <code>docker compose logs processor | grep 401</code>"
     )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send DLQ alert to admin %s: %s", admin_id, exc)
+
+
+def _track_unauth_error() -> None:
+    """Record a 401 error and trigger alert if threshold exceeded."""
+    _unauth_window.record()
+    if _unauth_window.total == 1:
+        _unauth_window.rearm()  # alone in the window: a new burst, free to alert again
+    if _unauth_window.total >= UNAUTH_THRESHOLD and _unauth_window.fire():
+        logger.critical("401 threshold reached (%d errors in 15 min) — alerting admins", _unauth_window.total)
+        asyncio.create_task(_alert_admins_unauthorized())
+
+
+async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
+    """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
+    await notify_admins(
+        "\U0001F6A8 <b>High failure rate detected</b>\n\n"
+        f"Mapped failure rate: <b>{rate:.1%}</b> ({failed}/{total} messages)\n"
+        f"Threshold: {FAILURE_RATE_THRESHOLD:.0%} over {FAILURE_RATE_WINDOW // 60} min window.\n"
+        "Check logs: <code>docker compose logs processor --tail 100</code>"
+    )
 
 
 def _track_delivery(failed: bool) -> None:
     """Record a mapped delivery result and alert if failure rate exceeds threshold."""
-    global _failure_rate_alert_sent
-    now = time.monotonic()
-    _delivery_times.append((now, failed))
-    # evict old entries outside window
-    while _delivery_times and _delivery_times[0][0] < now - _FAILURE_RATE_WINDOW:
-        _delivery_times.popleft()
-    total = len(_delivery_times)
-    if total < _FAILURE_RATE_MIN_MSGS:
+    _delivery_window.record(hit=failed)
+    total = _delivery_window.total
+    if total < FAILURE_RATE_MIN_MSGS:
         return
-    failed_count = sum(1 for _, f in _delivery_times if f)
+    failed_count = _delivery_window.hits
     rate = failed_count / total
-    if rate >= _FAILURE_RATE_THRESHOLD and not _failure_rate_alert_sent:
-        _failure_rate_alert_sent = True
+    if rate >= FAILURE_RATE_THRESHOLD and _delivery_window.fire():
         logger.critical(
             "Failure rate %.1f%% (%d/%d) exceeds threshold — alerting admins",
             rate * 100, failed_count, total,
         )
         asyncio.create_task(_alert_admins_failure_rate(rate, failed_count, total))
-    # reset flag when window clears (allow re-alerting next window)
-    if _failure_rate_alert_sent and failed_count == 0:
-        _failure_rate_alert_sent = False
+    # Failure-free window of enough messages: the incident is over, the next may alert.
+    if failed_count == 0:
+        _delivery_window.rearm()
 
-# ── Translation failure alert ─────────────────────────────
-# An untranslated message still counts as delivered, so the failure-rate alert never saw
-# it: on 30.09 the OpenAI balance ran out and every message went untranslated for 12h
-# without a word to the admins.
-_translation_fail_times: deque = deque()
-_last_translation_alert: float | None = None
+
+async def _alert_admins_dlq(depth: int) -> None:
+    """Warn admins that dead-lettered messages are piling up."""
+    global _last_dlq_alert
+    if time.time() - _last_dlq_alert < DLQ_ALERT_COOLDOWN:
+        return
+    sent = await notify_admins(
+        "\U0001F4EC <b>Dead-letter queue is filling up</b>\n\n"
+        f"Messages waiting: <b>{depth}</b>\n"
+        "They are retried automatically; this means the retries keep failing.\n"
+        "Check: <code>docker compose logs processor --tail 100</code>"
+    )
+    # Stamped on delivery: with alerts off, or Telegram unreachable, the next pass retries
+    # instead of staying silent for the whole cooldown.
+    if sent:
+        _last_dlq_alert = time.time()
 
 
 def _is_quota_error(error: str) -> bool:
@@ -312,13 +216,6 @@ def _is_quota_error(error: str) -> bool:
 async def _alert_admins_translation(failed: int, error: str) -> None:
     """Tell admins messages are going out untranslated, and why."""
     from html import escape
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
     if _is_quota_error(error):
         text = (
             "\U0001F4B3 <b>OpenAI credits ran out</b>\n\n"
@@ -333,35 +230,21 @@ async def _alert_admins_translation(failed: int, error: str) -> None:
             "were delivered untranslated.\n"
             f"<code>{escape(error[:300])}</code>"
         )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
-                )
-            except Exception as exc:
-                logger.error("Failed to send translation alert to admin %s: %s", admin_id, exc)
+    await notify_admins(text)
 
 
 def _track_translation_failure(error: str) -> None:
     """Record an untranslated delivery and alert admins once per cooldown."""
-    global _last_translation_alert
-    now = time.monotonic()
-    _translation_fail_times.append(now)
-    while _translation_fail_times and _translation_fail_times[0] < now - TRANSLATION_FAIL_WINDOW:
-        _translation_fail_times.popleft()
-    if not _is_quota_error(error) and len(_translation_fail_times) < TRANSLATION_FAIL_THRESHOLD:
+    _translation_window.record()
+    if not _is_quota_error(error) and _translation_window.total < TRANSLATION_FAIL_THRESHOLD:
         return
-    if _last_translation_alert is not None and now - _last_translation_alert < TRANSLATION_ALERT_COOLDOWN:
+    if not _translation_window.fire():
         return
-    _last_translation_alert = now
     logger.critical(
         "Translation failing (%d in window): %s — alerting admins",
-        len(_translation_fail_times), error[:200],
+        _translation_window.total, error[:200],
     )
-    asyncio.create_task(_alert_admins_translation(len(_translation_fail_times), error))
+    asyncio.create_task(_alert_admins_translation(_translation_window.total, error))
 
 # ── SSE stream ───────────────────────────────────────────
 
@@ -393,49 +276,82 @@ async def dashboard():
     return _dashboard_html
 
 
+# (monotonic time computed, result) — see STATS_CACHE_TTL.
+_stats_cache: tuple[float, dict] | None = None
+
+
 @app.get("/api/stats")
 async def api_stats():
-    """User stats from DB for the dashboard."""
+    """User stats from DB for the dashboard, over the last STATS_WINDOW_DAYS days."""
+    global _stats_cache
+    now = time.monotonic()
+    if _stats_cache is not None and now - _stats_cache[0] < STATS_CACHE_TTL:
+        return _stats_cache[1]
+
     from .db import get_pool
     pool = await get_pool()
+    # Each source is aggregated once and joined to users, instead of seven correlated
+    # subqueries per user that rescanned message_events every time.
     rows = await pool.fetch("""
+        with ev as (
+            select cp.user_id,
+                   count(*) filter (where me.delivery_status = 'delivered') as delivered,
+                   count(*) filter (where me.delivery_status = 'failed') as failed,
+                   round(avg(me.translation_ms)) as avg_ms,
+                   max(me.created_at) as last_msg
+            from message_events me
+            join chat_pairs cp on cp.id = me.chat_pair_id
+            where me.created_at >= now() - make_interval(days => $1)
+            group by cp.user_id
+        ),
+        di as (
+            select user_id,
+                   count(*) filter (where interaction_type = 'translation') as dir_tl,
+                   count(*) filter (where interaction_type = 'media_analysis') as dir_ma
+            from direct_interactions
+            where created_at >= now() - make_interval(days => $1)
+            group by user_id
+        ),
+        pr as (
+            select user_id, count(*) as pairs
+            from chat_pairs where status = 'active'
+            group by user_id
+        )
         select
             u.tg_username,
             u.tg_user_id,
             u.wa_connected,
             u.target_language,
-            (select count(*) from chat_pairs cp where cp.user_id = u.id and cp.status = 'active') as pairs,
-            (select count(*) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.delivery_status = 'delivered') as delivered,
-            (select count(*) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.delivery_status = 'failed') as failed,
-            (select round(avg(me.translation_ms)) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.translation_ms is not null) as avg_ms,
-            (select max(me.created_at) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id) as last_msg,
-            (select count(*) from direct_interactions di
-             where di.user_id = u.id and di.interaction_type = 'translation') as dir_tl,
-            (select count(*) from direct_interactions di
-             where di.user_id = u.id and di.interaction_type = 'media_analysis') as dir_ma
+            coalesce(pr.pairs, 0) as pairs,
+            coalesce(ev.delivered, 0) as delivered,
+            coalesce(ev.failed, 0) as failed,
+            ev.avg_ms,
+            ev.last_msg,
+            coalesce(di.dir_tl, 0) as dir_tl,
+            coalesce(di.dir_ma, 0) as dir_ma
         from users u
+        left join ev on ev.user_id = u.id
+        left join di on di.user_id = u.id
+        left join pr on pr.user_id = u.id
         where u.is_active = true
         order by delivered desc
-    """)
+    """, STATS_WINDOW_DAYS)
+    # Not derived from the per-user rows: skipped events often have no pair (that is why
+    # they were skipped), so they never reach the join above.
     totals = await pool.fetchrow("""
         select
             count(*) filter (where delivery_status = 'skipped') as total_skipped,
-            round(avg(translation_ms) filter (where translation_ms is not null)) as total_avg_ms
+            round(avg(translation_ms)) as total_avg_ms
         from message_events
-    """)
-    return {
+        where created_at >= now() - make_interval(days => $1)
+    """, STATS_WINDOW_DAYS)
+    result = {
         "users": [dict(r) for r in rows],
         "total_skipped": totals["total_skipped"],
         "total_avg_ms": totals["total_avg_ms"],
     }
+    _stats_cache = (now, result)
+    return result
 
 
 @app.get("/api/daily-stats")
@@ -578,32 +494,6 @@ async def api_dlq():
     try:
         items = await r.lrange("messages:dlq", 0, 99)
         return [json.loads(item) for item in items]
-    finally:
-        await r.aclose()
-
-
-@app.post("/api/dlq/retry")
-async def api_dlq_retry():
-    """Move all DLQ messages back to messages:in for reprocessing."""
-    r = aioredis.Redis(**redis_kwargs())
-    # Atomic per item: pop from DLQ, unwrap the {"payload": ...} envelope, and requeue in
-    # one server-side script so a crash between pop and push can't lose the message.
-    lua = """
-    local item = redis.call('RPOP', KEYS[1])
-    if not item then return nil end
-    local payload = item
-    local ok, entry = pcall(cjson.decode, item)
-    if ok and type(entry) == 'table' and entry['payload'] ~= nil then
-      payload = cjson.encode(entry['payload'])
-    end
-    redis.call('LPUSH', KEYS[2], payload)
-    return 1
-    """
-    try:
-        count = 0
-        while await r.eval(lua, 2, "messages:dlq", "messages:in") is not None:
-            count += 1
-        return {"retried": count}
     finally:
         await r.aclose()
 
@@ -925,7 +815,7 @@ def _surrogate_id(payload: dict) -> str:
 
 
 async def _dlq_push(r, payload, error: str, attempts: int = 0) -> None:
-    """Envelope a message into the DLQ ({"payload": ...}) matching /api/dlq/retry.
+    """Envelope a message into the DLQ ({"payload": ...}), the shape _dlq_retry_loop reads.
 
     `attempts` rides along so the auto-retry task can give up on a message that keeps
     failing instead of cycling it between the queues forever.
@@ -1067,7 +957,7 @@ async def _process_message(r, raw: str) -> None:
         # Every active pair of this chat gets its own run: a WhatsApp group message is
         # seen by several clients but dedup keeps only one copy, so fanning out here is
         # what stops the pairs that did not win the dedup race from starving.
-        pairs = await fetch_active_chat_pairs(user_id, state["wa_chat_id"])
+        pairs = await lookup_chat_pairs(user_id, state["wa_chat_id"])
     except Exception as exc:
         # Failure in parse/build/lookup/emit — the popped message would otherwise vanish.
         _counter["failed"] += 1
@@ -1076,7 +966,7 @@ async def _process_message(r, raw: str) -> None:
         return
 
     # No pair → a single pair-less run, so validate_node still decides between the
-    # admin fallback and "skipped".
+    # admin fallback and "skipped" (it must not look the pairs up a second time).
     branches = [
         {
             **state,
@@ -1085,11 +975,18 @@ async def _process_message(r, raw: str) -> None:
             "target_language": pair.get("target_language") or "Russian",
         }
         for pair in pairs
-    ] or [state]
+    ] or [{**state, "pairs_resolved": True}]
+
+    # A message that comes back through the DLQ or the in-flight list may already have
+    # reached some of its pairs (a fan-out that failed halfway). The upsert in
+    # insert_message_event only guards the row, and runs after Telegram was called, so
+    # without this check those pairs would get a second copy. Fresh messages skip the
+    # query: wa-service dedup has them covered.
+    delivered = await fetch_delivered_pair_ids(wa_message_id) if _is_requeued(payload) else set()
 
     for branch in branches:
         chat_pair_id = branch.get("chat_pair_id")
-        if await _already_delivered(wa_message_id, chat_pair_id):
+        if chat_pair_id in delivered:
             _counter["skipped"] += 1
             logger.info("Dedup skip: %s already delivered to pair %s", wa_message_id, chat_pair_id)
             continue
@@ -1140,24 +1037,20 @@ async def _handle_revoke(payload: dict) -> None:
             logger.warning("Revoke note failed for %s: %s", wa_message_id, exc)
 
 
-async def _already_delivered(wa_message_id: str, chat_pair_id: int | None) -> bool:
-    """True if this message was already delivered to this pair.
+def _is_requeued(payload: dict) -> bool:
+    """True for a message that already went through the pipeline once: a DLQ retry, or one
+    recovered from the in-flight list after a crash."""
+    return bool(payload.get("_dlq_attempts") or payload.get("_requeued"))
 
-    A lookup failure (DB down/timeout) must NOT drop the message — process it.
-    """
+
+def _mark_requeued(raw: str) -> str:
+    """Flag a recovered in-flight message so _process_message checks what it already reached."""
     try:
-        pool = await get_pool()
-        existing = await pool.fetchval(
-            """
-            SELECT delivery_status FROM message_events
-            WHERE wa_message_id = $1 AND chat_pair_id IS NOT DISTINCT FROM $2
-            """,
-            wa_message_id, chat_pair_id,
-        )
-        return existing == "delivered"
-    except Exception as exc:
-        logger.warning("Dedup check failed for %s: %s — processing anyway", wa_message_id, exc)
-        return False
+        payload = json.loads(raw)
+        payload["_requeued"] = True
+        return json.dumps(payload, default=str)
+    except (json.JSONDecodeError, TypeError):
+        return raw
 
 
 async def _run_pipeline(r, payload: dict, state: dict, msg_id: str, wa_message_id: str) -> None:
@@ -1254,7 +1147,7 @@ async def _requeue_inflight(r) -> None:
         if not stranded:
             return
         for raw in stranded:
-            await r.rpush("messages:in", raw)
+            await r.rpush("messages:in", _mark_requeued(raw))
             await r.lrem(PROCESSING_QUEUE, 1, raw)
         logger.warning("Recovered %d in-flight message(s) from a previous run", len(stranded))
     except Exception as exc:

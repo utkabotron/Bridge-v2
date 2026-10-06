@@ -1,16 +1,18 @@
 """Feature flags with DB + Redis cache + env var fallback.
 
-Flags are stored in the `feature_flags` table, cached in Redis for 60s.
+Flags are stored in the `feature_flags` table, cached in Redis for 60s and in this
+process for FLAG_MEMORY_TTL seconds (set_flag clears both).
 If DB/Redis are unavailable, falls back to env vars (default: enabled).
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 
 import redis.asyncio as aioredis
 
-from .config import redis_kwargs
+from .config import FLAG_MEMORY_TTL, redis_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,17 @@ _redis: aioredis.Redis | None = None
 # cost) does not silently flip back ON via the permissive env default during an outage.
 _last_known: dict[str, bool] = {}
 
+# flag name -> (monotonic expiry, value). is_enabled runs several times per message and
+# each call was a Redis round trip; only values read from Redis/DB land here, never the
+# outage fallbacks, so recovery is not delayed.
+_memory: dict[str, tuple[float, bool]] = {}
+
+
+def _remember(flag_name: str, value: bool) -> bool:
+    _last_known[flag_name] = value
+    _memory[flag_name] = (time.monotonic() + FLAG_MEMORY_TTL, value)
+    return value
+
 
 def _get_redis() -> aioredis.Redis:
     global _redis
@@ -33,14 +46,16 @@ def _get_redis() -> aioredis.Redis:
 
 
 async def is_enabled(flag_name: str) -> bool:
-    """Check if a feature flag is enabled (Redis cache → DB → env fallback)."""
+    """Check if a feature flag is enabled (memory → Redis cache → DB → env fallback)."""
+    hit = _memory.get(flag_name)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
+
     # Try Redis cache first
     try:
         cached = await _get_redis().get(f"{_CACHE_PREFIX}{flag_name}")
         if cached is not None:
-            val = cached == "1"
-            _last_known[flag_name] = val
-            return val
+            return _remember(flag_name, cached == "1")
     except Exception:
         pass
 
@@ -52,8 +67,7 @@ async def is_enabled(flag_name: str) -> bool:
             "SELECT enabled FROM feature_flags WHERE name = $1", flag_name,
         )
         if row is not None:
-            enabled = row["enabled"]
-            _last_known[flag_name] = enabled
+            enabled = _remember(flag_name, row["enabled"])
             try:
                 await _get_redis().setex(
                     f"{_CACHE_PREFIX}{flag_name}", _CACHE_TTL, "1" if enabled else "0",
@@ -96,5 +110,7 @@ async def set_flag(flag_name: str, enabled: bool) -> bool:
             await _get_redis().delete(f"{_CACHE_PREFIX}{flag_name}")
         except Exception:
             pass
+        # After the Redis delete: a read that raced it cannot put the old value back.
+        _memory.pop(flag_name, None)
         return True
     return False

@@ -112,6 +112,22 @@ REVOKE_NOTE = os.getenv("REVOKE_NOTE", "🗑 Сообщение удалено �
 TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
 MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
+# Active pairs of a WhatsApp chat, looked up for every message (pipeline/cache.py). Pair
+# changes made outside the processor (wa-service, bot) do not invalidate the key yet, so
+# "no pair" — the common answer, every unbridged chat gets it — is kept only briefly: a
+# freshly created pair must not wait out an hour of cached "none".
+PAIRS_CACHE_TTL = int(os.getenv("PAIRS_CACHE_TTL", 3600))
+PAIRS_NEGATIVE_CACHE_TTL = int(os.getenv("PAIRS_NEGATIVE_CACHE_TTL", 60))
+# Per-process copy of a feature flag, in front of its Redis read (feature_flags.is_enabled
+# runs several times per message). set_flag clears it, so a toggle is not delayed.
+FLAG_MEMORY_TTL = int(os.getenv("FLAG_MEMORY_TTL", 5))
+
+# ── Dashboard stats ──────────────────────────────────────
+# /api/stats is polled every 15s by every open dashboard tab. Counting message_events
+# since the beginning of time per user per poll grew with the table; a bounded window plus
+# a short in-process cache keeps it flat.
+STATS_WINDOW_DAYS = int(os.getenv("STATS_WINDOW_DAYS", 30))
+STATS_CACHE_TTL = int(os.getenv("STATS_CACHE_TTL", 60))
 
 # ── Media analysis ───────────────────────────────────────
 IMAGE_ANALYSIS_TIMEOUT = int(os.getenv("IMAGE_ANALYSIS_TIMEOUT", 60))

@@ -12,9 +12,6 @@ import os
 import re
 import time
 
-
-from langdetect import detect, LangDetectException
-
 from ..config import (
     AB_ALWAYS_B_USERS, OPENAI_MODEL,
     TRANSLATION_UNAVAILABLE_NOTE,
@@ -25,7 +22,10 @@ from ..config import (
 from ..llm import chat as llm_chat
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
-from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
+from .cache import (
+    get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile,
+    lookup_chat_pairs, invalidate_chat_pairs,
+)
 from .prompts import VARIANTS, choose_variant, get_translate_prompt, format_chat_context
 
 logger = logging.getLogger(__name__)
@@ -34,26 +34,34 @@ logger = logging.getLogger(__name__)
 _ANALYZABLE_TYPES = {"image", "photo", "audio", "voice", "ptt", "document"}
 
 
-# ── DB helpers (lazy import to avoid circular deps) ──────
-
-async def _fetch_chat_pairs(user_id: int, wa_chat_id: str) -> list[dict]:
-    from ..db import fetch_active_chat_pairs
-    return await fetch_active_chat_pairs(user_id, wa_chat_id)
-
-
 # ── Node: validate ────────────────────────────────────────
 
+def _is_russian_text(text: str) -> bool:
+    """Cyrillic with none of the source scripts — all the admin fallback needs to know.
+
+    Text with no letters at all (a bare emoji, digits) counts as Russian too: there is
+    nothing in it to forward, and the old language detector gave up on it the same way.
+    """
+    if not any(ch.isalpha() for ch in text):
+        return True
+    return bool(_CYRILLIC_RE.search(text)) and not _SRC_SCRIPT_RE.search(text)
+
+
 async def validate_node(state: MessageState) -> MessageState:
-    """Resolve chat_pair_id, tg_chat_id, target_language from DB.
+    """Resolve chat_pair_id, tg_chat_id, target_language.
 
     The consumer resolves the pairs itself to fan a group message out to every active
-    pair of that chat, and hands each run its own pre-resolved pair — in that case this
-    node is a pass-through instead of a second identical query.
+    pair of that chat, and hands each run its own pre-resolved pair — or `pairs_resolved`
+    when the chat has none — so this node is a pass-through instead of a second lookup.
+    The lookup below is for a state that arrives with neither.
     """
     if state.get("chat_pair_id"):
         return state
 
-    pairs = await _fetch_chat_pairs(state["user_id"], state["wa_chat_id"])
+    if state.get("pairs_resolved"):
+        pairs = []
+    else:
+        pairs = await lookup_chat_pairs(state["user_id"], state["wa_chat_id"])
     pair = pairs[0] if pairs else None
 
     if not pair:
@@ -65,19 +73,15 @@ async def validate_node(state: MessageState) -> MessageState:
         if ADMIN_NO_PAIR_FALLBACK and state["user_id"] in admin_ids:
             has_media = bool(state.get("media_s3_url")) or bool(state.get("media_failed"))
             text = state.get("original_text", "").strip()
-            lang = "ru"
-            if text:
-                try:
-                    lang = detect(text)
-                except LangDetectException:
-                    lang = "ru"
+            is_russian = _is_russian_text(text)
 
             # Forward an unpaired admin chat into the bot on any media or any non-Russian
-            # text. A caption-less video/photo has empty original_text, which langdetect
-            # would read as Russian and drop — so media must bypass the language gate.
+            # text. A caption-less video/photo has empty original_text, which reads as
+            # Russian and would be dropped — so media must bypass the language gate.
             # Russian-only text with no media still falls through to skipped.
-            if has_media or lang != "ru":
-                logger.info("Admin no-pair fallback (media=%s, lang=%s) → send to admins", has_media, lang)
+            if has_media or not is_russian:
+                logger.info("Admin no-pair fallback (media=%s, russian=%s) → send to admins",
+                            has_media, is_russian)
                 return {**state, "chat_pair_id": None, "tg_chat_id": None,
                         "target_language": "Russian",
                         "fallback_to_admins": True}
@@ -143,15 +147,15 @@ async def translate_node(state: MessageState) -> MessageState:
     lang = state.get("target_language", "Russian")
     chat_pair_id = state.get("chat_pair_id")
 
-    # Load chat profile: Redis cache → PostgreSQL → None
+    # Load chat profile: Redis cache → PostgreSQL. Most pairs have none, so that answer is
+    # cached too ({}) — None means "not cached", not "no profile".
     chat_context = ""
     if chat_pair_id:
         profile = await get_chat_profile(chat_pair_id)
         if profile is None:
             from ..db import fetch_chat_profile
-            profile = await fetch_chat_profile(chat_pair_id)
-            if profile:
-                await set_chat_profile(chat_pair_id, profile)
+            profile = await fetch_chat_profile(chat_pair_id) or {}
+            await set_chat_profile(chat_pair_id, profile)
         if profile:
             chat_context = format_chat_context(profile)
 
@@ -579,7 +583,7 @@ async def _deliver_simple(state: MessageState, tg_chat_id: int) -> MessageState:
 
     # Auto-migrate supergroup: update chat_pairs and retry
     if not ok and migrate_id:
-        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        await _migrate_chat_pair(state, migrate_id)
         ok, error, _, tg_msg_id = await send_message(
             chat_id=migrate_id,
             text=state["formatted_text"],
@@ -633,7 +637,7 @@ async def _deliver_media_with_button(state: MessageState, tg_chat_id: int) -> Me
 
     # Auto-migrate supergroup
     if not ok and migrate_id:
-        await _migrate_chat_pair(state.get("chat_pair_id"), migrate_id)
+        await _migrate_chat_pair(state, migrate_id)
         ok, error, _, tg_msg_id = await send_message(
             chat_id=migrate_id,
             text=state["formatted_text"],
@@ -718,6 +722,9 @@ async def _pause_dead_chat(state: MessageState, error: str | None) -> None:
         return
 
     owner_tg_id = await pause_chat_pair(chat_pair_id)
+    # The cached lookup still lists this pair; without this every later message retries the
+    # dead chat (and trips the failure-rate alert) until the entry expires.
+    await invalidate_chat_pairs(state.get("user_id"), state.get("wa_chat_id") or "")
     logger.warning("Paused chat_pair %s — Telegram chat unreachable: %s", chat_pair_id, error)
     if not owner_tg_id:
         return  # already paused by an earlier message — do not notify twice
@@ -733,8 +740,9 @@ async def _pause_dead_chat(state: MessageState, error: str | None) -> None:
     )
 
 
-async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> None:
+async def _migrate_chat_pair(state: MessageState, new_tg_chat_id: int) -> None:
     """Update chat_pairs tg_chat_id when Telegram group migrates to supergroup."""
+    chat_pair_id = state.get("chat_pair_id")
     if not chat_pair_id:
         return
     import asyncpg
@@ -763,6 +771,8 @@ async def _migrate_chat_pair(chat_pair_id: int | None, new_tg_chat_id: int) -> N
             logger.error("Failed to merge chat_pair %s into %s: %s", chat_pair_id, target_id, exc)
     except Exception as exc:
         logger.error("Failed to migrate chat_pair %s: %s", chat_pair_id, exc)
+    # The cached lookup holds the old tg_chat_id (or a pair that was just merged away).
+    await invalidate_chat_pairs(state.get("user_id"), state.get("wa_chat_id") or "")
 
 
 async def _persist_event(state: MessageState) -> None:

@@ -47,7 +47,7 @@ async def test_validate_node_no_pair():
     """When no chat pair exists, delivery_status should be 'skipped'."""
     from processor.src.pipeline.nodes import validate_node
 
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])):
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])):
         result = await validate_node(_base_state())
 
     assert result["delivery_status"] == "skipped"
@@ -60,7 +60,7 @@ async def test_validate_node_with_pair():
     from processor.src.pipeline.nodes import validate_node
 
     pair = {"id": 7, "tg_chat_id": -1001234567890, "target_language": "Hebrew"}
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[pair])):
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[pair])):
         result = await validate_node(_base_state())
 
     assert result["chat_pair_id"] == 7
@@ -76,12 +76,26 @@ async def test_validate_node_pair_already_resolved():
 
     fetch = AsyncMock(return_value=[])
     state = _base_state(chat_pair_id=9, tg_chat_id=-100999, target_language="Hebrew")
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=fetch):
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=fetch):
         result = await validate_node(state)
 
     fetch.assert_not_awaited()
     assert result["chat_pair_id"] == 9
     assert result["tg_chat_id"] == -100999
+
+
+@pytest.mark.asyncio
+async def test_validate_node_does_not_look_up_pairs_the_consumer_already_found_empty():
+    """The consumer's "no pair" answer is final — validate must not ask again."""
+    from processor.src.pipeline.nodes import validate_node
+
+    lookup = AsyncMock(return_value=[{"id": 1, "tg_chat_id": -1, "target_language": "Hebrew"}])
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=lookup):
+        result = await validate_node(_base_state(pairs_resolved=True))
+
+    lookup.assert_not_awaited()
+    assert result["delivery_status"] == "skipped"
+    assert result["error"] == "no_chat_pair"
 
 
 @pytest.mark.asyncio
@@ -91,7 +105,7 @@ async def test_validate_node_skips_unpaired_admin_chat_by_default():
 
     state = _base_state(user_id=100, original_text="", message_type="video",
                         media_s3_url="https://s3/bridge-media/vid.mp4")
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", False), \
          patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
         result = await validate_node(state)
@@ -108,7 +122,7 @@ async def test_validate_node_forwards_captionless_media_when_fallback_enabled():
 
     state = _base_state(user_id=100, original_text="", message_type="video",
                         media_s3_url="https://s3/bridge-media/vid.mp4")
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
          patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
         result = await validate_node(state)
@@ -124,13 +138,41 @@ async def test_validate_node_skips_russian_text_without_media_from_admin_chat():
 
     state = _base_state(user_id=100, message_type="text", media_s3_url=None,
                         original_text="привет как дела у тебя сегодня всё хорошо надеюсь")
-    with patch("processor.src.pipeline.nodes._fetch_chat_pairs", new=AsyncMock(return_value=[])), \
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
          patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
         result = await validate_node(state)
 
     assert result.get("fallback_to_admins") is not True
     assert result["delivery_status"] == "skipped"
+
+
+@pytest.mark.parametrize("text,is_russian", [
+    ("привет как дела", True),
+    ("", True),            # caption-less media: the media gate decides, not the language
+    ("👍", True),          # no letters, nothing worth forwarding
+    ("12:30", True),
+    ("hello how are you", False),
+    ("שלום, מה שלומך?", False),
+    ("привет, מה שלומך", False),  # mixed with a source script still gets forwarded
+])
+def test_admin_fallback_language_gate(text, is_russian):
+    from processor.src.pipeline.nodes import _is_russian_text
+
+    assert _is_russian_text(text) is is_russian
+
+
+@pytest.mark.asyncio
+async def test_validate_node_forwards_non_russian_text_when_fallback_enabled():
+    from processor.src.pipeline.nodes import validate_node
+
+    state = _base_state(user_id=100, original_text="hello how are you today")
+    with patch("processor.src.pipeline.nodes.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.pipeline.nodes.ADMIN_NO_PAIR_FALLBACK", True), \
+         patch.dict(os.environ, {"ADMIN_TG_IDS": "100"}):
+        result = await validate_node(state)
+
+    assert result.get("fallback_to_admins") is True
 
 
 # ── translate_node ────────────────────────────────────────
@@ -151,6 +193,47 @@ async def test_translate_node_cache_hit():
     assert result["translated_text"] == "Привет, как дела?"
     assert result["cache_hit"] is True
     assert result["translation_ms"] == 0
+
+
+async def _translate_with_profile_cache(cached_profile, db_profile):
+    """Run translate_node (cache hit, so no LLM) and return the profile-cache calls."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=1, tg_chat_id=-100, target_language="Russian")
+    fetch = AsyncMock(return_value=db_profile)
+    store = AsyncMock()
+    with patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value=cached_profile)), \
+         patch("processor.src.pipeline.nodes.set_chat_profile", new=store), \
+         patch("processor.src.db.fetch_chat_profile", new=fetch), \
+         patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value="Привет")):
+        await translate_node(state)
+    return fetch, store
+
+
+@pytest.mark.asyncio
+async def test_translate_node_caches_the_absence_of_a_profile():
+    """Most pairs have no chat_profiles row; without a cached "none" each message hit Postgres."""
+    fetch, store = await _translate_with_profile_cache(cached_profile=None, db_profile=None)
+
+    fetch.assert_awaited_once_with(1)
+    store.assert_awaited_once_with(1, {})
+
+
+@pytest.mark.asyncio
+async def test_translate_node_trusts_a_cached_empty_profile():
+    fetch, store = await _translate_with_profile_cache(cached_profile={}, db_profile={"tone": "x"})
+
+    fetch.assert_not_awaited()
+    store.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_translate_node_caches_a_profile_it_loaded():
+    profile = {"tone": "casual", "glossary": {"שלום": "привет"}}
+    fetch, store = await _translate_with_profile_cache(cached_profile=None, db_profile=profile)
+
+    fetch.assert_awaited_once_with(1)
+    store.assert_awaited_once_with(1, profile)
 
 
 @pytest.mark.asyncio
@@ -435,22 +518,32 @@ async def test_process_message_fans_out_to_every_pair():
     async def fake_run(r, payload_, state, msg_id, wa_message_id):
         runs.append((state["chat_pair_id"], state["tg_chat_id"], state["target_language"]))
 
-    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=pairs)), \
-         patch("processor.src.main._already_delivered", new=AsyncMock(return_value=False)), \
+    delivered = AsyncMock(return_value=set())
+    with patch("processor.src.main.lookup_chat_pairs", new=AsyncMock(return_value=pairs)), \
+         patch("processor.src.main.fetch_delivered_pair_ids", new=delivered), \
          patch("processor.src.main._run_pipeline", new=fake_run):
         await main._process_message(MagicMock(), json.dumps(payload))
 
     assert runs == [(11, -1001, "Russian"), (15, -1002, "Hebrew")]
+    # A fresh message costs no dedup query at all — wa-service dedup already covers it.
+    delivered.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_process_message_skips_pair_already_delivered():
-    """Per-pair dedup: a pair that already got the message is skipped, the other still runs."""
+@pytest.mark.parametrize("marker", ["_dlq_attempts", "_requeued"])
+async def test_requeued_message_skips_pairs_it_already_reached(marker):
+    """A fan-out that failed halfway comes back through the DLQ (or the in-flight list).
+
+    The pair that got its copy must be skipped, the other still runs — the upsert guard in
+    insert_message_event only protects the row, after Telegram was already called, so
+    without this check the first pair would get the message twice.
+    """
     import json
 
     import processor.src.main as main
 
-    payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@g.us", "user_id": 100, "body": "hi"}
+    payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@g.us", "user_id": 100, "body": "hi",
+               marker: 1}
     pairs = [
         {"id": 11, "tg_chat_id": -1001, "target_language": "Russian"},
         {"id": 15, "tg_chat_id": -1002, "target_language": "Russian"},
@@ -460,15 +553,56 @@ async def test_process_message_skips_pair_already_delivered():
     async def fake_run(r, payload_, state, msg_id, wa_message_id):
         runs.append(state["chat_pair_id"])
 
-    async def fake_delivered(wa_message_id, chat_pair_id):
-        return chat_pair_id == 11
-
-    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=pairs)), \
-         patch("processor.src.main._already_delivered", new=fake_delivered), \
+    delivered = AsyncMock(return_value={11})
+    with patch("processor.src.main.lookup_chat_pairs", new=AsyncMock(return_value=pairs)), \
+         patch("processor.src.main.fetch_delivered_pair_ids", new=delivered), \
          patch("processor.src.main._run_pipeline", new=fake_run):
         await main._process_message(MagicMock(), json.dumps(payload))
 
     assert runs == [15]
+    delivered.assert_awaited_once_with("fallback:abc")  # one query for the whole fan-out
+
+
+@pytest.mark.asyncio
+async def test_requeued_pairless_message_is_not_delivered_to_admins_twice():
+    """The pair-less run (admin fallback) is recorded under chat_pair_id NULL; same dedup."""
+    import json
+
+    import processor.src.main as main
+
+    payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@c.us", "user_id": 100, "body": "hi",
+               "_dlq_attempts": 1}
+    runs = []
+
+    async def fake_run(r, payload_, state, msg_id, wa_message_id):
+        runs.append(state["chat_pair_id"])
+
+    with patch("processor.src.main.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
+         patch("processor.src.main.fetch_delivered_pair_ids", new=AsyncMock(return_value={None})), \
+         patch("processor.src.main._run_pipeline", new=fake_run):
+        await main._process_message(MagicMock(), json.dumps(payload))
+
+    assert runs == []
+
+
+@pytest.mark.asyncio
+async def test_inflight_recovery_flags_messages_for_the_dedup_check():
+    import json
+
+    import processor.src.main as main
+
+    raw = json.dumps({"wa_message_id": "m1", "body": "hi"})
+    r = MagicMock()
+    r.lrange = AsyncMock(return_value=[raw, "not json"])
+    r.rpush = AsyncMock()
+    r.lrem = AsyncMock()
+
+    await main._requeue_inflight(r)
+
+    pushed = [call.args[1] for call in r.rpush.await_args_list]
+    assert json.loads(pushed[0]) == {"wa_message_id": "m1", "body": "hi", "_requeued": True}
+    assert pushed[1] == "not json"  # unparseable: handed back untouched, as before
+    assert [call.args[2] for call in r.lrem.await_args_list] == [raw, "not json"]
 
 
 @pytest.mark.asyncio
@@ -480,16 +614,51 @@ async def test_process_message_without_pairs_still_runs_once():
 
     payload = {"wa_message_id": "fallback:abc", "wa_chat_id": "123@g.us", "user_id": 100, "body": "hi"}
     runs = []
+    resolved = []
 
     async def fake_run(r, payload_, state, msg_id, wa_message_id):
         runs.append(state["chat_pair_id"])
+        resolved.append(state.get("pairs_resolved"))
 
-    with patch("processor.src.main.fetch_active_chat_pairs", new=AsyncMock(return_value=[])), \
-         patch("processor.src.main._already_delivered", new=AsyncMock(return_value=False)), \
+    with patch("processor.src.main.lookup_chat_pairs", new=AsyncMock(return_value=[])), \
          patch("processor.src.main._run_pipeline", new=fake_run):
         await main._process_message(MagicMock(), json.dumps(payload))
 
     assert runs == [None]
+    assert resolved == [True]  # validate_node is told the lookup already happened
+
+
+# ── Pair cache is invalidated by the changes the processor makes itself ──
+
+@pytest.mark.asyncio
+async def test_pausing_a_dead_chat_drops_the_cached_pairs():
+    """Otherwise every later message retries the dead chat until the cache entry expires."""
+    from processor.src.pipeline.nodes import _pause_dead_chat
+
+    state = _base_state(chat_pair_id=7, user_id=100, wa_chat_id="123@g.us")
+    invalidate = AsyncMock()
+    with patch("processor.src.pipeline.nodes.invalidate_chat_pairs", new=invalidate), \
+         patch("processor.src.telegram_sender.is_dead_chat", return_value=True), \
+         patch("processor.src.db.pause_chat_pair", new=AsyncMock(return_value=None)):
+        await _pause_dead_chat(state, "Bad Request: chat not found")
+
+    invalidate.assert_awaited_once_with(100, "123@g.us")
+
+
+@pytest.mark.asyncio
+async def test_supergroup_migration_drops_the_cached_pairs():
+    from processor.src.pipeline.nodes import _migrate_chat_pair
+
+    state = _base_state(chat_pair_id=7, user_id=100, wa_chat_id="123@g.us")
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+    invalidate = AsyncMock()
+    with patch("processor.src.pipeline.nodes.invalidate_chat_pairs", new=invalidate), \
+         patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        await _migrate_chat_pair(state, -1009999)
+
+    pool.execute.assert_awaited_once()
+    invalidate.assert_awaited_once_with(100, "123@g.us")
 
 
 # ── Resilience: translation failures must not swallow the message ──
@@ -516,16 +685,14 @@ async def test_translate_node_degrades_when_llm_fails():
 
 
 @pytest.fixture
-def translation_alerts():
+def translation_alerts(monkeypatch):
     """Fresh alert state, with the Telegram send replaced by a mock."""
     import processor.src.main as main
 
-    main._translation_fail_times.clear()
-    main._last_translation_alert = None
+    monkeypatch.setattr(main, "_translation_window", main.SlidingWindow(
+        main.TRANSLATION_FAIL_WINDOW, cooldown=main.TRANSLATION_ALERT_COOLDOWN))
     with patch("processor.src.main._alert_admins_translation", new=AsyncMock()) as alert:
         yield main, alert
-    main._translation_fail_times.clear()
-    main._last_translation_alert = None
 
 
 QUOTA_ERROR = ("Error code: 429 - {'error': {'message': 'You have no credits remaining.', "
