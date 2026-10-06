@@ -113,5 +113,16 @@ def test_builder_leaves_names_pinned_service_wide_alone():
     assert glossary.drop_global(delta, None) == delta
 
     prompt = build_extraction_prompt("Russian", None, ["גבעולים"])
-    assert "fixed rendering for every chat" in prompt and "גבעולים" in prompt
-    assert "for every chat" not in build_extraction_prompt("Russian", None)
+    assert "already known to the service glossary" in prompt and "גבעולים" in prompt
+    assert "already known" not in build_extraction_prompt("Russian", None)
+
+
+def test_service_entries_are_found_by_words_and_only_flagged():
+    entries = {"גיל": {"translation": "Гиль", "id": 1}, "גבעולים": {"translation": "Гиволим", "id": 2}}
+    evaluations = [
+        _eval("זה רגיל", "Это Гиль", ["mistranslation"]),                       # גיל only inside רגיל
+        _eval("ראיתי את גיל", "Я видел Гиль", ["grammar"]),
+        _eval("בגבעולים", "в Гиволим", ["omission"]),                          # not a glossary issue
+    ]
+    hits = glossary.service_hits(evaluations, entries)
+    assert list(hits) == ["גיל"] and len(hits["גיל"]) == 1

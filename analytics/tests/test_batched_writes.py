@@ -1,6 +1,7 @@
 """The flows' DB writes: one connection per task, plain inserts batched with executemany."""
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -214,3 +215,30 @@ def test_summaries_already_sent_are_stored_even_if_a_later_chat_fails(monkeypatc
 
     # chat 1 was already sent: it must be on record so a re-run in this slot does not send it again
     assert [[r["chat_pair_id"] for r in batch] for batch in stored] == [[1]]
+
+
+def test_builder_routes_names_to_the_service_glossary(monkeypatch):
+    """Settled names stay out of the profile, new ones become candidates, names the service
+    left to the chats (several readings) are still written into the profile."""
+    conn = FakeConn(fetchone=[None])
+    patch_db_conn(monkeypatch, ccb, conn)
+    monkeypatch.setattr(ccb, "invalidate_profile_cache", lambda ids: None)
+
+    statuses = {"גבעולים": "locked", "אורי": "rejected", "עמוס": "verified"}
+    delta = {"tone": "warm",
+             "glossary": {"גבעולים": {"translation": "Геваулим"}, "צמרות": {"translation": "Цмарот"},
+                          "א-1": {"translation": "Алеф-1"}},
+             "members": {"אורי": "Ури", "עמוס": "Амос", "דנה": "Дана"}}
+    ccb.store_profiles.fn([{"chat_pair_id": 9, "target_language": "Russian", "delta": delta,
+                            "statuses": statuses}])
+
+    names = [s for s in conn.statements if s[0] == "executemany" and "INSERT INTO glossary" in s[1]]
+    assert {r["s"] for r in names[0][2]} == {"גבעולים", "צמרות", "אורי", "עמוס", "דנה"}
+    assert all(r["p"] == 9 for r in names[0][2])                  # this chat joins each name's scope
+
+    (profiles,) = _insert_into(conn, "chat_profiles")
+    profile = json.loads(profiles[2][0][1])
+    assert profile["glossary"] == {"א-1": {"translation": "Алеф-1"}}   # not a name: kept as before
+    assert profile["members"] == {"אורי": "Ури"}                      # left to the chat
+    (history,) = _insert_into(conn, "chat_profile_history")
+    assert "2 new names → service glossary" in history[2][0][3]       # צמרות, דנה

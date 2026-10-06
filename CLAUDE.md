@@ -160,8 +160,12 @@ processor и bot НЕ общаются — оба независимо → Postg
 [--limit N] [--contested] [--kind person|other] [--dry-run]` — веб-поиск латинского написания для мест/
 организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8);
 `--classify` — `also_word` + подсказка ≤ 3 слов (длинное пояснение модель копировала в перевод).
-Спорные (`proposed`) решает `--arbitrate`, не человек: веб-проверка на каждое имя; уверенное одно прочтение →
-`verified`, «несколько прочтений» (אורי: Ори/Ури) / «не имя» / «не уверен» → `rejected` = остаётся чату.
+НОВЫЕ ИМЕНА НЕ РАЗБИРАЕТ LLM СЕРВИСА (решение 06.10): ночной `chat_context_builder` раскладывает найденное
+(`glossary_resolver.route_delta`): verified/locked — не в профиль; rejected («решает чат») — в профиль как раньше;
+новое — `candidate` (`upsert_names`, заодно расширяет `chat_pairs`). Разбирает Claude по запросу «разбери новые
+имена»: выгрузка candidate → решение → одна транзакция verified/rejected, `decided_by='admin'` → `glossary_check`.
+Плохие оценки переводов: запись чата снимается после 3 флагов, запись словаря — только `flags` (миграция 028),
+в дайджесте «под вопросом N». `--resolve`/`--arbitrate` в ночной поток НЕ включать.
 Ручное одобрение — только для того, что арбитр не смог решить: после дайджеста analytics шлёт админам «Имена на одобрение» (10 штук, `bridge_shared.glossary_review`),
 кнопки ✅/✏️/❌ и «Следующие» обрабатывает бот (`handlers/glossary.py`, callback `gl:*`); ✏️ — ответ на
 вопрос бота (строка `ref g:` в вопросе). Решения → `verified`/`rejected`, `decided_by='admin'`; ✏️ НЕ `locked`
@@ -296,6 +300,7 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 025 | glossary, glossary_override — словарь имён сервиса; glossary_global → locked, удалена |
 | 026 | glossary += also_word, chat_pairs — неоднозначные имена только в своих чатах |
 | 027 | glossary += decided_by (auto / admin) |
+| 028 | glossary += flags, flag_examples — «под вопросом» от плохих оценок |
 
 ## ANALYTICS FLOWS
 

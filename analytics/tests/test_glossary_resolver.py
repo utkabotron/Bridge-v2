@@ -212,3 +212,22 @@ def test_arbitrate_commits_as_it_goes_and_never_touches_admin_decisions():
     answers = iter([{"decision": "one", "translation": "Саги", "confidence": 0.9}])
     gr.arbitrate(conn, client, dry_run=True)
     assert len(conn.executed("execute")) == 1         # the SELECT only
+
+
+def test_route_delta_and_upsert_names_sql():
+    statuses = {"גבעולים": "verified", "מיה": "rejected"}
+    delta = {"glossary": {"גבעולים": {"translation": "Геваулим"}, "מיה": {"translation": "Мия"}},
+             "members": {"דנה דרחי": "Дана Драхи", "מיה": "Майя", "❤️": "сердце"},
+             "mentioned_people": {"נועם": {"transliteration": "Ноам", "relation": "сын Даны"}}}
+    profile_delta, names = gr.route_delta(delta, 4, "Russian", statuses)
+    assert profile_delta["glossary"] == {"מיה": {"translation": "Мия"}}
+    assert profile_delta["members"] == {"מיה": "Майя", "❤️": "сердце"}
+    assert profile_delta["mentioned_people"] == delta["mentioned_people"]   # relations stay
+    assert set(names) == {(k, "Russian") for k in ("גבעולים", "מיה", "דנה", "דרחי", "נועם")}
+
+    conn = FakeConn()
+    n = gr.upsert_names(conn.cursor(), names)
+    (_, sql, rows), = conn.executed("executemany")
+    assert "WHERE NOT (glossary.chat_pairs @> EXCLUDED.chat_pairs)" in sql
+    assert n == len(rows) and all(r["p"] == 4 for r in rows)
+    assert {"s": "נועם", "l": "Russian", "k": "person", "n": None, "r": '{"Ноам": 1}', "p": 4} in rows

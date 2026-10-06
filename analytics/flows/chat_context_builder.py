@@ -26,6 +26,7 @@ from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import glossary as glossary_rules
+from . import glossary_resolver as names_rules
 from . import llm
 from .shared import db_conn, invalidate_profile_cache
 
@@ -69,16 +70,24 @@ def collect_per_chat_data() -> list[dict]:
         """)
         pairs = [dict(r) for r in cur.fetchall()]
 
-        # Names the service glossary already settled (migration 025) — not the builder's
-        # to re-guess. Rejected ones stay the chat's business: "not a name for the whole
-        # service" can still be one chat's kindergarten group (חרדון — Хардон).
-        cur.execute("""
-            SELECT source, target_language FROM glossary
-            WHERE status IN ('verified', 'locked')
-        """)
-        pinned: dict[str, list[str]] = {}
+        # The service glossary (docs/glossary-plan.md, step 5). `statuses` routes what the
+        # builder finds (glossary_resolver.route_delta); `known` is what it need not look
+        # for again in a chat: names settled for every chat, and names already recorded
+        # for this one. A rejected name stays the chat's business — "not one reading for
+        # the whole service" (אורי: Ори / Ури) is exactly what the chat profile is for.
+        cur.execute("SELECT source, target_language, status, also_word, chat_pairs FROM glossary")
+        statuses: dict[str, dict[str, str]] = {}
+        everywhere: dict[str, list[str]] = {}
+        in_chat: dict[tuple[int, str], list[str]] = {}
         for r in cur.fetchall():
-            pinned.setdefault(r["target_language"], []).append(r["source"])
+            lang = r["target_language"]
+            statuses.setdefault(lang, {})[r["source"]] = r["status"]
+            if r["status"] == "rejected":
+                continue
+            if r["status"] in names_rules.SERVICE_STATUSES and (r["status"] == "locked" or r["also_word"] is False):
+                everywhere.setdefault(lang, []).append(r["source"])
+            for pid in r["chat_pairs"] or ():
+                in_chat.setdefault((pid, lang), []).append(r["source"])
 
         result = []
         for pair in pairs:
@@ -108,7 +117,9 @@ def collect_per_chat_data() -> list[dict]:
                 "chat_pair_id": pair["chat_pair_id"],
                 "wa_chat_id": pair["wa_chat_id"],
                 "target_language": target_language,
-                "global_keys": pinned.get(target_language, []),
+                "global_keys": everywhere.get(target_language, [])
+                               + in_chat.get((pair["chat_pair_id"], target_language), []),
+                "statuses": statuses.get(target_language, {}),
                 "existing_profile": pair["profile_data"],
                 "existing_version": pair.get("version") or 0,
                 "messages": messages,
@@ -129,8 +140,8 @@ def build_extraction_prompt(target_lang: str, existing: dict | None,
         )
     if global_keys:
         banned_block += (
-            "\n- These names already have a fixed rendering for every chat; do NOT add them "
-            "or phrases containing them to the glossary: " + ", ".join(sorted(global_keys)[:60])
+            "\n- These names are already known to the service glossary; do NOT add them, or "
+            "phrases containing them, to the glossary or members: " + ", ".join(sorted(global_keys)[:80])
         )
     return f"""You analyze WhatsApp group chat messages to build a translation context profile.
 The messages are translated from Hebrew to {target_lang}.
@@ -362,12 +373,23 @@ def store_profiles(results: list[dict]) -> int:
         cur = conn.cursor()
 
         writes: list[tuple] = []
+        names_seen = 0
         for r in results:
             chat_pair_id = r["chat_pair_id"]
             delta = r["delta"]
             dropped = r.get("dropped") or {}
             tokens = r.get("tokens_used", 0)
             messages_analyzed = r.get("messages_analyzed", 0)
+
+            # Names go to the service glossary: settled ones are not re-guessed here, new
+            # ones wait as candidates for a hand review, and only names the service left to
+            # the chats are written into the profile (glossary_resolver.route_delta).
+            new_names = 0
+            if r.get("statuses") is not None:
+                delta, names = names_rules.route_delta(
+                    delta, chat_pair_id, r.get("target_language") or "Russian", r["statuses"])
+                new_names = sum(1 for key in names if r["statuses"].get(key[0]) is None)
+                names_seen += names_rules.upsert_names(cur, names)
 
             # Skip empty deltas (a validator rejection alone is still worth recording)
             if not any(delta.get(k) for k in PROFILE_FIELDS) and not dropped:
@@ -400,6 +422,8 @@ def store_profiles(results: list[dict]) -> int:
             for k in ("chat_type", "chat_description", "tone"):
                 if delta.get(k):
                     change_parts.append(f"updated {k}")
+            if new_names:
+                change_parts.append(f"{new_names} new names → service glossary")
             change_summary = ", ".join(change_parts) if change_parts else "no changes"
 
             writes.append((chat_pair_id, merged, new_version, tokens, cost, change_summary))
@@ -411,13 +435,15 @@ def store_profiles(results: list[dict]) -> int:
     # The processor caches profiles for an hour; a stale copy would keep serving the old glossary.
     invalidate_profile_cache(touched)
 
-    logger.info("Stored %d chat profiles", stored)
+    logger.info("Stored %d chat profiles; %d name sightings recorded in the service glossary",
+                stored, names_seen)
     return stored
 
 
 @task(retries=1, name="apply-quality-feedback")
 def apply_quality_feedback() -> list[dict]:
-    """Flag glossary entries implicated in last night's bad translations; remove at threshold.
+    """Flag glossary entries implicated in last night's bad translations: a chat's own entry
+    is removed at the threshold, a service glossary entry is only flagged for review.
 
     Reads this morning's translation-quality run (it finishes half an hour before us).
     """
@@ -463,6 +489,20 @@ def apply_quality_feedback() -> list[dict]:
 
         _write_profiles(cur, writes)
 
+        # Service glossary entries: flagged, not removed (migration 028). Locked ones are
+        # the admin's and are left alone. updated_at is not touched — flags do not change
+        # what the processor applies, so there is nothing for it to reload.
+        cur.execute("SELECT id, source, translation FROM glossary WHERE status = 'verified'")
+        entries = {r["source"]: {"translation": r["translation"], "id": r["id"]} for r in cur.fetchall()}
+        flagged = glossary_rules.service_hits([e for evs in by_pair.values() for e in evs], entries)
+        cur.executemany("""
+            UPDATE glossary SET flags = flags + %s, flag_examples = %s::jsonb WHERE id = %s
+        """, [(len(ex), json.dumps(ex[-glossary_rules.MAX_EXAMPLES:], ensure_ascii=False), entries[k]["id"])
+              for k, ex in flagged.items()])
+        if flagged:
+            logger.info("Service glossary: flagged %s", ", ".join(f"{k}×{len(v)}" for k, v in flagged.items()))
+            outcomes.append({"service_flagged": sorted(flagged)})
+
     invalidate_profile_cache([w[0] for w in writes])
     return outcomes
 
@@ -480,6 +520,7 @@ def chat_context_builder():
     for chat_data in chat_data_list:
         result = extract_context_with_llm(chat_data)
         if result:
+            result = {**result, "statuses": chat_data.get("statuses") or {}}
             results.append(validate_delta_glossary(result, chat_data["existing_profile"],
                                                    chat_data.get("global_keys")))
 

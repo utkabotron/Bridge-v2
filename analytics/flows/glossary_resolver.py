@@ -154,6 +154,70 @@ def import_candidates(conn) -> int:
     return len(rows)
 
 
+# ── Nightly: names the profile builder finds (step 5) ─────
+
+SERVICE_STATUSES = ("verified", "locked")
+
+
+def route_delta(delta: dict, pair_id: int, lang: str, statuses: dict[str, str]) -> tuple[dict, dict]:
+    """Split a profile builder's delta: (what still goes into the chat profile, every name
+    it mentions for upsert_names). `statuses`: {glossary key: status} for this language.
+
+    A name the service glossary settled (verified / locked) is not written to the profile —
+    the service rendering applies. One it handed back to the chats (rejected: several
+    readings, a word in this chat's sense) stays in the profile as before. A new one is
+    only a candidate, reviewed by hand later (no LLM of the service decides it) — the
+    profile does not get the builder's guess, which is how one school became Геваулим.
+    Keys that are not names at all (א-1, emoji labels) stay in the profile untouched.
+    """
+    def keep(key: str) -> bool:
+        k = key_of(key)
+        if not _is_name_key(k):
+            return True
+        return statuses.get(k) == "rejected"
+
+    def keep_member(key: str) -> bool:
+        ws = words(key)
+        if not _is_name_key(key_of(key)):
+            return True
+        return any(statuses.get(w) == "rejected" for w in ws)
+
+    profile_delta = dict(delta)
+    if delta.get("glossary"):
+        profile_delta["glossary"] = {k: v for k, v in delta["glossary"].items() if keep(k)}
+    if delta.get("members"):
+        profile_delta["members"] = {k: v for k, v in delta["members"].items() if keep_member(k)}
+    names = collect_names([{"chat_pair_id": pair_id, "target_language": lang, "profile_data": {
+        k: delta.get(k) for k in ("glossary", "members", "mentioned_people")}}])
+    return profile_delta, names
+
+
+def upsert_names(cur, names: dict[tuple[str, str], dict]) -> int:
+    """Record that these names were seen in a chat: a new one becomes a `candidate`; any
+    known one gets the chat added to chat_pairs — which is what lets a name that is also a
+    word (עמוס) apply in a chat it newly appears in. Nothing changes when the chat is
+    already listed, so a nightly re-extraction is a no-op."""
+    rows = []
+    for (source, lang), item in names.items():
+        for rendering, pairs in item["renderings"].items():
+            for pair_id in pairs:
+                rows.append({"s": source, "l": lang, "k": item["kind"], "n": "; ".join(item["notes"]) or None,
+                             "r": json.dumps({rendering: 1}, ensure_ascii=False), "p": pair_id})
+    cur.executemany("""
+        INSERT INTO glossary (source, target_language, kind, note, chat_renderings, chats_seen, chat_pairs)
+        VALUES (%(s)s, %(l)s, %(k)s, %(n)s, %(r)s::jsonb, 1, ARRAY[%(p)s]::int[])
+        ON CONFLICT (source, target_language) DO UPDATE
+            SET chat_renderings = glossary.chat_renderings || (
+                    SELECT jsonb_object_agg(k, coalesce((glossary.chat_renderings ->> k)::int, 0) + 1)
+                    FROM jsonb_object_keys(EXCLUDED.chat_renderings) AS k),
+                chat_pairs = glossary.chat_pairs || EXCLUDED.chat_pairs,
+                chats_seen = cardinality(glossary.chat_pairs) + 1,
+                updated_at = now()
+            WHERE NOT (glossary.chat_pairs @> EXCLUDED.chat_pairs)
+    """, rows)
+    return len(rows)
+
+
 # ── Asking the model ──────────────────────────────────────
 
 def _parse_json(content: str):

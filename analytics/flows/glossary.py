@@ -25,6 +25,7 @@ import os
 from datetime import date
 
 from bridge_shared.chat_context import covered_by_global
+from bridge_shared.glossary_match import GlossaryIndex
 
 from . import llm
 
@@ -79,6 +80,30 @@ def find_hits(evaluations: list[dict], glossary: dict) -> dict[str, list[dict]]:
                 "translated": (ev.get("translated_text") or "")[:160],
                 "issues": sorted(types & GLOSSARY_ISSUE_TYPES),
             })
+    return hits
+
+
+def service_hits(evaluations: list[dict], entries: dict[str, dict]) -> dict[str, list[dict]]:
+    """find_hits for the service glossary: names are found by words (GlossaryIndex), not
+    as substrings. entries: {source: {"translation": ...}}. A service entry is only flagged,
+    never removed — the digest shows it "под вопросом" for a hand review."""
+    index = GlossaryIndex(entries)
+    hits: dict[str, list[dict]] = {}
+    for ev in evaluations:
+        issues = ev.get("issues") or []
+        types = {i.get("type") for i in issues if isinstance(i, dict)}
+        if not types & GLOSSARY_ISSUE_TYPES:
+            continue
+        translated = (ev.get("translated_text") or "").lower()
+        for key, info in index.find(ev.get("original_text") or "").items():
+            rendering = _rendering(info)
+            if rendering and rendering.lower() in translated:
+                hits.setdefault(key, []).append({
+                    "score": ev.get("quality_score"),
+                    "original": (ev.get("original_text") or "")[:160],
+                    "translated": (ev.get("translated_text") or "")[:160],
+                    "issues": sorted(types & GLOSSARY_ISSUE_TYPES),
+                })
     return hits
 
 

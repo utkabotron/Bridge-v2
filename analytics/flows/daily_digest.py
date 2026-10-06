@@ -22,6 +22,7 @@ import httpx
 from bridge_shared import glossary_review
 from prefect import flow, get_run_logger, task
 
+from .glossary import FLAG_THRESHOLD
 from .shared import db_conn, esc, notify_telegram, redis_client
 
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
@@ -140,9 +141,13 @@ def collect_digest() -> dict:
         cur.execute("""
             SELECT count(*) FILTER (WHERE decided_by = 'auto' AND status = 'verified'
                                     AND decided_at >= current_date - interval '1 day') AS auto_accepted,
-                   count(*) FILTER (WHERE status = 'proposed') AS proposed
+                   count(*) FILTER (WHERE status = 'proposed') AS proposed,
+                   count(*) FILTER (WHERE status = 'candidate') AS candidates,
+                   count(*) FILTER (WHERE status = 'candidate'
+                                    AND created_at >= current_date - interval '1 day') AS new_candidates,
+                   count(*) FILTER (WHERE status = 'verified' AND flags >= %s) AS flagged
             FROM glossary
-        """)
+        """, (FLAG_THRESHOLD,))
         data["names"] = dict(cur.fetchone())
 
         # Users: who is connected, how many bridges, what went through for them yesterday
@@ -312,9 +317,18 @@ def format_digest(data: dict) -> str:
     if g.get("added") or g.get("removed"):
         lines.append(f"<b>Глоссарий:</b> +{g.get('added', 0)} · снято {g.get('removed', 0)}")
     names = data.get("names") or {}
-    if names.get("auto_accepted") or names.get("proposed"):
-        lines.append(f"<b>Словарь имён:</b> принято автоматически {names.get('auto_accepted') or 0}"
-                     f" · ждут одобрения {names.get('proposed') or 0}")
+    parts = []
+    if names.get("candidates"):
+        new = names.get("new_candidates") or 0
+        parts.append(f"новых имён ждут разбора {names['candidates']}" + (f" (+{new} за сутки)" if new else ""))
+    if names.get("flagged"):
+        parts.append(f"под вопросом {names['flagged']}")
+    if names.get("proposed"):
+        parts.append(f"ждут одобрения {names['proposed']}")
+    if names.get("auto_accepted"):
+        parts.append(f"принято автоматически {names['auto_accepted']}")
+    if parts:
+        lines.append("<b>Словарь имён:</b> " + " · ".join(parts))
 
     # Users
     users = data.get("users") or []

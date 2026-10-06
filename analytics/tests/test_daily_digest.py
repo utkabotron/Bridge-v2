@@ -131,7 +131,7 @@ def test_russian_plurals():
 
 def test_names_line_shows_auto_accepted_and_waiting():
     text = format_digest(_data(names={"auto_accepted": 456, "proposed": 244}))
-    assert "Словарь имён:</b> принято автоматически 456 · ждут одобрения 244" in text
+    assert "Словарь имён:</b> ждут одобрения 244 · принято автоматически 456" in text
     assert "Словарь имён" not in format_digest(_data(names={"auto_accepted": 0, "proposed": 0}))
 
 
@@ -151,3 +151,9 @@ def test_review_message_carries_the_first_batch_and_its_buttons(monkeypatch):
 
     patch_db_conn(monkeypatch, daily_digest, FakeConn(fetchall=[[]]))
     assert daily_digest.review_message() is None
+
+
+def test_names_line_shows_candidates_and_entries_in_question():
+    text = format_digest(_data(names={"candidates": 12, "new_candidates": 3, "flagged": 2,
+                                      "proposed": 0, "auto_accepted": 0}))
+    assert "Словарь имён:</b> новых имён ждут разбора 12 (+3 за сутки) · под вопросом 2" in text
