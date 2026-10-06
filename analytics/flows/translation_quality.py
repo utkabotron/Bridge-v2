@@ -30,7 +30,11 @@ from . import jev_eval, quality_stats
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-EVAL_MODEL = "gpt-4.1-mini"
+# The judge must be stronger than the translator it grades. gpt-4.1-mini judged
+# gpt-4.1-mini until 2026-10-06; scores before and after that date are not comparable.
+EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-6.1-sol")
+# $/1M tokens (input, output) — developers.openai.com/api/docs/pricing, 2026-10-06
+EVAL_PRICE = {"gpt-6.1-sol": (2.00, 10.00), "gpt-4.1-mini": (0.40, 1.60), "gpt-6-luna": (0.10, 0.50)}
 
 JEV_MODE = os.getenv("JEV_MODE", "off").strip().lower()
 # Nightly "add a rule to the prompt" suggestions are off: three months of them produced
@@ -245,6 +249,7 @@ def evaluate_translations(samples: list[dict]) -> dict:
     client = OpenAI(api_key=OPENAI_API_KEY)
     all_evals = []
     total_tokens = 0
+    tokens_in = tokens_out = 0
 
     system_prompt = """You are a translation quality evaluator for a WhatsApp→Telegram bridge.
 Evaluate each translation pair and return a JSON array with one object per sample.
@@ -280,15 +285,20 @@ Return ONLY the JSON array, no markdown fences."""
                 "target_language": s.get("target_language", "Unknown"),
             })
 
-        response = client.chat.completions.create(
-            model=EVAL_MODEL,
-            messages=[
+        request: dict = {
+            "model": EVAL_MODEL,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(pairs, ensure_ascii=False)},
             ],
-            max_tokens=4000,
-            temperature=0,
-        )
+        }
+        if EVAL_MODEL.startswith(("gpt-5", "gpt-6", "o")):
+            request["reasoning_effort"] = "low"   # a rubric, not a proof
+            request["max_completion_tokens"] = 4000
+        else:
+            request["temperature"] = 0
+            request["max_tokens"] = 4000
+        response = client.chat.completions.create(**request)
 
         content = (response.choices[0].message.content or "").strip()
         if content.startswith("```"):
@@ -297,6 +307,9 @@ Return ONLY the JSON array, no markdown fences."""
         batch_evals = json.loads(content)
         tokens = response.usage.total_tokens if response.usage else 0
         total_tokens += tokens
+        if response.usage:
+            tokens_in += response.usage.prompt_tokens or 0
+            tokens_out += response.usage.completion_tokens or 0
 
         # Attach message_event_id to each evaluation
         for ev in batch_evals:
@@ -314,8 +327,10 @@ Return ONLY the JSON array, no markdown fences."""
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
 
-    logger.info("Total evaluations: %d, tokens: %d", len(all_evals), total_tokens)
-    return {"evaluations": all_evals, "tokens_used": total_tokens}
+    price = EVAL_PRICE.get(EVAL_MODEL, (2.00, 10.00))
+    cost = (tokens_in * price[0] + tokens_out * price[1]) / 1e6
+    logger.info("Total evaluations: %d, tokens: %d, cost $%.3f (%s)", len(all_evals), total_tokens, cost, EVAL_MODEL)
+    return {"evaluations": all_evals, "tokens_used": total_tokens, "cost_usd": cost, "judge": EVAL_MODEL}
 
 
 @task(retries=1, name="fetch-pending-suggestions")
@@ -478,8 +493,8 @@ def store_quality_results(
     cur = conn.cursor()
 
     total_tokens = eval_result.get("tokens_used", 0) + suggestion_result.get("tokens_used", 0)
-    # gpt-4.1-mini: ~$0.40/1M input + $1.60/1M output, rough estimate
-    cost = total_tokens * 0.001 / 1000
+    # Judge cost is measured; the (normally disabled) suggestion call is a rough add-on.
+    cost = eval_result.get("cost_usd", 0.0) + suggestion_result.get("tokens_used", 0) * 0.001 / 1000
 
     summary = {
         "samples_evaluated": len(eval_result.get("evaluations", [])),
@@ -488,6 +503,7 @@ def store_quality_results(
         "suggestions_count": len(suggestion_result.get("suggestions", [])),
         "jev": jev_info or {"mode": "off"},
         "prompt_version": _load_prompt_from_db()[0],
+        "judge": eval_result.get("judge", EVAL_MODEL),
         "breakdown": suggestion_result.get("breakdown"),
         "worst_pair": suggestion_result.get("worst_pair"),
     }
