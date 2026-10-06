@@ -124,6 +124,16 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `analytics/flows/translation_quality.py` — nightly quality eval; `JEV_MODE` = off | shadow | primary
 - `analytics/flows/jev_eval.py` — TypeSafe Jev scoring (`typesafe-sdk`), без Prefect/DB, тесты в `analytics/tests/`
 - `analytics/flows/jev_benchmark.py` — read-only сверка Jev с LLM-оценками: `docker compose exec analytics python -m flows.jev_benchmark`
+- `analytics/flows/glossary.py` — гейты глоссария: LLM-валидатор новых записей, флаги от оценщика (3 → удаление в `glossary_removed`)
+- `analytics/flows/quality_stats.py` — разбивка оценок по source/pair/language/type/prompt_version; отчёты считают только `source='bridge'`
+- `docs/quality-loop-plan.md` — чеклист петли «аналитика → качество перевода», отмечать по факту выкатки
+
+**Глоссарий чатов:** только имена собственные. `chat_context_builder` видит ТОЛЬКО оригиналы;
+новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
+оценки за ночь и снимает записи с 3 флагами (`profile_data.glossary_removed` — строитель их
+не предлагает). После любого изменения профиля — `invalidate_profile_cache` (Redis).
+Ключ кэша переводов = sha(PROMPT_VERSION + chat_context + text). Разовая чистка:
+`docker compose exec analytics python -m flows.chat_context_builder --prune-glossaries`.
 
 **Jev:** нужен `TYPESAFE_API_KEY` в `.env`, без него любой режим = off. `shadow` пишет строки
 `translation_evaluations` с `shadow=true` — читатели таблицы ОБЯЗАНЫ фильтровать `NOT shadow`
@@ -229,6 +239,8 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 009 | chat_profiles, chat_profile_history (VPS only) |
 | 010 | daily_chat_summaries, chat_summary_schedule |
 | 011 | feature_flags |
+| 018 | translation_evaluations += evaluator, shadow, quality_expected, confidence (Jev) |
+| 019 | message_events += prompt_version, cache_hit, translation_passthrough/failed/error; translation_evaluations += source (bridge/direct/fallback), chat_pair_id, target_language, message_type, prompt_version |
 
 ## ANALYTICS FLOWS
 
