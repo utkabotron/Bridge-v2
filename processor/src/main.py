@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -27,15 +26,14 @@ from .config import (
     BRPOP_TIMEOUT, redis_kwargs,
     DLQ_RETRY_INTERVAL, DLQ_RETRY_BATCH, DLQ_MAX_ATTEMPTS, PROCESSING_QUEUE,
     DLQ_ALERT_THRESHOLD, DLQ_ALERT_COOLDOWN,
-    ADMIN_TG_IDS as _CFG_ADMIN_TG_IDS,
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
-    FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD as _CFG_FAILURE_RATE_THRESHOLD,
-    FAILURE_RATE_MIN_MSGS as _CFG_FAILURE_RATE_MIN_MSGS,
+    FAILURE_RATE_WINDOW, FAILURE_RATE_THRESHOLD, FAILURE_RATE_MIN_MSGS,
     TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
     OPENAI_BILLING_URL,
     TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
     STATS_WINDOW_DAYS, STATS_CACHE_TTL,
 )
+from .alerts import SlidingWindow, notify_admins
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
 from .media_analyzer import analyze_image, transcribe_audio, analyze_document
@@ -56,14 +54,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 async def _validate_bot_token() -> None:
     """Check that the Telegram bot token is valid on startup."""
-    from .telegram_sender import BOT_TOKEN
+    from .telegram_sender import BASE_URL, BOT_TOKEN, get_client
     if not BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN is not set")
         return
-    import httpx as _httpx
     try:
-        async with _httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+        r = await get_client().get(f"{BASE_URL}/getMe")
         if r.status_code == 200:
             data = r.json()
             logger.info("Bot token valid: @%s (id=%s)", data["result"].get("username"), data["result"].get("id"))
@@ -131,157 +127,85 @@ _counter = {"processed": 0, "failed": 0, "skipped": 0, "dlq": 0}
 # being cancelled mid-pipeline.
 _shutting_down = asyncio.Event()
 
-# ── 401 alert ────────────────────────────────────────────
-_unauth_times: deque = deque()  # timestamps of recent 401 errors
-_UNAUTH_WINDOW = UNAUTH_WINDOW
-_UNAUTH_THRESHOLD = UNAUTH_THRESHOLD
-_unauth_alert_sent = False  # send once per window
-
-ADMIN_TG_IDS = _CFG_ADMIN_TG_IDS
-
-
-async def _alert_admins_unauthorized() -> None:
-    """Send a Telegram alert to admins when repeated 401 errors are detected."""
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-    text = (
-        "🚨 <b>401 Unauthorized spike detected</b>\n\n"
-        f"≥{_UNAUTH_THRESHOLD} Telegram API 401 errors in the last 15 min.\n"
-        "Possible causes: bot removed from chats, or token invalid.\n"
-        "Check logs: <code>docker compose logs processor | grep 401</code>"
-    )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send 401 alert to admin %s: %s", admin_id, exc)
-
-
-def _track_unauth_error() -> None:
-    """Record a 401 error and trigger alert if threshold exceeded."""
-    global _unauth_alert_sent
-    now = time.monotonic()
-    _unauth_times.append(now)
-    # evict old entries outside window
-    while _unauth_times and _unauth_times[0] < now - _UNAUTH_WINDOW:
-        _unauth_times.popleft()
-    if len(_unauth_times) >= _UNAUTH_THRESHOLD and not _unauth_alert_sent:
-        _unauth_alert_sent = True
-        logger.critical("401 threshold reached (%d errors in 15 min) — alerting admins", len(_unauth_times))
-        asyncio.create_task(_alert_admins_unauthorized())
-    # reset flag after window expires (allow re-alerting next window)
-    if _unauth_alert_sent and len(_unauth_times) == 0:
-        _unauth_alert_sent = False
-
-# ── Failure rate alert ────────────────────────────────────
-_delivery_times: deque = deque()  # (monotonic_ts, is_failed) for mapped msgs
-_FAILURE_RATE_WINDOW = FAILURE_RATE_WINDOW
-_FAILURE_RATE_THRESHOLD = _CFG_FAILURE_RATE_THRESHOLD
-_FAILURE_RATE_MIN_MSGS = _CFG_FAILURE_RATE_MIN_MSGS
-_failure_rate_alert_sent = False
-
-
-async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
-    """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-    text = (
-        "\U0001F6A8 <b>High failure rate detected</b>\n\n"
-        f"Mapped failure rate: <b>{rate:.1%}</b> ({failed}/{total} messages)\n"
-        f"Threshold: {_FAILURE_RATE_THRESHOLD:.0%} over {_FAILURE_RATE_WINDOW // 60} min window.\n"
-        "Check logs: <code>docker compose logs processor --tail 100</code>"
-    )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send failure rate alert to admin %s: %s", admin_id, exc)
-
+# ── Admin alerts ─────────────────────────────────────────
+# Each tracker counts events in a sliding window and alerts once per incident (see
+# alerts.SlidingWindow); the _alert_admins_* functions only compose the text, and
+# notify_admins does the sending.
+_unauth_window = SlidingWindow(UNAUTH_WINDOW)
+_delivery_window = SlidingWindow(FAILURE_RATE_WINDOW)  # hit = a failed delivery
+# An untranslated message still counts as delivered, so the failure-rate alert never saw
+# it: on 30.09 the OpenAI balance ran out and every message went untranslated for 12h
+# without a word to the admins.
+_translation_window = SlidingWindow(TRANSLATION_FAIL_WINDOW, cooldown=TRANSLATION_ALERT_COOLDOWN)
 
 # Suppress repeat DLQ alerts: the loop runs every few minutes and a backlog clears slowly.
 _last_dlq_alert = 0.0
 
 
-async def _alert_admins_dlq(depth: int) -> None:
-    """Warn admins that dead-lettered messages are piling up."""
-    global _last_dlq_alert
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    if time.time() - _last_dlq_alert < DLQ_ALERT_COOLDOWN:
-        return
-
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
-
-    _last_dlq_alert = time.time()
-    text = (
-        "\U0001F4EC <b>Dead-letter queue is filling up</b>\n\n"
-        f"Messages waiting: <b>{depth}</b>\n"
-        "They are retried automatically; this means the retries keep failing.\n"
-        "Check: <code>docker compose logs processor --tail 100</code>"
+async def _alert_admins_unauthorized() -> None:
+    """Send a Telegram alert to admins when repeated 401 errors are detected."""
+    await notify_admins(
+        "🚨 <b>401 Unauthorized spike detected</b>\n\n"
+        f"≥{UNAUTH_THRESHOLD} Telegram API 401 errors in the last 15 min.\n"
+        "Possible causes: bot removed from chats, or token invalid.\n"
+        "Check logs: <code>docker compose logs processor | grep 401</code>"
     )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML"},
-                )
-            except Exception as exc:
-                logger.error("Failed to send DLQ alert to admin %s: %s", admin_id, exc)
+
+
+def _track_unauth_error() -> None:
+    """Record a 401 error and trigger alert if threshold exceeded."""
+    _unauth_window.record()
+    if _unauth_window.total == 1:
+        _unauth_window.rearm()  # alone in the window: a new burst, free to alert again
+    if _unauth_window.total >= UNAUTH_THRESHOLD and _unauth_window.fire():
+        logger.critical("401 threshold reached (%d errors in 15 min) — alerting admins", _unauth_window.total)
+        asyncio.create_task(_alert_admins_unauthorized())
+
+
+async def _alert_admins_failure_rate(rate: float, failed: int, total: int) -> None:
+    """Send a Telegram alert to admins when mapped failure rate exceeds threshold."""
+    await notify_admins(
+        "\U0001F6A8 <b>High failure rate detected</b>\n\n"
+        f"Mapped failure rate: <b>{rate:.1%}</b> ({failed}/{total} messages)\n"
+        f"Threshold: {FAILURE_RATE_THRESHOLD:.0%} over {FAILURE_RATE_WINDOW // 60} min window.\n"
+        "Check logs: <code>docker compose logs processor --tail 100</code>"
+    )
 
 
 def _track_delivery(failed: bool) -> None:
     """Record a mapped delivery result and alert if failure rate exceeds threshold."""
-    global _failure_rate_alert_sent
-    now = time.monotonic()
-    _delivery_times.append((now, failed))
-    # evict old entries outside window
-    while _delivery_times and _delivery_times[0][0] < now - _FAILURE_RATE_WINDOW:
-        _delivery_times.popleft()
-    total = len(_delivery_times)
-    if total < _FAILURE_RATE_MIN_MSGS:
+    _delivery_window.record(hit=failed)
+    total = _delivery_window.total
+    if total < FAILURE_RATE_MIN_MSGS:
         return
-    failed_count = sum(1 for _, f in _delivery_times if f)
+    failed_count = _delivery_window.hits
     rate = failed_count / total
-    if rate >= _FAILURE_RATE_THRESHOLD and not _failure_rate_alert_sent:
-        _failure_rate_alert_sent = True
+    if rate >= FAILURE_RATE_THRESHOLD and _delivery_window.fire():
         logger.critical(
             "Failure rate %.1f%% (%d/%d) exceeds threshold — alerting admins",
             rate * 100, failed_count, total,
         )
         asyncio.create_task(_alert_admins_failure_rate(rate, failed_count, total))
-    # reset flag when window clears (allow re-alerting next window)
-    if _failure_rate_alert_sent and failed_count == 0:
-        _failure_rate_alert_sent = False
+    # Failure-free window of enough messages: the incident is over, the next may alert.
+    if failed_count == 0:
+        _delivery_window.rearm()
 
-# ── Translation failure alert ─────────────────────────────
-# An untranslated message still counts as delivered, so the failure-rate alert never saw
-# it: on 30.09 the OpenAI balance ran out and every message went untranslated for 12h
-# without a word to the admins.
-_translation_fail_times: deque = deque()
-_last_translation_alert: float | None = None
+
+async def _alert_admins_dlq(depth: int) -> None:
+    """Warn admins that dead-lettered messages are piling up."""
+    global _last_dlq_alert
+    if time.time() - _last_dlq_alert < DLQ_ALERT_COOLDOWN:
+        return
+    sent = await notify_admins(
+        "\U0001F4EC <b>Dead-letter queue is filling up</b>\n\n"
+        f"Messages waiting: <b>{depth}</b>\n"
+        "They are retried automatically; this means the retries keep failing.\n"
+        "Check: <code>docker compose logs processor --tail 100</code>"
+    )
+    # Stamped on delivery: with alerts off, or Telegram unreachable, the next pass retries
+    # instead of staying silent for the whole cooldown.
+    if sent:
+        _last_dlq_alert = time.time()
 
 
 def _is_quota_error(error: str) -> bool:
@@ -292,13 +216,6 @@ def _is_quota_error(error: str) -> bool:
 async def _alert_admins_translation(failed: int, error: str) -> None:
     """Tell admins messages are going out untranslated, and why."""
     from html import escape
-    from .feature_flags import is_enabled
-    if not await is_enabled("admin_alerts_enabled"):
-        return
-    import httpx as _httpx
-    from .telegram_sender import BOT_TOKEN
-    if not BOT_TOKEN or not ADMIN_TG_IDS:
-        return
     if _is_quota_error(error):
         text = (
             "\U0001F4B3 <b>OpenAI credits ran out</b>\n\n"
@@ -313,35 +230,21 @@ async def _alert_admins_translation(failed: int, error: str) -> None:
             "were delivered untranslated.\n"
             f"<code>{escape(error[:300])}</code>"
         )
-    async with _httpx.AsyncClient(timeout=10) as client:
-        for admin_id in ADMIN_TG_IDS:
-            try:
-                await client.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": admin_id, "text": text, "parse_mode": "HTML",
-                          "disable_web_page_preview": True},
-                )
-            except Exception as exc:
-                logger.error("Failed to send translation alert to admin %s: %s", admin_id, exc)
+    await notify_admins(text)
 
 
 def _track_translation_failure(error: str) -> None:
     """Record an untranslated delivery and alert admins once per cooldown."""
-    global _last_translation_alert
-    now = time.monotonic()
-    _translation_fail_times.append(now)
-    while _translation_fail_times and _translation_fail_times[0] < now - TRANSLATION_FAIL_WINDOW:
-        _translation_fail_times.popleft()
-    if not _is_quota_error(error) and len(_translation_fail_times) < TRANSLATION_FAIL_THRESHOLD:
+    _translation_window.record()
+    if not _is_quota_error(error) and _translation_window.total < TRANSLATION_FAIL_THRESHOLD:
         return
-    if _last_translation_alert is not None and now - _last_translation_alert < TRANSLATION_ALERT_COOLDOWN:
+    if not _translation_window.fire():
         return
-    _last_translation_alert = now
     logger.critical(
         "Translation failing (%d in window): %s — alerting admins",
-        len(_translation_fail_times), error[:200],
+        _translation_window.total, error[:200],
     )
-    asyncio.create_task(_alert_admins_translation(len(_translation_fail_times), error))
+    asyncio.create_task(_alert_admins_translation(_translation_window.total, error))
 
 # ── SSE stream ───────────────────────────────────────────
 

@@ -685,16 +685,14 @@ async def test_translate_node_degrades_when_llm_fails():
 
 
 @pytest.fixture
-def translation_alerts():
+def translation_alerts(monkeypatch):
     """Fresh alert state, with the Telegram send replaced by a mock."""
     import processor.src.main as main
 
-    main._translation_fail_times.clear()
-    main._last_translation_alert = None
+    monkeypatch.setattr(main, "_translation_window", main.SlidingWindow(
+        main.TRANSLATION_FAIL_WINDOW, cooldown=main.TRANSLATION_ALERT_COOLDOWN))
     with patch("processor.src.main._alert_admins_translation", new=AsyncMock()) as alert:
         yield main, alert
-    main._translation_fail_times.clear()
-    main._last_translation_alert = None
 
 
 QUOTA_ERROR = ("Error code: 429 - {'error': {'message': 'You have no credits remaining.', "
