@@ -982,3 +982,73 @@ def test_format_node_keeps_a_mark_free_copy_for_in_place_edits():
     assert "✏️" in result["formatted_text"]
     assert "✏️" not in result["formatted_text_plain"]
     assert "Alice" in result["formatted_text_plain"]
+
+
+# ── Service-wide glossary ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_global_glossary_overrides_the_chat_spelling_in_the_prompt():
+    """Seven chats spelled one school four ways; the pinned rendering must reach the model."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=29, tg_chat_id=-100, target_language="Russian",
+                        original_text="מחר בגבעולים יום ספורט")
+    profile = {"glossary": {"גבעולים": {"translation": "Геваулим"}}}
+    llm = AsyncMock(return_value=MagicMock(text="Завтра в Гиволим день спорта"))
+    get_cached = AsyncMock(return_value=None)
+
+    with patch("processor.src.pipeline.glossary.global_glossary",
+               new=AsyncMock(return_value={"גבעולים": {"translation": "Гиволим"}})), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value=profile)), \
+         patch("processor.src.pipeline.nodes.get_cached", new=get_cached), \
+         patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()), \
+         patch("processor.src.feature_flags.is_enabled", new=AsyncMock(return_value=False)), \
+         patch("processor.src.pipeline.nodes.llm_chat", new=llm):
+        await translate_node(state)
+
+    system = llm.await_args.args[0][0]["content"]
+    assert "גבעולים → Гиволим" in system
+    assert "Геваулим" not in system
+    # The context is part of the cache key, so a pinned name never serves an old translation.
+    assert "Гиволим" in get_cached.await_args.kwargs["context"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_global_glossary
+async def test_global_glossary_reads_postgres_once_then_redis():
+    from processor.src.pipeline import glossary
+
+    redis = MagicMock()
+    redis.get = AsyncMock(return_value=None)
+    redis.setex = AsyncMock()
+    pool = MagicMock()
+    pool.fetch = AsyncMock(return_value=[
+        {"source": "גבעולים", "translation": "Гиволим", "note": "школа"},
+        {"source": "אופק", "translation": "Офек", "note": None},
+    ])
+    with patch("processor.src.pipeline.cache.get_redis", return_value=redis), \
+         patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        entries = await glossary.global_glossary("Russian")
+
+    assert entries == {"גבעולים": {"translation": "Гиволим", "note": "школа"},
+                       "אופק": {"translation": "Офек"}}
+    assert redis.setex.await_args.args[0] == "glossary_global:Russian"
+
+    redis.get = AsyncMock(return_value='{"x": {"translation": "y"}}')
+    pool.fetch.reset_mock()
+    with patch("processor.src.pipeline.cache.get_redis", return_value=redis), \
+         patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        assert await glossary.global_glossary("Russian") == {"x": {"translation": "y"}}
+    pool.fetch.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_global_glossary
+async def test_global_glossary_outage_falls_back_to_chat_glossaries():
+    from processor.src.pipeline import glossary
+
+    redis = MagicMock()
+    redis.get = AsyncMock(side_effect=ConnectionError("redis down"))
+    with patch("processor.src.pipeline.cache.get_redis", return_value=redis), \
+         patch("processor.src.db.get_pool", new=AsyncMock(side_effect=OSError("pg down"))):
+        assert await glossary.global_glossary("Russian") == {}

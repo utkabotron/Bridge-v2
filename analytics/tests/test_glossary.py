@@ -99,3 +99,19 @@ def test_record_dropped_removes_and_remembers():
     assert out["glossary_removed"]["כדורסל"]["reason"] == "validator: everyday word"
     assert "כדורסל" not in out["glossary_flags"]
     assert json.loads(json.dumps(out, ensure_ascii=False)) == out  # JSON-serialisable for jsonb
+
+
+def test_builder_leaves_names_pinned_service_wide_alone():
+    """glossary_global covers a name and any phrase containing it; nothing gets banned."""
+    delta = {
+        "גבעולים": {"translation": "Геваулим"},
+        "ביה״ס גבעולים": {"translation": "Бейт-сефер Гевалим"},
+        "אופק": {"translation": "Офек"},
+    }
+    assert glossary.drop_global(delta, ["גבעולים"]) == {"אופק": {"translation": "Офек"}}
+    assert glossary.drop_global(delta, []) == delta
+    assert glossary.drop_global(delta, None) == delta
+
+    prompt = build_extraction_prompt("Russian", None, ["גבעולים"])
+    assert "fixed rendering for every chat" in prompt and "גבעולים" in prompt
+    assert "for every chat" not in build_extraction_prompt("Russian", None)

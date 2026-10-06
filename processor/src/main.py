@@ -548,6 +548,62 @@ async def api_profiles():
     return result
 
 
+# ── Global Glossary API ──────────────────────────────────
+
+@app.get("/api/glossary")
+async def api_glossary():
+    """Service-wide glossary (migration 024): names pinned for every chat."""
+    from .db import get_pool
+    pool = await get_pool()
+    rows = await pool.fetch("""
+        SELECT id, source, target_language, translation, note, updated_at
+        FROM glossary_global ORDER BY target_language, source
+    """)
+    return [dict(r) for r in rows]
+
+
+class GlossaryEntry(BaseModel):
+    source: str
+    translation: str
+    note: str | None = None
+    target_language: str = TARGET_LANGUAGE
+
+
+@app.put("/api/glossary")
+async def api_glossary_upsert(body: GlossaryEntry):
+    """Add or replace the rendering of one name; applies from the next message."""
+    from .db import get_pool
+    from .pipeline import glossary
+
+    source, translation = body.source.strip(), body.translation.strip()
+    if not source or not translation:
+        return JSONResponse({"error": "source and translation are required"}, status_code=400)
+    pool = await get_pool()
+    row = await pool.fetchrow("""
+        INSERT INTO glossary_global (source, target_language, translation, note)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (source, target_language) DO UPDATE
+            SET translation = EXCLUDED.translation, note = EXCLUDED.note, updated_at = now()
+        RETURNING id, source, target_language, translation, note, updated_at
+    """, source, body.target_language, translation, (body.note or "").strip() or None)
+    await glossary.invalidate(body.target_language)
+    return dict(row)
+
+
+@app.delete("/api/glossary/{entry_id}")
+async def api_glossary_delete(entry_id: int = Path(...)):
+    from .db import get_pool
+    from .pipeline import glossary
+
+    pool = await get_pool()
+    lang = await pool.fetchval(
+        "DELETE FROM glossary_global WHERE id = $1 RETURNING target_language", entry_id)
+    if lang is None:
+        return JSONResponse({"error": "entry not found"}, status_code=404)
+    await glossary.invalidate(lang)
+    return {"deleted": entry_id}
+
+
 # ── Costs API (LangSmith) ────────────────────────────────
 
 # Fallback costs per token (USD) when LangSmith doesn't provide cost
@@ -606,6 +662,8 @@ async def translate_text(body: TranslateRequest):
         return JSONResponse({"error": "Translation is temporarily disabled"}, status_code=503)
     from .llm import chat as llm_chat
     from .pipeline.cache import get_cached, set_cached
+    from bridge_shared.chat_context import format_chat_context, with_global_glossary
+    from .pipeline import glossary
     from .pipeline.prompts import PROMPT_VERSION, get_translate_prompt
 
     text = body.text.strip()
@@ -624,8 +682,11 @@ async def translate_text(body: TranslateRequest):
     if not lang:
         lang = TARGET_LANGUAGE
 
+    # No chat here, so no chat profile — but pinned names apply in the DM too.
+    context = format_chat_context(with_global_glossary({}, await glossary.global_glossary(lang), text))
+
     # Cache check
-    cached = await get_cached(text, lang, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
+    cached = await get_cached(text, lang, context=context, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
     if cached:
         if body.user_id:
             await insert_direct_translation(body.user_id, text, cached, lang, 0, True)
@@ -634,13 +695,13 @@ async def translate_text(body: TranslateRequest):
     # LLM translation. DM is outside the bridge A/B: DIRECT_MODEL, cached under its own version.
     t0 = time.monotonic()
     messages = [
-        {"role": "system", "content": get_translate_prompt(lang)},
+        {"role": "system", "content": get_translate_prompt(lang, context)},
         {"role": "user", "content": text},
     ]
     translated = (await llm_chat(messages, model=DIRECT_MODEL, purpose="direct_translate")).text
     translation_ms = int((time.monotonic() - t0) * 1000)
 
-    await set_cached(text, lang, translated, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
+    await set_cached(text, lang, translated, context=context, version=f"{PROMPT_VERSION}@{DIRECT_MODEL}")
 
     if body.user_id:
         await insert_direct_translation(body.user_id, text, translated, lang, translation_ms, False)

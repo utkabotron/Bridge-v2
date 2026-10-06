@@ -6,6 +6,9 @@ became "кадурсаль", a club "хуг", English "англит" — and the
 ever removed an entry, and the builder learned from its own translations, so the worst
 chat sat at a third of its messages rated bad.
 
+Names that recur across chats (a school several families share) are pinned by hand in
+the service-wide glossary_global table instead; the builder leaves those alone.
+
 Two gates now:
   validate_entries   an LLM classifies each NEW entry as a named entity (kept) or an
                      everyday word (dropped) before it reaches the profile;
@@ -20,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 from datetime import date
+
+from bridge_shared.chat_context import covered_by_global
 
 from . import llm
 
@@ -120,6 +125,16 @@ def drop_removed(delta_glossary: dict, profile: dict | None) -> dict:
     """The builder may not re-add what the evaluator or the validator threw out."""
     banned = set((profile or {}).get("glossary_removed") or {})
     return {k: v for k, v in delta_glossary.items() if k not in banned}
+
+
+def drop_global(delta_glossary: dict, global_keys) -> dict:
+    """Names pinned service-wide (glossary_global) are not the builder's to guess.
+
+    Not recorded in glossary_removed: if the global entry is deleted later, the chat may
+    learn the name again.
+    """
+    keys = list(global_keys or ())
+    return {k: v for k, v in delta_glossary.items() if not covered_by_global(k, keys)}
 
 
 # ── LLM validation of entries ─────────────────────────────

@@ -76,6 +76,35 @@ def test_chat_context_tolerates_missing_parts():
     assert ctx == "\nChat context:\n- Member names:\n  Dana → Дана"
 
 
+def test_global_glossary_overrides_the_chats_guess_only_when_mentioned():
+    profile = {"tone": "warm", "glossary": {
+        "גבעולים": {"translation": "Геваулим"},
+        "ביה״ס גבעולים": {"translation": "Бейт-сефер Гевалим"},
+        "אופק": {"translation": "Офек"},
+    }}
+    global_glossary = {"גבעולים": {"translation": "Гиволим", "note": "школа"}}
+
+    merged = chat_context.with_global_glossary(profile, global_glossary, "מחר בגבעולים יום ספורט")
+    assert merged["glossary"] == {"אופק": {"translation": "Офек"},
+                                  "גבעולים": {"translation": "Гиволим", "note": "школа"}}
+    assert merged["tone"] == "warm"
+    assert profile["glossary"]["גבעולים"] == {"translation": "Геваулим"}  # caller's untouched
+
+    # Not mentioned: the profile goes through as is, so the cache key does not move.
+    assert chat_context.with_global_glossary(profile, global_glossary, "שלום") is profile
+    # No chat profile at all still gets the global entry.
+    alone = chat_context.with_global_glossary(None, global_glossary, "גבעולים")
+    assert "Гиволим" in chat_context.format_chat_context(alone)
+    assert chat_context.with_global_glossary(None, {}, "גבעולים") == {}
+
+
+def test_covered_by_global_matches_either_way():
+    assert chat_context.covered_by_global("ביה״ס גבעולים", {"גבעולים"})
+    assert chat_context.covered_by_global("גבעולים", {"ביה״ס גבעולים"})
+    assert not chat_context.covered_by_global("אופק", {"גבעולים"})
+    assert not chat_context.covered_by_global("אופק", {""})
+
+
 def test_esc_escapes_quotes_and_accepts_non_strings():
     assert telegram_html.esc('<a href="x">Tom\'s & co</a>') == (
         "&lt;a href=&quot;x&quot;&gt;Tom&#x27;s &amp; co&lt;/a&gt;")

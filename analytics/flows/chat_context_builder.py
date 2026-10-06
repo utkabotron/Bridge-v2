@@ -69,6 +69,12 @@ def collect_per_chat_data() -> list[dict]:
         """)
         pairs = [dict(r) for r in cur.fetchall()]
 
+        # Names pinned for every chat (migration 024) — the builder must not re-guess them.
+        cur.execute("SELECT source, target_language FROM glossary_global")
+        pinned: dict[str, list[str]] = {}
+        for r in cur.fetchall():
+            pinned.setdefault(r["target_language"], []).append(r["source"])
+
         result = []
         for pair in pairs:
             has_profile = pair["profile_data"] is not None
@@ -92,10 +98,12 @@ def collect_per_chat_data() -> list[dict]:
             if len(messages) < (MIN_MESSAGES_EXISTING if has_profile else MIN_MESSAGES):
                 continue
 
+            target_language = pair.get("target_language") or "Russian"
             result.append({
                 "chat_pair_id": pair["chat_pair_id"],
                 "wa_chat_id": pair["wa_chat_id"],
-                "target_language": pair.get("target_language") or "Russian",
+                "target_language": target_language,
+                "global_keys": pinned.get(target_language, []),
                 "existing_profile": pair["profile_data"],
                 "existing_version": pair.get("version") or 0,
                 "messages": messages,
@@ -105,13 +113,19 @@ def collect_per_chat_data() -> list[dict]:
     return result
 
 
-def build_extraction_prompt(target_lang: str, existing: dict | None) -> str:
+def build_extraction_prompt(target_lang: str, existing: dict | None,
+                            global_keys: list[str] | None = None) -> str:
     removed = sorted((existing or {}).get("glossary_removed") or {})
     banned_block = ""
     if removed:
         banned_block = (
             "\n- NEVER propose these glossary keys again; they were removed as everyday words "
             "or bad renderings: " + ", ".join(removed[:60])
+        )
+    if global_keys:
+        banned_block += (
+            "\n- These names already have a fixed rendering for every chat; do NOT add them "
+            "or phrases containing them to the glossary: " + ", ".join(sorted(global_keys)[:60])
         )
     return f"""You analyze WhatsApp group chat messages to build a translation context profile.
 The messages are translated from Hebrew to {target_lang}.
@@ -170,7 +184,7 @@ def extract_context_with_llm(chat_data: dict) -> dict | None:
     existing_for_prompt = {k: v for k, v in existing.items() if k not in ("glossary_removed", "glossary_flags")}
     existing_json = json.dumps(existing_for_prompt, ensure_ascii=False, indent=2) if existing_for_prompt else "null"
 
-    system_prompt = build_extraction_prompt(target_lang, existing)
+    system_prompt = build_extraction_prompt(target_lang, existing, chat_data.get("global_keys"))
 
     user_prompt = f"""Existing profile:
 {existing_json}
@@ -237,12 +251,16 @@ Recent messages:
 
 
 @task(retries=1, name="validate-delta-glossary")
-def validate_delta_glossary(result: dict, existing_profile: dict | None) -> dict:
-    """Keep only named entities out of the new glossary entries; drop what was removed before."""
+def validate_delta_glossary(result: dict, existing_profile: dict | None,
+                            global_keys: list[str] | None = None) -> dict:
+    """Keep only named entities out of the new glossary entries; drop what was removed
+    before and what is pinned service-wide."""
     logger = get_run_logger()
     proposed = result["delta"].get("glossary") or {}
+    # Pinned names are dropped silently — not banned for the chat, see drop_global.
+    proposed = glossary_rules.drop_global(proposed, global_keys)
     if not proposed:
-        return result
+        return {**result, "delta": {**result["delta"], "glossary": {}}}
 
     allowed = glossary_rules.drop_removed(proposed, existing_profile)
     banned = {k: "removed earlier" for k in proposed if k not in allowed}
@@ -457,7 +475,8 @@ def chat_context_builder():
     for chat_data in chat_data_list:
         result = extract_context_with_llm(chat_data)
         if result:
-            results.append(validate_delta_glossary(result, chat_data["existing_profile"]))
+            results.append(validate_delta_glossary(result, chat_data["existing_profile"],
+                                                   chat_data.get("global_keys")))
 
     stored = store_profiles(results) if results else 0
     if not chat_data_list:

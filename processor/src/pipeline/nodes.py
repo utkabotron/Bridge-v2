@@ -11,6 +11,7 @@ import logging
 import re
 import time
 
+from bridge_shared.chat_context import with_global_glossary
 from bridge_shared.scripts import CYRILLIC_RE, SOURCE_SCRIPT_RE, target_script_re
 
 from ..config import (
@@ -28,6 +29,7 @@ from .cache import (
     lookup_chat_pairs, invalidate_chat_pairs,
 )
 from .prompts import VARIANTS, choose_variant, get_translate_prompt, format_chat_context
+from . import glossary
 
 logger = logging.getLogger(__name__)
 
@@ -141,15 +143,16 @@ async def translate_node(state: MessageState) -> MessageState:
 
     # Load chat profile: Redis cache → PostgreSQL. Most pairs have none, so that answer is
     # cached too ({}) — None means "not cached", not "no profile".
-    chat_context = ""
+    profile: dict = {}
     if chat_pair_id:
         profile = await get_chat_profile(chat_pair_id)
         if profile is None:
             from ..db import fetch_chat_profile
             profile = await fetch_chat_profile(chat_pair_id) or {}
             await set_chat_profile(chat_pair_id, profile)
-        if profile:
-            chat_context = format_chat_context(profile)
+    # Names pinned for the whole service override the chat's own guess at them.
+    profile = with_global_glossary(profile, await glossary.global_glossary(lang), text)
+    chat_context = format_chat_context(profile) if profile else ""
 
     # Determine if this chat has a meaningful profile (glossary or member names)
     has_profile = bool(chat_context)

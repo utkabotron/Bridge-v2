@@ -7,6 +7,32 @@ measures a prompt production does not use — it used to keep a "mirror" of this
 from __future__ import annotations
 
 
+def covered_by_global(key: str, global_keys) -> bool:
+    """Whether a chat glossary key names what a service-wide entry already pins.
+
+    Either way round: a chat's "ביה״ס גבעולים" (the school X) is covered by a global
+    "גבעולים" (X), and vice versa — two renderings of one name must not reach the prompt.
+    """
+    return any(g and (g in key or key in g) for g in global_keys)
+
+
+def with_global_glossary(profile: dict | None, global_glossary: dict | None, text: str) -> dict:
+    """The chat profile plus the service-wide glossary entries this text mentions.
+
+    Global entries are curated by hand and win over the chat's own: a chat entry is the
+    builder's guess for that chat alone, and seven chats guessed four spellings of one
+    school. Only entries the text contains are added, so the prompt — and the translation
+    cache key built from it — changes only for messages that name them.
+    """
+    profile = profile or {}
+    hits = {k: v for k, v in (global_glossary or {}).items() if k and k in text}
+    if not hits:
+        return profile
+    own = profile.get("glossary") or {}
+    kept = {k: v for k, v in own.items() if not covered_by_global(k, hits)}
+    return {**profile, "glossary": {**kept, **hits}}
+
+
 def format_chat_context(profile: dict | None) -> str:
     """Group description, tone, glossary and member names as a prompt block; "" when the
     profile has none of them."""

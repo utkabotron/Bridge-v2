@@ -102,6 +102,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
 - `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
+- `processor/src/pipeline/glossary.py` — общий глоссарий: Redis → `glossary_global`, best-effort
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
 - `processor/src/media_analyzer.py` — OpenAI vision (`DIRECT_MODEL`) + `gpt-transcribe` + PyPDF
@@ -138,6 +139,12 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `analytics/flows/quality_stats.py` — разбивка оценок по source/pair/language/type/prompt_version; отчёты считают только `source='bridge'`
 - `docs/quality-loop-plan.md` — чеклист петли «аналитика → качество перевода», отмечать по факту выкатки
 
+**Общий глоссарий** (`glossary_global`, миграция 024): имена, закреплённые вручную для ВСЕХ
+чатов всех пользователей (школа, общая для нескольких семей). Перекрывает запись чата с тем же
+ключом или фразой, его содержащей (`bridge_shared.chat_context.with_global_glossary`), и попадает
+в промпт только когда ключ есть в тексте. Действует и в DM `/translate`. Строитель такие имена
+не предлагает (`glossary.drop_global`). Правка: `PUT /api/glossary`, сброс Redis — автоматически.
+
 **Глоссарий чатов:** только имена собственные. `chat_context_builder` видит ТОЛЬКО оригиналы;
 новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
 оценки за ночь и снимает записи с 3 флагами (`profile_data.glossary_removed` — строитель их
@@ -170,6 +177,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 | `translation:{lang}:{pair_id}:{sha256}` | String | 24h | Translation cache (per-pair) |
 | `translation_global:{lang}:{sha256}` | String | 24h | Translation cache (no profile) |
 | `chat_profile:{pair_id}` | String | 1h | Chat profile cache |
+| `glossary_global:{lang}` | String | 10m | Общий глоссарий (`pipeline/glossary.py`), сбрасывает `/api/glossary` |
 | `ff:{flag_name}` | String | 60s | Feature flag cache |
 
 ## PROCESSOR API
@@ -190,6 +198,9 @@ processor и bot НЕ общаются — оба независимо → Postg
 | PATCH | /api/flags/{name} | — | Toggle flag `{"enabled": bool}` |
 | GET | /api/costs?days= | — | LLM costs по дням и по назначению из `llm_usage` |
 | GET | /api/profiles | — | Chat profiles with glossaries |
+| GET | /api/glossary | — | Общий глоссарий |
+| PUT | /api/glossary | — | Upsert `{source, translation, note?, target_language?}` |
+| DELETE | /api/glossary/{id} | — | Удалить запись общего глоссария |
 | POST | /translate | translation_enabled | Text translation |
 | POST | /analyze | media_analysis_enabled | Media analysis by event_id |
 | POST | /analyze-direct | media_analysis_enabled | Media analysis (file upload) |
@@ -257,6 +268,7 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 021 | llm_usage — журнал каждого вызова модели из processor (purpose, model, tag, tokens, cost_usd, ms), 90 дней |
 | 022 | feature_flags −= direct_chat_enabled (мёртвый) |
 | 023 | users −= wa_session_id (никто не читал) |
+| 024 | glossary_global — общий глоссарий имён для всех чатов (seed: גבעולים → Гиволим) |
 
 ## ANALYTICS FLOWS
 
