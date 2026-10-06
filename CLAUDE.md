@@ -89,6 +89,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 ### Pipeline
 - `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
 - `processor/src/pipeline/graph.py` — `Pipeline`: validate → translate → format → deliver (обычный Python, стрим `{node: output}` для SSE)
+- `processor/src/alerts.py` — `notify_admins()` (единственная отправка алертов админам) + `SlidingWindow` для порогов «N за окно»
 - `processor/src/llm.py` — ЕДИНСТВЕННЫЙ способ звать OpenAI из processor: форма запроса под семейство модели, таймауты, запись стоимости в `llm_usage`
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
 - `processor/src/pipeline/prompts.py` — A/B переводчика (`VARIANTS`: версия + промпт + модель, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`; `docs/model-bakeoff-2026-10-06.md` — результаты bake-off
@@ -157,11 +158,10 @@ processor и bot НЕ общаются — оба независимо → Postg
 | `analytics:health:*` | String/Hash | 1h | Дедуп алертов + прошлые значения метрик |
 | `dedup:msg:{wa_message_id}` | String | 5m | Message dedup (SET NX) |
 | `onboarding:qr_scanned:{userId}` | Pub/Sub | — | WA connected event |
-| `chat_pairs:user:{uid}:chat:{chatId}` | String | 1h | Chat pairs cache |
+| `chat_pairs:user:{uid}:chat:{chatId}` | String | 1h / 60s если пар нет | Кэш пар — пишет processor (`pipeline/cache.py`); сбрасывает processor при паузе/миграции чата; wa-service/bot пока НЕ сбрасывают (C1 в плане) |
 | `translation:{lang}:{pair_id}:{sha256}` | String | 24h | Translation cache (per-pair) |
 | `translation_global:{lang}:{sha256}` | String | 24h | Translation cache (no profile) |
 | `chat_profile:{pair_id}` | String | 1h | Chat profile cache |
-| `bot:user_groups:{userId}` | Hash | 1h | TG groups for Mini App |
 | `ff:{flag_name}` | String | 60s | Feature flag cache |
 
 ## PROCESSOR API
@@ -172,14 +172,12 @@ processor и bot НЕ общаются — оба независимо → Postg
 | GET | /metrics | — | Counters: processed/failed/skipped/dlq |
 | GET | /events | — | SSE stream (pipeline events) |
 | GET | /dashboard | — | HTML dashboard |
-| GET | /api/config | — | Current config (no secrets) |
-| GET | /api/stats | — | User stats |
+| GET | /api/stats | — | User stats за 30 дней, кэш 60 с |
 | GET | /api/daily-stats | — | Today's counts |
 | GET | /api/reports?date= | — | Nightly problems + quality |
 | GET | /api/backlog | — | Open critical issues |
 | PATCH | /api/backlog/{id} | — | Resolve/wontfix issue |
-| GET | /api/dlq | — | DLQ messages (max 100) |
-| POST | /api/dlq/retry | — | Retry all DLQ → messages:in |
+| GET | /api/dlq | — | DLQ messages (max 100); ретрай только автоматический (`_dlq_retry_loop`) |
 | GET | /api/flags | — | Feature flags list |
 | PATCH | /api/flags/{name} | — | Toggle flag `{"enabled": bool}` |
 | GET | /api/costs?days= | — | LLM costs по дням и по назначению из `llm_usage` |
@@ -225,7 +223,6 @@ Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 |------|----------|
 | translation_enabled | POST /translate |
 | media_analysis_enabled | POST /analyze, /analyze-direct |
-| direct_chat_enabled | (reserved) |
 | admin_alerts_enabled | 401 + failure rate alerts to admins |
 | prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (сейчас gpt-6-luna на промпте v2.10), чётные/DM → A; чаты `AB_ALWAYS_B_USERS` (по умолчанию админы) — всегда B; сравнение по `prompt_version` в оценках |
 
@@ -250,6 +247,8 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 019 | message_events += prompt_version, cache_hit, translation_passthrough/failed/error; translation_evaluations += source (bridge/direct/fallback), chat_pair_id, target_language, message_type, prompt_version |
 | 020 | feature_flags += prompt_ab_enabled |
 | 021 | llm_usage — журнал каждого вызова модели из processor (purpose, model, tag, tokens, cost_usd, ms), 90 дней |
+| 022 | feature_flags −= direct_chat_enabled (мёртвый) |
+| 023 | users −= wa_session_id (никто не читал) |
 
 ## ANALYTICS FLOWS
 

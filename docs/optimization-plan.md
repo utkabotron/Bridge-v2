@@ -31,8 +31,8 @@
 
 - [ ] C1. wa-service: проверять «есть ли активный мост» ДО скачивания медиа и публикации; кэш пар в Redis (1 ч, включая отрицательный ответ), сброс кэша в роутах создания/паузы/удаления пары; сообщения без моста не публикуются вовсе. — Opus → ночь 2 → `message_events` без `skipped`-строк, MinIO не растёт на чужих фото
 - [ ] C2. Дедуп сообщения ДО скачивания медиа; проверить, что при двух наших пользователях в одной группе второй не теряет сообщение (дедуп по `wa_message_id` общий). — Sonnet → ночь 2 → тест на двух получателей
-- [ ] C3. processor: кэш пар (Redis 1 ч) вместо запроса в Postgres на каждое сообщение; убрать повторный запрос в `validate_node` и дедуп-SELECT на ветку (есть guard в upsert). — Sonnet → сейчас → на одно сообщение ≤ 1 запрос к Postgres до доставки
-- [ ] C4. Отрицательный кэш профиля чата; кэш feature-флагов в процессе на 5 с. — Haiku → сейчас
+- [x] (06.10) C3. processor: кэш пар в Redis (1 ч, пустой ответ — 60 с, пока wa-service не сбрасывает кэш); повторный запрос в `validate_node` убран; дедуп-SELECT остался только для повторно поставленных в очередь сообщений — иначе ретрай из DLQ слал бы дубль в Telegram. — Sonnet
+- [x] (06.10) C4. Отрицательный кэш профиля чата; кэш feature-флагов в процессе на 5 с. — Haiku → сейчас
 
 ## D. Очередь не блокируется одним сообщением
 
@@ -41,21 +41,21 @@
 
 ## E. Дубли
 
-- [ ] E1. Одна функция `notify_admins` в processor через `telegram_sender` вместо 4 копий; один класс скользящего окна для алертов вместо 3. — Sonnet → сейчас
+- [x] (06.10) E1. Одна функция `notify_admins` в processor через `telegram_sender` вместо 4 копий; один класс скользящего окна для алертов вместо 3. — Sonnet → сейчас
 - [ ] E2. Общий пакет `shared/` (копируется в образы processor и analytics): таблица цен моделей, `is_reasoning`, `format_chat_context`, регэкспы письменностей, `esc`, разбор `ADMIN_TG_IDS`; bake-off перестаёт держать свою копию. — Opus → сейчас → один источник на каждую вещь, тест сверяет
-- [ ] E3. analytics: один `db_conn()` вместо `psycopg2.connect` в каждой задаче; batch-вставки (`executemany`) в quality/problems/context; `daily_chat_summary` не открывает соединение на каждый чат. — Sonnet → сейчас
-- [ ] E4. `translation_quality.generate_suggestions` зовёт модель мимо `llm.complete` (упадёт на gpt-6, если включить). — Haiku → сейчас
+- [x] (06.10) E3. analytics: один `db_conn()` вместо `psycopg2.connect` в каждой задаче; batch-вставки (`executemany`) в quality/problems/context; `daily_chat_summary` не открывает соединение на каждый чат. — Sonnet → сейчас
+- [x] (06.10) E4. `translation_quality.generate_suggestions` зовёт модель мимо `llm.complete` (упадёт на gpt-6, если включить). — Haiku → сейчас
 
 ## F. Мёртвый код
 
-- [ ] F1. Выгрузка в BigQuery: flow, `google-cloud-bigquery`, env и том в compose, `.env.example`. — Sonnet → сейчас
-- [ ] F2. Флаг `direct_chat_enabled`: удалить строку (миграция), убрать из CLAUDE.md и дашборда. — Haiku → сейчас
-- [ ] F3. Эндпоинты `/api/config`, `/api/dlq/retry`; роуты wa-service `/disconnect`, `/reconnect`; функции `count_users`, `bold`, `get_history`, `split_object_url`, константа `REDIS_RETRY_LIMIT`. — Sonnet → сейчас / ночь 2 (wa-service)
+- [x] (06.10) F1. Выгрузка в BigQuery: flow, `google-cloud-bigquery`, env и том в compose, `.env.example`. — Sonnet → сейчас
+- [x] (06.10) F2. Флаг `direct_chat_enabled`: удалить строку (миграция), убрать из CLAUDE.md и дашборда. — Haiku → сейчас
+- [x] (06.10, processor+bot) F3. Эндпоинты `/api/config`, `/api/dlq/retry`; функции `count_users`, `bold`, `get_history`, `split_object_url` — удалены. Осталось в wa-service (ночь 2): роуты `/disconnect`, `/reconnect`, константа `REDIS_RETRY_LIMIT`.
 - [ ] F4. Таблица `onboarding_sessions` и её состояния: убрать записи из bot и wa-service, миграция drop. — Sonnet → ночь 2
-- [ ] F5. Колонка `users.wa_session_id`: убрать запись, миграция drop. — Haiku → сейчас
-- [ ] F6. `langdetect` → регэксп письменности (уже есть), убрать зависимость. — Haiku → сейчас
-- [ ] F7. `.env.example`: `LANGCHAIN_*`, `WA_SERVICE_PORT`, `BOT_PORT`. — Haiku → сейчас
-- [ ] F8. Дашборд: `/api/stats` — 7 подзапросов на пользователя по всей таблице каждые 15 с → кэш 60 с + окно 30 дней. — Haiku → сейчас
+- [x] (06.10) F5. Колонка `users.wa_session_id`: убрать запись, миграция drop. — Haiku → сейчас
+- [x] (06.10) F6. `langdetect` → регэксп письменности (уже есть), убрать зависимость. — Haiku → сейчас
+- [x] (06.10) F7. `.env.example`: `LANGCHAIN_*`, `WA_SERVICE_PORT`, `BOT_PORT`. — Haiku → сейчас
+- [x] (06.10) F8. Дашборд: `/api/stats` — 7 подзапросов на пользователя по всей таблице каждые 15 с → кэш 60 с + окно 30 дней. — Haiku → сейчас
 
 ## Порядок
 
