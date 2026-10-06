@@ -34,6 +34,7 @@ from .config import (
     TRANSLATION_FAIL_WINDOW, TRANSLATION_FAIL_THRESHOLD, TRANSLATION_ALERT_COOLDOWN,
     OPENAI_BILLING_URL,
     TARGET_LANGUAGE, REVOKE_NOTE, DIRECT_MODEL,
+    STATS_WINDOW_DAYS, STATS_CACHE_TTL,
 )
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
@@ -371,49 +372,82 @@ async def dashboard():
     return _dashboard_html
 
 
+# (monotonic time computed, result) — see STATS_CACHE_TTL.
+_stats_cache: tuple[float, dict] | None = None
+
+
 @app.get("/api/stats")
 async def api_stats():
-    """User stats from DB for the dashboard."""
+    """User stats from DB for the dashboard, over the last STATS_WINDOW_DAYS days."""
+    global _stats_cache
+    now = time.monotonic()
+    if _stats_cache is not None and now - _stats_cache[0] < STATS_CACHE_TTL:
+        return _stats_cache[1]
+
     from .db import get_pool
     pool = await get_pool()
+    # Each source is aggregated once and joined to users, instead of seven correlated
+    # subqueries per user that rescanned message_events every time.
     rows = await pool.fetch("""
+        with ev as (
+            select cp.user_id,
+                   count(*) filter (where me.delivery_status = 'delivered') as delivered,
+                   count(*) filter (where me.delivery_status = 'failed') as failed,
+                   round(avg(me.translation_ms)) as avg_ms,
+                   max(me.created_at) as last_msg
+            from message_events me
+            join chat_pairs cp on cp.id = me.chat_pair_id
+            where me.created_at >= now() - make_interval(days => $1)
+            group by cp.user_id
+        ),
+        di as (
+            select user_id,
+                   count(*) filter (where interaction_type = 'translation') as dir_tl,
+                   count(*) filter (where interaction_type = 'media_analysis') as dir_ma
+            from direct_interactions
+            where created_at >= now() - make_interval(days => $1)
+            group by user_id
+        ),
+        pr as (
+            select user_id, count(*) as pairs
+            from chat_pairs where status = 'active'
+            group by user_id
+        )
         select
             u.tg_username,
             u.tg_user_id,
             u.wa_connected,
             u.target_language,
-            (select count(*) from chat_pairs cp where cp.user_id = u.id and cp.status = 'active') as pairs,
-            (select count(*) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.delivery_status = 'delivered') as delivered,
-            (select count(*) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.delivery_status = 'failed') as failed,
-            (select round(avg(me.translation_ms)) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id and me.translation_ms is not null) as avg_ms,
-            (select max(me.created_at) from message_events me
-             join chat_pairs cp2 on cp2.id = me.chat_pair_id
-             where cp2.user_id = u.id) as last_msg,
-            (select count(*) from direct_interactions di
-             where di.user_id = u.id and di.interaction_type = 'translation') as dir_tl,
-            (select count(*) from direct_interactions di
-             where di.user_id = u.id and di.interaction_type = 'media_analysis') as dir_ma
+            coalesce(pr.pairs, 0) as pairs,
+            coalesce(ev.delivered, 0) as delivered,
+            coalesce(ev.failed, 0) as failed,
+            ev.avg_ms,
+            ev.last_msg,
+            coalesce(di.dir_tl, 0) as dir_tl,
+            coalesce(di.dir_ma, 0) as dir_ma
         from users u
+        left join ev on ev.user_id = u.id
+        left join di on di.user_id = u.id
+        left join pr on pr.user_id = u.id
         where u.is_active = true
         order by delivered desc
-    """)
+    """, STATS_WINDOW_DAYS)
+    # Not derived from the per-user rows: skipped events often have no pair (that is why
+    # they were skipped), so they never reach the join above.
     totals = await pool.fetchrow("""
         select
             count(*) filter (where delivery_status = 'skipped') as total_skipped,
-            round(avg(translation_ms) filter (where translation_ms is not null)) as total_avg_ms
+            round(avg(translation_ms)) as total_avg_ms
         from message_events
-    """)
-    return {
+        where created_at >= now() - make_interval(days => $1)
+    """, STATS_WINDOW_DAYS)
+    result = {
         "users": [dict(r) for r in rows],
         "total_skipped": totals["total_skipped"],
         "total_avg_ms": totals["total_avg_ms"],
     }
+    _stats_cache = (now, result)
+    return result
 
 
 @app.get("/api/daily-stats")

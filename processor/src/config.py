@@ -113,6 +113,13 @@ TRANSLATION_CACHE_TTL = int(os.getenv("TRANSLATION_CACHE_TTL", 86400))
 PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", 3600))
 MEDIA_CACHE_TTL = int(os.getenv("MEDIA_CACHE_TTL", 86400))
 
+# ── Dashboard stats ──────────────────────────────────────
+# /api/stats is polled every 15s by every open dashboard tab. Counting message_events
+# since the beginning of time per user per poll grew with the table; a bounded window plus
+# a short in-process cache keeps it flat.
+STATS_WINDOW_DAYS = int(os.getenv("STATS_WINDOW_DAYS", 30))
+STATS_CACHE_TTL = int(os.getenv("STATS_CACHE_TTL", 60))
+
 # ── Media analysis ───────────────────────────────────────
 IMAGE_ANALYSIS_TIMEOUT = int(os.getenv("IMAGE_ANALYSIS_TIMEOUT", 60))
 AUDIO_ANALYSIS_TIMEOUT = int(os.getenv("AUDIO_ANALYSIS_TIMEOUT", 120))
