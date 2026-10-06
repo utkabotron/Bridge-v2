@@ -3,6 +3,13 @@
 Samples recent translations, evaluates quality with LLM,
 and generates suggestions for prompt improvement.
 
+JEV_MODE switches in TypeSafe's Jev classifier (flows/jev_eval.py):
+  off      LLM judges a ~50-message sample (the original behaviour)
+  shadow   as off, plus Jev scores every translation; its rows are stored with
+           shadow=true (kept out of reports) and its agreement with the LLM is reported
+  primary  Jev scores every translation; the LLM only explains the worst JEV_DETAIL_TOP_N
+Any Jev failure falls back to off for that night.
+
 Deploy:
   prefect deployment build flows/translation_quality.py:translation_quality \
     --name translation-quality --cron "30 4 * * *" --apply
@@ -18,12 +25,19 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
+from . import jev_eval
 from .shared import esc, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 EVAL_MODEL = "gpt-4.1-mini"
+
+JEV_MODE = os.getenv("JEV_MODE", "off").strip().lower()
+# Yesterday's translations Jev scores at most — a safety cap, a normal day is ~40.
+JEV_MAX_PAIRS = int(os.getenv("JEV_MAX_PAIRS", 300))
+# In primary mode, how many of Jev's worst the LLM still describes in words.
+JEV_DETAIL_TOP_N = int(os.getenv("JEV_DETAIL_TOP_N", 10))
 
 def _load_prompt_from_db() -> tuple[str, str]:
     """Load current translation prompt from prompt_registry.
@@ -145,6 +159,66 @@ def sample_translations() -> list[dict]:
     return samples
 
 
+@task(retries=2, name="sample-all-translations")
+def sample_all_translations() -> list[dict]:
+    """Every translation delivered yesterday, plus direct ones — what Jev scores.
+
+    Language as the pipeline resolves it (pair, then account), not the account alone as the
+    LLM sample does — that join is what produced the phantom 'Unknown' target language.
+    """
+    logger = get_run_logger()
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT me.id, me.original_text, me.translated_text,
+               COALESCE(cp.target_language, u.target_language, 'Unknown') AS target_language
+        FROM message_events me
+        JOIN chat_pairs cp ON me.chat_pair_id = cp.id
+        JOIN users u ON cp.user_id = u.id
+        WHERE me.created_at >= current_date - interval '1 day'
+          AND me.created_at < current_date
+          AND me.delivery_status = 'delivered'
+          AND COALESCE(me.original_text, '') <> ''
+          AND COALESCE(me.translated_text, '') <> ''
+        ORDER BY me.created_at
+        LIMIT %s
+    """, (JEV_MAX_PAIRS,))
+    samples = [dict(r) for r in cur.fetchall()]
+
+    cur.execute("""
+        SELECT di.id, di.original_text, di.translated_text,
+               COALESCE(di.target_language, 'Unknown') AS target_language,
+               'direct' AS source
+        FROM direct_interactions di
+        WHERE di.created_at >= current_date - interval '1 day'
+          AND di.created_at < current_date
+          AND di.interaction_type = 'translation'
+          AND COALESCE(di.translated_text, '') <> ''
+          AND di.status = 'completed'
+        ORDER BY di.created_at
+        LIMIT %s
+    """, (max(JEV_MAX_PAIRS - len(samples), 0),))
+    samples.extend(dict(r) for r in cur.fetchall())
+
+    cur.close()
+    conn.close()
+    logger.info("Collected %d translations for Jev", len(samples))
+    return samples
+
+
+@task(retries=0, name="jev-score-translations")
+def jev_score(samples: list[dict]) -> dict:
+    """Score every translation with Jev. Raises jev_eval.JevUnavailable when it cannot."""
+    logger = get_run_logger()
+    result = jev_eval.evaluate_samples(samples, log=logger)
+    logger.info(
+        "Jev scored %d/%d translations (%d failed, %d tokens)",
+        len(result["evaluations"]), len(samples), result["failed"], result["tokens_used"],
+    )
+    return result
+
+
 @task(retries=1, name="evaluate-translations")
 def evaluate_translations(samples: list[dict]) -> dict:
     """Evaluate translation quality in batches of 10."""
@@ -220,6 +294,8 @@ Return ONLY the JSON array, no markdown fences."""
                 ev["original_text"] = batch[idx]["original_text"]
                 ev["translated_text"] = batch[idx]["translated_text"]
                 ev["target_language"] = batch[idx].get("target_language", "Unknown")
+                ev["sample_key"] = jev_eval.sample_key(batch[idx])
+                ev["evaluator"] = "llm"
 
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
@@ -357,7 +433,12 @@ Worst translation examples (original → translated):
 
 
 @task(retries=2, name="store-quality-results")
-def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
+def store_quality_results(
+    eval_result: dict,
+    suggestion_result: dict,
+    shadow_evaluations: list[dict] | None = None,
+    jev_info: dict | None = None,
+) -> int:
     """Store evaluations and suggestions in DB."""
     logger = get_run_logger()
     conn = psycopg2.connect(DB_URL)
@@ -372,6 +453,7 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
         "avg_scores": suggestion_result.get("avg_scores", {}),
         "issue_counts": suggestion_result.get("issue_counts", {}),
         "suggestions_count": len(suggestion_result.get("suggestions", [])),
+        "jev": jev_info or {"mode": "off"},
     }
 
     cur.execute(
@@ -392,14 +474,17 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
     cur.execute("DELETE FROM translation_evaluations WHERE run_id = %s", (run_id,))
     cur.execute("DELETE FROM prompt_suggestions WHERE run_id = %s", (run_id,))
 
-    # Store individual evaluations
-    for ev in eval_result.get("evaluations", []):
+    # Store individual evaluations; shadow rows are Jev's comparison data, kept out of reports
+    rows = [(ev, False) for ev in eval_result.get("evaluations", [])]
+    rows += [(ev, True) for ev in shadow_evaluations or []]
+    for ev, shadow in rows:
         cur.execute(
             """
             INSERT INTO translation_evaluations
                 (run_id, message_event_id, original_text, translated_text,
-                 quality_score, accuracy_score, naturalness_score, issues_found)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 quality_score, accuracy_score, naturalness_score, issues_found,
+                 evaluator, shadow, quality_expected, confidence)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 run_id,
@@ -410,6 +495,10 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
                 ev.get("accuracy_score"),
                 ev.get("naturalness_score"),
                 json.dumps(ev.get("issues", [])),
+                ev.get("evaluator", "llm"),
+                shadow,
+                ev.get("quality_expected"),
+                ev.get("confidence"),
             ),
         )
 
@@ -437,16 +526,17 @@ def store_quality_results(eval_result: dict, suggestion_result: dict) -> int:
     conn.close()
 
     logger.info(
-        "Stored run_id=%d: %d evaluations, %d suggestions",
+        "Stored run_id=%d: %d evaluations (+%d shadow), %d suggestions",
         run_id,
         len(eval_result.get("evaluations", [])),
+        len(shadow_evaluations or []),
         len(suggestion_result.get("suggestions", [])),
     )
     return run_id
 
 
 @task(retries=1, name="notify-quality-report")
-def notify_quality_report(suggestion_result: dict) -> int:
+def notify_quality_report(suggestion_result: dict, jev_info: dict | None = None) -> int:
     """Send translation quality report and prompt suggestions to admins."""
     logger = get_run_logger()
 
@@ -514,6 +604,10 @@ def notify_quality_report(suggestion_result: dict) -> int:
     if pending_count > 0:
         lines.append(f"⏳ <b>Pending suggestions: {pending_count}</b> — review in DB\n")
 
+    jev_line = _jev_report_line(jev_info or {})
+    if jev_line:
+        lines.append(jev_line)
+
     text = "\n".join(lines)
     sent = notify_telegram(text)
 
@@ -521,19 +615,110 @@ def notify_quality_report(suggestion_result: dict) -> int:
     return sent
 
 
+def _jev_report_line(jev_info: dict) -> str:
+    """One line in the admin report on what Jev did tonight."""
+    if jev_info.get("fallback"):
+        return f"⚠️ <b>Jev unavailable</b> — LLM only tonight: <code>{esc(jev_info['fallback'])}</code>"
+    if jev_info.get("mode") == "primary":
+        return (
+            f"🤖 Jev scored {jev_info.get('evaluated', 0)} translations "
+            f"({jev_info.get('failed', 0)} failed); LLM explained the worst {jev_info.get('detailed', 0)}."
+        )
+    agreement = jev_info.get("agreement") or {}
+    if jev_info.get("mode") == "shadow" and agreement.get("n"):
+        def pct(v):
+            return "—" if v is None else f"{v:.0%}"
+        return (
+            f"🔬 <b>Jev vs LLM</b> on {agreement['n']} translations: "
+            f"MAE {agreement['mae']}, within ±1 {pct(agreement['within_1'])}, "
+            f"bad recall {pct(agreement['bad_recall'])} / precision {pct(agreement['bad_precision'])} "
+            f"(Jev scored {jev_info.get('evaluated', 0)})"
+        )
+    return ""
+
+
+def _resolve_jev_mode(logger) -> str:
+    if JEV_MODE not in ("off", "shadow", "primary"):
+        logger.warning("Unknown JEV_MODE=%r — treating as off", JEV_MODE)
+        return "off"
+    if JEV_MODE != "off" and not jev_eval.TYPESAFE_API_KEY:
+        logger.warning("JEV_MODE=%s but TYPESAFE_API_KEY is not set — LLM only", JEV_MODE)
+        return "off"
+    return JEV_MODE
+
+
+def _merge_detailed(jev_evals: list[dict], llm_evals: list[dict]) -> list[dict]:
+    """Jev's scores for everything, with the LLM's written verdict where it gave one."""
+    llm_by_key = {ev["sample_key"]: ev for ev in llm_evals if ev.get("sample_key")}
+    return [llm_by_key.get(ev["sample_key"], ev) for ev in jev_evals]
+
+
 @flow(name="translation-quality", log_prints=True)
 def translation_quality():
     """Nightly translation quality: sample → evaluate → suggest → store → notify."""
-    samples = sample_translations()
-    eval_result = evaluate_translations(samples)
+    logger = get_run_logger()
+    mode = _resolve_jev_mode(logger)
+    jev_info: dict = {"mode": mode}
+    eval_result = None
+    shadow_evaluations: list[dict] = []
+    samples: list[dict] = []
+
+    if mode == "primary":
+        try:
+            samples = sample_all_translations()
+            scored = jev_score(samples)
+        except Exception as exc:
+            logger.warning("Jev unavailable (%s) — falling back to the LLM sample", exc)
+            jev_info.update(mode="off", fallback=str(exc)[:200])
+        else:
+            by_key = {jev_eval.sample_key(s): s for s in samples}
+            worst = jev_eval.pick_worst(scored["evaluations"], JEV_DETAIL_TOP_N)
+            detailed = {"evaluations": [], "tokens_used": 0}
+            if worst:
+                try:
+                    detailed = evaluate_translations([by_key[ev["sample_key"]] for ev in worst])
+                except Exception as exc:
+                    # Jev's scores for the whole night are still worth keeping without the prose.
+                    logger.warning("LLM detail pass failed (%s) — storing Jev scores alone", exc)
+            eval_result = {
+                "evaluations": _merge_detailed(scored["evaluations"], detailed["evaluations"]),
+                "tokens_used": detailed["tokens_used"],
+            }
+            jev_info.update(
+                evaluated=len(scored["evaluations"]),
+                failed=scored["failed"],
+                detailed=len(detailed["evaluations"]),
+            )
+
+    if eval_result is None:
+        samples = sample_translations()
+        eval_result = evaluate_translations(samples)
+
+    if mode == "shadow":
+        try:
+            scored = jev_score(sample_all_translations())
+        except Exception as exc:
+            logger.warning("Jev shadow run failed (%s) — report is LLM only", exc)
+            jev_info["fallback"] = str(exc)[:200]
+        else:
+            shadow_evaluations = scored["evaluations"]
+            jev_info.update(
+                evaluated=len(shadow_evaluations),
+                failed=scored["failed"],
+                agreement=jev_eval.agreement(eval_result.get("evaluations", []), shadow_evaluations),
+            )
+            logger.info("Jev vs LLM agreement: %s", jev_info["agreement"])
+
     pending = fetch_pending_suggestions()
     suggestion_result = generate_suggestions(eval_result.get("evaluations", []), pending)
-    run_id = store_quality_results(eval_result, suggestion_result)
-    notified = notify_quality_report(suggestion_result)
+    run_id = store_quality_results(eval_result, suggestion_result, shadow_evaluations, jev_info)
+    notified = notify_quality_report(suggestion_result, jev_info)
     return {
         "run_id": run_id,
+        "jev_mode": jev_info["mode"],
         "samples": len(samples),
         "evaluations": len(eval_result.get("evaluations", [])),
+        "shadow_evaluations": len(shadow_evaluations),
         "suggestions": len(suggestion_result.get("suggestions", [])),
         "admins_notified": notified,
     }

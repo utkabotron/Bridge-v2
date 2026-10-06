@@ -7,4 +7,6 @@ python-dotenv>=1.0.0
 sqlalchemy>=2.0.0
 httpx>=0.27.0
 openai>=1.68.0
+# Jev classifier for translation_quality (JEV_MODE); dormant without TYPESAFE_API_KEY
+typesafe-sdk>=0.7.2
 ruff>=0.4.0

@@ -1,5 +1,5 @@
 ---
-description: Run all unit tests (wa-service Jest + processor pytest + bot pytest)
+description: Run all unit tests (wa-service Jest + processor/bot/analytics pytest)
 model: haiku
 ---
 
@@ -24,7 +24,12 @@ Run all tests across all services and report results.
    cd bot && python3 -m pytest tests/ -v 2>&1
    ```
 
-4. Report summary:
+4. Run analytics pytest (Jev tests skip themselves when `typesafe-sdk` is not installed):
+   ```
+   cd analytics && python3 -m pytest tests/ -v 2>&1
+   ```
+
+5. Report summary:
    - Total passed / failed per service
    - If any failures: show the failing test names and error messages
    - If all pass: confirm "All tests passed ✓"

@@ -243,6 +243,9 @@ services:
       # collided ~100 times a day with "database is locked".
       - PREFECT_API_DATABASE_CONNECTION_URL=${PREFECT_API_DATABASE_CONNECTION_URL:-postgresql+asyncpg://bridge:bridge@postgres:5432/prefect}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Jev for translation_quality: off | shadow | primary (see analytics/flows/translation_quality.py)
+      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
+      - JEV_MODE=${JEV_MODE:-off}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
       - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-sa.json

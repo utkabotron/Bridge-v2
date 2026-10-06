@@ -38,6 +38,7 @@ test:
 	cd wa-service && npm test
 	cd processor && python3 -m pytest tests/ -v
 	cd bot && python3 -m pytest tests/ -v
+	cd analytics && python3 -m pytest tests/ -v
 
 lint:
 	cd processor && ruff check src/

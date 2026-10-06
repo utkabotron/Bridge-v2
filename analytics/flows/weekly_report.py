@@ -94,6 +94,7 @@ def collect_weekly_data() -> dict:
         FROM translation_evaluations te
         JOIN nightly_analysis_runs nar ON nar.id = te.run_id
         WHERE nar.run_date >= %s AND nar.run_date < %s
+          AND NOT te.shadow
         GROUP BY nar.run_date
         ORDER BY nar.run_date
     """, (four_weeks_ago, today))

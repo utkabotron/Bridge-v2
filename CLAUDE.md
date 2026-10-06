@@ -121,6 +121,13 @@ processor и bot НЕ общаются — оба независимо → Postg
 ### Analytics
 - `analytics/flows/` — 8 Prefect flows (local server mode, no Cloud)
 - `analytics/flows/chat_context_builder.py` — daily glossary/members/tone → chat_profiles (VPS only)
+- `analytics/flows/translation_quality.py` — nightly quality eval; `JEV_MODE` = off | shadow | primary
+- `analytics/flows/jev_eval.py` — TypeSafe Jev scoring (`typesafe-sdk`), без Prefect/DB, тесты в `analytics/tests/`
+- `analytics/flows/jev_benchmark.py` — read-only сверка Jev с LLM-оценками: `docker compose exec analytics python -m flows.jev_benchmark`
+
+**Jev:** нужен `TYPESAFE_API_KEY` в `.env`, без него любой режим = off. `shadow` пишет строки
+`translation_evaluations` с `shadow=true` — читатели таблицы ОБЯЗАНЫ фильтровать `NOT shadow`
+(миграция 018). Любой сбой Jev → откат на LLM-выборку на эту ночь.
 
 ## REDIS KEYS
 

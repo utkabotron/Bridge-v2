@@ -512,7 +512,7 @@ async def api_reports(date: str = Query(default="")):
     if quality_run:
         quality["summary"] = json.loads(quality_run["summary"]) if quality_run["summary"] else None
         eval_count = await pool.fetchval("""
-            SELECT count(*) FROM translation_evaluations WHERE run_id = $1
+            SELECT count(*) FROM translation_evaluations WHERE run_id = $1 AND NOT shadow
         """, quality_run["id"])
         quality["evaluations_count"] = eval_count
         sug_rows = await pool.fetch("""
