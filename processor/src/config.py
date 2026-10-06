@@ -12,6 +12,10 @@ REDIS_DB = int(os.getenv("REDIS_DB", 0))
 # line must leave the queue reachable rather than lock every client out.
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 BRPOP_TIMEOUT = int(os.getenv("BRPOP_TIMEOUT", 5))
+# Workers pulling from messages:in. One worker meant a slow OpenAI or Telegram reply (up to
+# minutes with retries) held every chat of every user; chats are independent, so several
+# run side by side while messages of one chat still go one at a time, in order.
+CONSUMER_WORKERS = int(os.getenv("CONSUMER_WORKERS", 4))
 # MUST stay strictly greater than BRPOP_TIMEOUT. redis-py 8.x applies socket_timeout to
 # blocking commands too, so an equal (or unset — it then defaults to something shorter than
 # the server-side block) value makes every idle brpop die with "Timeout reading from redis"
@@ -44,7 +48,9 @@ DB_COMMAND_TIMEOUT = int(os.getenv("DB_COMMAND_TIMEOUT", 10))
 # ── Telegram ─────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_SEND_TIMEOUT = int(os.getenv("TELEGRAM_SEND_TIMEOUT", 30))
-MAX_RETRY_AFTER = int(os.getenv("MAX_RETRY_AFTER", 60))
+# Longest Telegram retry_after we honour before giving up on this attempt: a worker stuck
+# for a minute on one chat is a minute lost for that chat, not for the others any more.
+MAX_RETRY_AFTER = int(os.getenv("MAX_RETRY_AFTER", 20))
 TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 
 # ── Alerting ─────────────────────────────────────────────
@@ -94,7 +100,7 @@ PROCESSING_QUEUE = os.getenv("PROCESSING_QUEUE", "messages:processing")
 # The consumer processes one message at a time, so a slow LLM call is head-of-line
 # blocking for every user. Fail fast and deliver the original instead.
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", 30))
-LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", 2))
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", 1))  # 2 attempts x LLM_TIMEOUT worst case
 TRANSLATION_UNAVAILABLE_NOTE = os.getenv(
     "TRANSLATION_UNAVAILABLE_NOTE", "⚠️ Перевод временно недоступен",
 )

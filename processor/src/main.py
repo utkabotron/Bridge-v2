@@ -23,7 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import (
-    BRPOP_TIMEOUT, redis_kwargs,
+    BRPOP_TIMEOUT, CONSUMER_WORKERS, redis_kwargs,
     DLQ_RETRY_INTERVAL, DLQ_RETRY_BATCH, DLQ_MAX_ATTEMPTS, PROCESSING_QUEUE,
     DLQ_ALERT_THRESHOLD, DLQ_ALERT_COOLDOWN,
     UNAUTH_WINDOW, UNAUTH_THRESHOLD,
@@ -1154,16 +1154,21 @@ async def _requeue_inflight(r) -> None:
         logger.error("Failed to recover in-flight messages: %s", exc)
 
 
-async def consume_loop():
-    r = aioredis.Redis(**redis_kwargs())
+# One lock per chat. Messages of a chat are processed one at a time in queue order, so an
+# edit or a reply never overtakes the message it refers to; different chats run in parallel.
+_chat_locks: dict[str, asyncio.Lock] = {}
 
-    # Anything left in the in-flight list belongs to a previous process that died between
-    # taking a message and finishing it (OOM kill, SIGKILL past the stop grace period).
-    # BRPOP alone deleted the message the instant it was read, so those were simply lost.
-    await _requeue_inflight(r)
 
-    logger.info("Consumer loop started — waiting for messages:in")
+def _chat_lock(raw: str) -> asyncio.Lock:
+    try:
+        payload = json.loads(raw)
+        key = f"{payload.get('user_id')}:{payload.get('wa_chat_id')}"
+    except (ValueError, AttributeError):
+        key = raw[:64]  # unparseable: still one lock per item, _process_message DLQs it
+    return _chat_locks.setdefault(key, asyncio.Lock())
 
+
+async def _consume_worker(r, n: int) -> None:
     while not _shutting_down.is_set():
         raw = None
         try:
@@ -1172,14 +1177,17 @@ async def consume_loop():
             raw = await r.blmove("messages:in", PROCESSING_QUEUE, BRPOP_TIMEOUT, "RIGHT", "LEFT")
             if raw is None:
                 continue  # timeout — loop again
-            # Shield so a shutdown cancel can't interrupt a message we've already popped
-            # from Redis — it finishes (or DLQs) before the loop exits.
-            await asyncio.shield(_process_message(r, raw))
+            # No await between the pop and the lock: two workers that popped two messages
+            # of one chat reach the lock in pop order, so the chat's order is kept.
+            async with _chat_lock(raw):
+                # Shield so a shutdown cancel can't interrupt a message we've already popped
+                # from Redis — it finishes (or DLQs) before the loop exits.
+                await asyncio.shield(_process_message(r, raw))
             await r.lrem(PROCESSING_QUEUE, 1, raw)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error("Consumer loop error: %s", exc)
+            logger.error("Consumer worker %d error: %s", n, exc)
             # Backstop: if we popped a message but blew up outside _process_message's own
             # handling, DLQ the raw item rather than lose it.
             if raw is not None:
@@ -1190,10 +1198,29 @@ async def consume_loop():
                     pass
             await asyncio.sleep(1)
 
+
+async def consume_loop():
+    r = aioredis.Redis(**redis_kwargs())
+
+    # Anything left in the in-flight list belongs to a previous process that died between
+    # taking a message and finishing it (OOM kill, SIGKILL past the stop grace period).
+    # BRPOP alone deleted the message the instant it was read, so those were simply lost.
+    await _requeue_inflight(r)
+
+    logger.info("Consumer loop started — %d workers waiting for messages:in", CONSUMER_WORKERS)
+
+    # Each worker blocks on its own BLMOVE (its own pooled connection); a slow chat holds
+    # one worker, the rest keep serving every other chat.
+    workers = [asyncio.create_task(_consume_worker(r, n)) for n in range(CONSUMER_WORKERS)]
     try:
-        await r.aclose()
-    except Exception:
-        pass
+        await asyncio.gather(*workers)
+    finally:
+        for w in workers:
+            w.cancel()
+        try:
+            await r.aclose()
+        except Exception:
+            pass
     logger.info("Consumer loop stopped (graceful)")
 
 
