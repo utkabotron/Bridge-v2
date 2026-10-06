@@ -90,7 +90,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `processor/src/main.py` — FastAPI + consume_loop + все API endpoints
 - `processor/src/pipeline/graph.py` — LangGraph StateGraph
 - `processor/src/pipeline/nodes.py` — validate/translate/format/deliver
-- `processor/src/pipeline/prompts.py` — prompt + PROMPT_VERSION + register_prompt()
+- `processor/src/pipeline/prompts.py` — prompt A/B (`SYSTEM_TRANSLATE`/`_B`, `choose_variant`), `register_prompt()` пишет смену версии в `analytics_changelog`
 - `processor/src/pipeline/cache.py` — Redis translation/profile/media cache
 - `processor/src/pipeline/events.py` — in-memory event bus (asyncio.Queue)
 - `processor/src/telegram_sender.py` — raw httpx → Telegram API (sendMessage/Photo/Video/Audio/Document)
@@ -132,7 +132,9 @@ processor и bot НЕ общаются — оба независимо → Postg
 новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
 оценки за ночь и снимает записи с 3 флагами (`profile_data.glossary_removed` — строитель их
 не предлагает). После любого изменения профиля — `invalidate_profile_cache` (Redis).
-Ключ кэша переводов = sha(PROMPT_VERSION + chat_context + text). Разовая чистка:
+Ключ кэша переводов = sha(prompt_version + chat_context + text), версия — та, что выбрал A/B.
+Ночные «добавьте правило в промпт» выключены (`PROMPT_SUGGESTIONS_ENABLED=false`); промпт
+меняется только через A/B → `/weekly-improve` (продвижение B → A описано в скилле). Разовая чистка:
 `docker compose exec analytics python -m flows.chat_context_builder --prune-glossaries`.
 
 **Jev:** нужен `TYPESAFE_API_KEY` в `.env`, без него любой режим = off. `shadow` пишет строки
@@ -221,6 +223,7 @@ Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 | media_analysis_enabled | POST /analyze, /analyze-direct |
 | direct_chat_enabled | (reserved) |
 | admin_alerts_enabled | 401 + failure rate alerts to admins |
+| prompt_ab_enabled | A/B промпта: нечётные пары → `SYSTEM_TRANSLATE_B` (v3.0), чётные/DM → A; сравнение по `prompt_version` в оценках |
 
 ## DATABASE
 

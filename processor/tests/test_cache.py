@@ -33,6 +33,12 @@ def test_cache_key_changes_with_prompt_version(monkeypatch):
     assert cache._global_cache_key("hello", "Russian") != global_before
 
 
+def test_ab_variants_never_share_a_cache_entry():
+    from processor.src.pipeline.cache import _cache_key, _global_cache_key
+    assert _cache_key("hello", "Russian", 29, version="v2.10") != _cache_key("hello", "Russian", 29, version="v3.0")
+    assert _global_cache_key("hello", "Russian", "v2.10") != _global_cache_key("hello", "Russian", "v3.0")
+
+
 def test_cache_key_no_pair_uses_zero():
     from processor.src.pipeline.cache import _cache_key
     key = _cache_key("hello", "Russian")

@@ -180,6 +180,8 @@ services:
       - TRANSLATION_CACHE_TTL=${TRANSLATION_CACHE_TTL:-86400}
       - ADMIN_TG_IDS=${ADMIN_TG_IDS}
       - ADMIN_NO_PAIR_FALLBACK=${ADMIN_NO_PAIR_FALLBACK:-false}
+      # Fallback for the prompt A/B flag when Redis and DB are both unreachable: stay on A.
+      - PROMPT_AB_ENABLED=false
       # Media reads are signed now that the bucket is private (src/s3.py).
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}

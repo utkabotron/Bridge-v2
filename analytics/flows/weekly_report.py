@@ -330,7 +330,10 @@ You receive:
 - The current translation prompt
 - ALL pending prompt improvement suggestions from daily flows
 - Open issues from the persistent backlog
-- Recent analytics changelog (model switches, config changes)
+- Recent analytics changelog (model switches, config changes, prompt versions going live)
+- Your previous prompt draft. Nightly prompt suggestions are no longer generated: prompt
+  changes are tested as A/B (flag prompt_ab_enabled: odd chat pairs get variant B) and
+  judged by quality_by_prompt_version_4w. Recommend promote / keep testing / drop.
 - Your previous 4 weekly insights (for continuity and recommendation tracking)
 
 Return a single JSON object with these exact sections:
@@ -415,6 +418,13 @@ Rules:
                 context_parts.append(f"Recommendations: {json.dumps(insight['recommendations'], default=str)}")
             if insight.get("analytics_meta"):
                 context_parts.append(f"Analytics meta: {json.dumps(insight['analytics_meta'], default=str)}")
+        last_draft = previous_insights[0].get("prompt_draft")
+        if last_draft:
+            context_parts.append(
+                "\n=== YOUR PREVIOUS PROMPT DRAFT (deployed only if the changelog says so; "
+                "if it is running as A/B variant B, judge it by quality_by_prompt_version_4w) ===\n"
+                + str(last_draft)
+            )
     else:
         context_parts.append("\n=== NO PREVIOUS WEEKLY INSIGHTS (first run) ===")
 

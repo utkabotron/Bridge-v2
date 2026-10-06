@@ -40,45 +40,48 @@ def get_redis() -> aioredis.Redis:
     return _client
 
 
-def _cache_key(text: str, language: str, chat_pair_id: int | None = None, context: str = "") -> str:
-    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00{context}\x00{text}".encode()).hexdigest()
+def _cache_key(text: str, language: str, chat_pair_id: int | None = None, context: str = "",
+               version: str | None = None) -> str:
+    version = version or PROMPT_VERSION
+    digest = hashlib.sha256(f"{version}\x00{context}\x00{text}".encode()).hexdigest()
     pair_id = chat_pair_id or 0
     return f"translation:{language}:{pair_id}:{digest}"
 
 
 async def get_cached(text: str, language: str, chat_pair_id: int | None = None,
-                     context: str = "") -> Optional[str]:
+                     context: str = "", version: str | None = None) -> Optional[str]:
     try:
-        return await get_redis().get(_cache_key(text, language, chat_pair_id, context))
+        return await get_redis().get(_cache_key(text, language, chat_pair_id, context, version))
     except Exception:
         return None
 
 
 async def set_cached(text: str, language: str, translation: str, chat_pair_id: int | None = None,
-                     context: str = "") -> None:
+                     context: str = "", version: str | None = None) -> None:
     try:
-        await get_redis().setex(_cache_key(text, language, chat_pair_id, context), CACHE_TTL, translation)
+        await get_redis().setex(_cache_key(text, language, chat_pair_id, context, version), CACHE_TTL, translation)
     except Exception:
         pass  # cache is best-effort
 
 
-def _global_cache_key(text: str, language: str) -> str:
-    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00{text}".encode()).hexdigest()
+def _global_cache_key(text: str, language: str, version: str | None = None) -> str:
+    version = version or PROMPT_VERSION
+    digest = hashlib.sha256(f"{version}\x00{text}".encode()).hexdigest()
     return f"translation_global:{language}:{digest}"
 
 
-async def get_cached_global(text: str, language: str) -> Optional[str]:
+async def get_cached_global(text: str, language: str, version: str | None = None) -> Optional[str]:
     """Get cached translation without pair context (for chats with no profile)."""
     try:
-        return await get_redis().get(_global_cache_key(text, language))
+        return await get_redis().get(_global_cache_key(text, language, version))
     except Exception:
         return None
 
 
-async def set_cached_global(text: str, language: str, translation: str) -> None:
+async def set_cached_global(text: str, language: str, translation: str, version: str | None = None) -> None:
     """Cache translation without pair context."""
     try:
-        await get_redis().setex(_global_cache_key(text, language), CACHE_TTL, translation)
+        await get_redis().setex(_global_cache_key(text, language, version), CACHE_TTL, translation)
     except Exception:
         pass  # cache is best-effort
 

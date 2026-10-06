@@ -295,6 +295,12 @@ def format_digest(data: dict) -> str:
                 qline += f" {esc(name[:24])}"
             qline += f" ({worst['bad']} из {worst['n']})"
         lines.append(qline)
+        versions = [r for r in ((q.get("breakdown") or {}).get("by_prompt_version") or []) if r.get("key")]
+        if len(versions) >= 2:
+            lines.append("<b>A/B:</b> " + " vs ".join(
+                f"{esc(str(r['key']))} {r['quality']} (n={r['n']}, плохих {r['bad_pct'] or 0}%)"
+                for r in sorted(versions, key=lambda r: str(r["key"]))
+            ))
         jev = q.get("jev") or {}
         if jev.get("fallback"):
             attention.append("Jev недоступен, оценка только LLM")

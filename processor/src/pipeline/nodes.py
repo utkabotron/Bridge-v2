@@ -27,7 +27,7 @@ from ..config import (
 from ..models.message import MessageState
 from ..utils.telegram_format import bold, esc
 from .cache import get_cached, set_cached, get_cached_global, set_cached_global, get_chat_profile, set_chat_profile
-from .prompts import PROMPT_VERSION, get_translate_prompt, format_chat_context
+from .prompts import PROMPT_VERSION, VARIANTS, choose_variant, get_translate_prompt, format_chat_context
 
 logger = logging.getLogger(__name__)
 
@@ -178,27 +178,38 @@ async def translate_node(state: MessageState) -> MessageState:
     # Determine if this chat has a meaningful profile (glossary or member names)
     has_profile = bool(chat_context)
 
+    # A/B: odd pairs get variant B while the flag is on. The version travels with the
+    # message (cache key, LangSmith tag, message_events.prompt_version) so the nightly
+    # evaluation can compare the two.
+    from ..feature_flags import is_enabled
+    variant = choose_variant(chat_pair_id, await is_enabled("prompt_ab_enabled"))
+    version = VARIANTS[variant][0]
+
     # Cache lookup: pair-specific first; for chats without profile also check global cache
-    cached = await get_cached(text, lang, chat_pair_id, context=chat_context)
+    cached = await get_cached(text, lang, chat_pair_id, context=chat_context, version=version)
     if cached:
         logger.debug("Translation cache HIT (pair-specific)")
-        return {**state, "translated_text": cached, "translation_ms": 0, "cache_hit": True}
+        return {**state, "translated_text": cached, "translation_ms": 0, "cache_hit": True,
+                "prompt_version": version}
 
     if not has_profile:
-        cached_global = await get_cached_global(text, lang)
+        cached_global = await get_cached_global(text, lang, version=version)
         if cached_global:
             logger.debug("Translation cache HIT (global)")
-            await set_cached(text, lang, cached_global, chat_pair_id, context=chat_context)  # populate pair cache too
-            return {**state, "translated_text": cached_global, "translation_ms": 0, "cache_hit": True}
+            await set_cached(text, lang, cached_global, chat_pair_id, context=chat_context,
+                             version=version)  # populate pair cache too
+            return {**state, "translated_text": cached_global, "translation_ms": 0, "cache_hit": True,
+                    "prompt_version": version}
 
     # LLM call — traced by LangSmith automatically
     t0 = time.monotonic()
     messages = [
-        SystemMessage(content=get_translate_prompt(lang, chat_context)),
+        SystemMessage(content=get_translate_prompt(lang, chat_context, variant)),
         HumanMessage(content=text),
     ]
+    llm_config = {"tags": [f"prompt-{version}", f"variant-{variant}"]}
     try:
-        response = await get_llm().ainvoke(messages)
+        response = await get_llm().ainvoke(messages, config=llm_config)
     except Exception as exc:
         # An OpenAI outage used to raise here, escape the graph and send the message to a
         # dead-letter queue nobody drained — so the whole bridge went quiet and stayed
@@ -213,6 +224,7 @@ async def translate_node(state: MessageState) -> MessageState:
             "cache_hit": False,
             "translation_failed": True,
             "translation_error": str(exc)[:500],
+            "prompt_version": version,
         }
 
     translated = response.content.strip()
@@ -232,7 +244,7 @@ async def translate_node(state: MessageState) -> MessageState:
             )),
         ]
         try:
-            retried = (await get_llm().ainvoke(retry_messages)).content.strip()
+            retried = (await get_llm().ainvoke(retry_messages, config=llm_config)).content.strip()
         except Exception as exc:
             logger.error("Passthrough retry failed (%s) — keeping first result", exc)
             retried = ""
@@ -255,9 +267,9 @@ async def translate_node(state: MessageState) -> MessageState:
             len(text), len(translated), lang,
         )
     if not (is_degenerate or passthrough):
-        await set_cached(text, lang, translated, chat_pair_id, context=chat_context)
+        await set_cached(text, lang, translated, chat_pair_id, context=chat_context, version=version)
         if not has_profile:
-            await set_cached_global(text, lang, translated)
+            await set_cached_global(text, lang, translated, version=version)
 
     return {
         **state,
@@ -265,6 +277,7 @@ async def translate_node(state: MessageState) -> MessageState:
         "translation_ms": translation_ms,
         "cache_hit": False,
         "translation_passthrough": passthrough,
+        "prompt_version": version,
     }
 
 

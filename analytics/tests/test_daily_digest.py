@@ -89,6 +89,19 @@ def test_problems_surface_under_attention():
         assert expected in text, expected
 
 
+def test_ab_line_appears_only_when_two_prompt_versions_were_evaluated():
+    q = _data()["quality"]
+    q["breakdown"]["by_prompt_version"] = [
+        {"key": "v3.0", "n": 14, "quality": 4.71, "bad_pct": 7.1},
+        {"key": "v2.10", "n": 15, "quality": 4.53, "bad_pct": 13.3},
+    ]
+    text = format_digest(_data(quality=q))
+    assert "<b>A/B:</b> v2.10 4.53 (n=15, плохих 13.3%) vs v3.0 4.71 (n=14, плохих 7.1%)" in text
+
+    q["breakdown"]["by_prompt_version"] = [{"key": "v2.10", "n": 29, "quality": 4.6, "bad_pct": 12.0}]
+    assert "A/B" not in format_digest(_data(quality=q))
+
+
 def test_missing_quality_run_is_itself_a_warning():
     text = format_digest(_data(quality=None))
     assert "<b>Качество:</b> ночная оценка не отработала" in text

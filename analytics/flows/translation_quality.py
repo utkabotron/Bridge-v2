@@ -33,6 +33,10 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 EVAL_MODEL = "gpt-4.1-mini"
 
 JEV_MODE = os.getenv("JEV_MODE", "off").strip().lower()
+# Nightly "add a rule to the prompt" suggestions are off: three months of them produced
+# 84 "applied" rows and no measurable change (v2.6 4.59 → v2.9 4.54). Prompt changes now
+# go through the A/B flag and the weekly report; the aggregation below still runs.
+PROMPT_SUGGESTIONS_ENABLED = os.getenv("PROMPT_SUGGESTIONS_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 # Yesterday's translations Jev scores at most — a safety cap, a normal day is ~40.
 JEV_MAX_PAIRS = int(os.getenv("JEV_MAX_PAIRS", 300))
 # In primary mode, how many of Jev's worst the LLM still describes in words.
@@ -381,6 +385,18 @@ def generate_suggestions(evaluations: list[dict], pending_suggestions: list[dict
             "quality_score": ev.get("quality_score"),
             "issue_types": issue_types,
         })
+
+    if not PROMPT_SUGGESTIONS_ENABLED:
+        logger.info("Prompt suggestions disabled — stored scores and breakdown only")
+        return {
+            "suggestions": [],
+            "tokens_used": 0,
+            "avg_scores": avg_scores,
+            "issue_counts": issue_counts,
+            "worst_examples": worst_examples,
+            "breakdown": breakdown,
+            "worst_pair": quality_stats.worst_pair(breakdown),
+        }
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 

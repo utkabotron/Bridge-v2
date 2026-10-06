@@ -46,6 +46,8 @@ class MessageState(TypedDict):
     translation_error: Optional[str]
     # The model echoed the source and one corrective retry did not fix it.
     translation_passthrough: bool
+    # Which prompt (A/B variant) produced translated_text.
+    prompt_version: Optional[str]
 
     # Set by format node
     formatted_text: Optional[str]

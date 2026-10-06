@@ -239,7 +239,7 @@ async def insert_message_event(state: dict[str, Any], return_id: bool = False) -
             state.get("delivery_status", "pending"),
             state.get("error"),
             state.get("tg_message_id"),
-            PROMPT_VERSION if translated else None,
+            (state.get("prompt_version") or PROMPT_VERSION) if translated else None,
             state.get("cache_hit") if translated else None,
             bool(state.get("translation_passthrough")),
             bool(state.get("translation_failed")),

@@ -173,6 +173,40 @@ async def test_translate_node_llm_call():
     assert result["translation_ms"] >= 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_on,pair,expected_version,expected_marker", [
+    (True, 29, "v3.0", "Compound nouns"),
+    (True, 12, "v2.10", "e) Formatting"),
+    (False, 29, "v2.10", "e) Formatting"),
+])
+async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_on, pair, expected_version, expected_marker):
+    """Odd pairs get variant B while the flag is on; the version rides along for the evaluation."""
+    from processor.src.pipeline.nodes import translate_node
+
+    state = _base_state(chat_pair_id=pair, tg_chat_id=-100, target_language="Russian")
+    mock_response = MagicMock()
+    mock_response.content = "Привет, как дела?"
+
+    with patch("processor.src.feature_flags.is_enabled", new=AsyncMock(return_value=flag_on)), \
+         patch("processor.src.pipeline.nodes.get_cached", new=AsyncMock(return_value=None)) as get_cached, \
+         patch("processor.src.pipeline.nodes.get_cached_global", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.set_cached", new=AsyncMock()) as set_cached, \
+         patch("processor.src.pipeline.nodes.set_cached_global", new=AsyncMock()), \
+         patch("processor.src.pipeline.nodes.get_chat_profile", new=AsyncMock(return_value={})), \
+         patch("processor.src.db.fetch_chat_profile", new=AsyncMock(return_value=None)), \
+         patch("processor.src.pipeline.nodes.get_llm") as mock_llm:
+        mock_llm.return_value.ainvoke = AsyncMock(return_value=mock_response)
+        result = await translate_node(state)
+
+    assert result["prompt_version"] == expected_version
+    system_prompt = mock_llm.return_value.ainvoke.await_args.args[0][0].content
+    assert expected_marker in system_prompt
+    assert f"prompt-{expected_version}" in mock_llm.return_value.ainvoke.await_args.kwargs["config"]["tags"]
+    # The cache is partitioned by version, so A and B never serve each other's translations.
+    assert get_cached.await_args.kwargs["version"] == expected_version
+    assert set_cached.await_args.kwargs["version"] == expected_version
+
+
 def test_looks_untranslated_detects_echo_but_not_real_translation():
     """The passthrough guard flags echoed source, not legitimate translations."""
     from processor.src.pipeline.nodes import _looks_untranslated

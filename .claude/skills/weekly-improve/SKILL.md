@@ -11,13 +11,28 @@ description: Читает последний Weekly Intelligence Report из Б�
 ### 1. Читаем последний weekly report из production DB
 
 ```bash
-ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T postgres psql -U bridge -d bridge -c \"SELECT week_start, executive_summary, deep_analysis::text, recommendations::text FROM weekly_insights ORDER BY week_start DESC LIMIT 2;\""
+ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T postgres psql -U bridge -d bridge -c \"SELECT week_start, executive_summary, deep_analysis::text, recommendations::text, prompt_draft FROM weekly_insights ORDER BY week_start DESC LIMIT 2;\""
+```
+
+И состояние A/B промпта (флаг + оценки по версиям за 4 недели, только чаты моста):
+
+```bash
+ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T postgres psql -U bridge -d bridge -c \"SELECT name, enabled FROM feature_flags WHERE name='prompt_ab_enabled'; SELECT key, version FROM prompt_registry; SELECT te.prompt_version, count(*) n, round(avg(quality_score),2) q, round(100.0*avg((quality_score<=3)::int),1) bad_pct FROM translation_evaluations te JOIN nightly_analysis_runs nar ON nar.id=te.run_id WHERE nar.run_date >= current_date-28 AND te.source='bridge' AND NOT te.shadow GROUP BY 1;\""
 ```
 
 Выводим пользователю:
 - `week_start` и `executive_summary` последнего отчёта
 - Таблицу рекомендаций: **priority | area | action | metric_to_track**
 - Тренд качества: последние 2 записи `deep_analysis.translation_quality.avg_scores`
+- A/B: версии A и B, n и bad_pct по каждой; при n ≥ 30 на вариант и B лучше на ≥ 0.15
+  балла или на ≥ 3 п.п. bad_pct — предложить продвинуть B; иначе — продолжать или снять
+- Если `prompt_draft` нового отчёта отличается от текущего B в `prompt_registry` — показать
+  diff и предложить сделать его новым вариантом B (`SYSTEM_TRANSLATE_B` + `PROMPT_VERSION_B`)
+
+**Продвижение B → A** (только по решению пользователя): текст B копируется в
+`SYSTEM_TRANSLATE`, `PROMPT_VERSION` = версия B, флаг `prompt_ab_enabled` выключается
+(`PATCH /api/flags/prompt_ab_enabled {"enabled": false}`). Смена версии попадает в
+`analytics_changelog` сама при старте processor.
 
 ### 2. Классифицируем рекомендации
 
@@ -56,6 +71,7 @@ ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T 
 cd wa-service && npx jest --forceExit 2>&1
 cd processor && python3 -m pytest tests/ -v 2>&1
 cd bot && python3 -m pytest tests/ -v 2>&1
+cd analytics && python3 -m pytest tests/ -v 2>&1
 ```
 
 Если тесты падают — исправить до коммита. НЕ деплоить с упавшими тестами.
@@ -70,6 +86,15 @@ git commit -m "feat: apply weekly report recommendations $(date +%Y-%m-%d)"
 ### 6. Деплой
 
 Вызвать `/deploy` с именами изменённых сервисов. Обычно: `processor bot analytics`.
+
+### 6b. Записать обратно, что сделано
+
+Следующий недельный отчёт читает `analytics_changelog` — без этой записи o3 гадает,
+внедрены ли его рекомендации. Одна строка на запуск скилла, по пунктам:
+
+```bash
+ssh bridge "docker compose -f /home/deploy/bridge-v2/docker-compose.yml exec -T postgres psql -U bridge -d bridge -c \"INSERT INTO analytics_changelog (change_type, description, impact_notes) VALUES ('weekly_improve', '<сделано: пункт; пункт>', '<отложено/отклонено и почему; операционные — кому передано>');\""
+```
 
 ### 7. Составляем changelog для пользователей
 
