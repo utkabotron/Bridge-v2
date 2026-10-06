@@ -441,20 +441,18 @@ def daily_chat_summary():
     chats_data = collect_chat_messages(chats_due)
 
     results: list[dict] = []
-    try:
-        for chat_data in chats_data:
-            # Generate summary
-            summary = generate_summary_with_llm(chat_data)
-            if not summary:
-                continue
+    for chat_data in chats_data:
+        # Generate summary
+        summary = generate_summary_with_llm(chat_data)
+        if not summary:
+            continue
 
-            # Send to TG group
-            results.append(send_summary_to_chat(summary))
-    finally:
-        # Stored once at the end, but in a finally: if chat N blows up, the summaries already
-        # sent to chats 1..N-1 are still recorded, and a re-run in the same slot skips them
-        # (find_chats_due_now excludes sent=true) instead of sending them twice.
-        store_summaries(results)
+        # Send, then record at once. A deferred write would let a hard kill (the container
+        # has a memory limit) forget a summary that already reached the group, and the next
+        # half-hour slot would send it again. A connection per sent summary is a few a day.
+        result = send_summary_to_chat(summary)
+        store_summaries([result])
+        results.append(result)
 
     processed = len(results)
     sent_count = sum(1 for r in results if r.get("sent"))

@@ -588,6 +588,8 @@ def translation_quality():
             eval_result = {
                 "evaluations": _merge_detailed(scored["evaluations"], detailed["evaluations"]),
                 "tokens_used": detailed["tokens_used"],
+                "cost_usd": detailed.get("cost_usd", 0.0),
+                "judge": detailed.get("judge", EVAL_MODEL),
             }
             jev_info.update(
                 evaluated=len(scored["evaluations"]),
