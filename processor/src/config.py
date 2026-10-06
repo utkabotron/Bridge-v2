@@ -45,6 +45,9 @@ TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 
 # ── Alerting ─────────────────────────────────────────────
 ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+# Users whose chats always get A/B variant B while the flag is on — the admin dogfoods the
+# candidate in every chat instead of half of them. Defaults to the admins.
+AB_ALWAYS_B_USERS = [int(x) for x in os.getenv("AB_ALWAYS_B_USERS", "").split(",") if x.strip()] or ADMIN_TG_IDS
 UNAUTH_WINDOW = int(os.getenv("UNAUTH_WINDOW", 900))
 UNAUTH_THRESHOLD = int(os.getenv("UNAUTH_THRESHOLD", 3))
 FAILURE_RATE_WINDOW = int(os.getenv("FAILURE_RATE_WINDOW", 900))

@@ -55,6 +55,14 @@ def test_variant_b_only_for_odd_pairs_while_the_flag_is_on():
     assert choose_variant(0, True) == "A"
 
 
+def test_admins_get_variant_b_in_every_chat():
+    """The admin wants the candidate in all their chats, not the odd half."""
+    assert choose_variant(12, True, user_id=191440421, always_b_users=[191440421]) == "B"
+    assert choose_variant(12, True, user_id=41097563, always_b_users=[191440421]) == "A"
+    assert choose_variant(12, False, user_id=191440421, always_b_users=[191440421]) == "A"  # flag off: nobody
+    assert choose_variant(None, True, user_id=191440421, always_b_users=[191440421]) == "A"  # DM still A
+
+
 def test_variant_b_changes_exactly_one_thing():
     """Right now B is the same prompt on another model, so the test measures the model."""
     from processor.src.pipeline.prompts import VARIANTS, SYSTEM_TRANSLATE_B

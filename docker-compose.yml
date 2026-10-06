@@ -182,6 +182,8 @@ services:
       - ADMIN_NO_PAIR_FALLBACK=${ADMIN_NO_PAIR_FALLBACK:-false}
       # Fallback for the prompt A/B flag when Redis and DB are both unreachable: stay on A.
       - PROMPT_AB_ENABLED=false
+      # Users whose chats always get variant B (default: ADMIN_TG_IDS)
+      - AB_ALWAYS_B_USERS=${AB_ALWAYS_B_USERS:-}
       # Media reads are signed now that the bucket is private (src/s3.py).
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
       - S3_PUBLIC_URL=${S3_PUBLIC_URL:-http://83.217.222.126:9000}

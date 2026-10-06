@@ -223,7 +223,7 @@ Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 | media_analysis_enabled | POST /analyze, /analyze-direct |
 | direct_chat_enabled | (reserved) |
 | admin_alerts_enabled | 401 + failure rate alerts to admins |
-| prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (сейчас gpt-6-luna на промпте v2.10), чётные/DM → A; сравнение по `prompt_version` в оценках |
+| prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (сейчас gpt-6-luna на промпте v2.10), чётные/DM → A; чаты `AB_ALWAYS_B_USERS` (по умолчанию админы) — всегда B; сравнение по `prompt_version` в оценках |
 
 ## DATABASE
 

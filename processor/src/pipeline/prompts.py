@@ -74,12 +74,16 @@ VARIANTS: dict[str, dict] = {
 }
 
 
-def choose_variant(chat_pair_id: int | None, ab_enabled: bool) -> str:
+def choose_variant(chat_pair_id: int | None, ab_enabled: bool, user_id: int | None = None,
+                   always_b_users: tuple[int, ...] | list[int] = ()) -> str:
     """Deterministic per chat: a pair keeps one prompt for the whole test, so its glossary,
-    cache and evaluations line up. DM translations and unpaired chats always get A."""
-    if ab_enabled and chat_pair_id and chat_pair_id % 2 == 1:
+    cache and evaluations line up. DM translations and unpaired chats always get A.
+    Users in always_b_users (the admins) get B in every chat — they dogfood the candidate."""
+    if not ab_enabled or not chat_pair_id:
+        return "A"
+    if user_id is not None and user_id in always_b_users:
         return "B"
-    return "A"
+    return "B" if chat_pair_id % 2 == 1 else "A"
 
 
 def format_chat_context(profile: dict) -> str:

@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import (
+    AB_ALWAYS_B_USERS,
     LLM_TIMEOUT, LLM_MAX_RETRIES, TRANSLATION_UNAVAILABLE_NOTE,
     VOICE_AUTO_TRANSCRIBE, VOICE_TRANSCRIPT_TITLE,
     MEDIA_FAILED_NOTE, EDITED_MARK, OWN_MESSAGE_PREFIX,
@@ -191,7 +192,8 @@ async def translate_node(state: MessageState) -> MessageState:
     # message (cache key, LangSmith tag, message_events.prompt_version) so the nightly
     # evaluation can compare the two.
     from ..feature_flags import is_enabled
-    variant = choose_variant(chat_pair_id, await is_enabled("prompt_ab_enabled"))
+    variant = choose_variant(chat_pair_id, await is_enabled("prompt_ab_enabled"),
+                             user_id=state.get("user_id"), always_b_users=AB_ALWAYS_B_USERS)
     version = VARIANTS[variant]["version"]
 
     # Cache lookup: pair-specific first; for chats without profile also check global cache
