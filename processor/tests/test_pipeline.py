@@ -1074,3 +1074,14 @@ async def test_glossary_outage_keeps_what_was_loaded(fresh_glossary):
 async def test_glossary_never_loaded_means_chat_glossaries_only(fresh_glossary):
     with patch("processor.src.db.get_pool", new=AsyncMock(side_effect=OSError("pg down"))):
         assert await fresh_glossary.lookup("Russian", "גבעולים") == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_glossary
+async def test_people_entries_say_they_are_names(fresh_glossary):
+    """עמוס is Amos and "busy": the hint must tell the translator which one it is about."""
+    pool = _glossary_pool(rows=[{"source": "עמוס", "target_language": "Russian",
+                                 "translation": "Амос", "note": None, "kind": "person"}])
+    with patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        hits = await fresh_glossary.lookup("Russian", "אני עמוס היום")
+    assert hits["עמוס"]["note"] == fresh_glossary.PERSON_NOTE

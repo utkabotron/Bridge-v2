@@ -31,8 +31,15 @@ _by_language: dict[str, GlossaryIndex] = {}
 _overrides: dict[tuple[int, str], GlossaryIndex] = {}
 
 
+# Many Israeli first names are everyday words too (עמוס "busy", קשת "rainbow", ישראל the
+# country). People's entries carry no note of their own — relations stay in chat profiles —
+# so they get this one, or "I'm busy" comes back as "I'm Amos".
+PERSON_NOTE = "имя человека — только если слово здесь означает имя"
+
+
 def _entry(row) -> dict:
-    return {"translation": row["translation"], **({"note": row["note"]} if row["note"] else {})}
+    note = row["note"] or (PERSON_NOTE if row.get("kind") == "person" else None)
+    return {"translation": row["translation"], **({"note": note} if note else {})}
 
 
 async def _refresh() -> None:
@@ -57,7 +64,7 @@ async def _refresh() -> None:
             if signature == _signature:
                 return
             rows = await pool.fetch(
-                "SELECT source, target_language, translation, note FROM glossary "
+                "SELECT source, target_language, translation, note, kind FROM glossary "
                 "WHERE status = ANY($1::text[]) AND translation IS NOT NULL",
                 list(USED_STATUSES),
             )
