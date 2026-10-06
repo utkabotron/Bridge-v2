@@ -26,6 +26,7 @@ from telegram.ext import (  # noqa: E402
 
 from .handlers.admin import cmd_broadcast, cmd_users, cmd_whitelist  # noqa: E402
 from .handlers.analyze import cb_analyze_media, cb_noop  # noqa: E402
+from .handlers.glossary import GLOSSARY_EDIT_REPLY, cb_glossary, handle_glossary_edit  # noqa: E402
 from .handlers.translate import cb_translate_lang, handle_direct_media, handle_direct_text  # noqa: E402
 from .handlers.chats import cb_chat_action, cb_link_chat, cmd_add, cmd_chats  # noqa: E402
 from .handlers.groups import cb_cmd_add, handle_group_message, handle_my_chat_member  # noqa: E402
@@ -93,6 +94,13 @@ def main() -> None:
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    # Glossary review under the morning digest. The ✏️ reply handler must come before the
+    # DM translator below, which would otherwise translate the admin's answer.
+    app.add_handler(CallbackQueryHandler(cb_glossary, pattern=r"^gl:(ok|ed|no|more):"))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE & GLOSSARY_EDIT_REPLY,
+        handle_glossary_edit,
+    ))
 
     # ── Direct translation (private chat text) ─────────────
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_direct_text))

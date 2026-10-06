@@ -123,7 +123,8 @@ def test_resolve_writes_decisions_and_the_dry_run_writes_nothing():
     giv = next(u for u in updates if u[-1] == 1)
     assert giv[:6] == ("Гиволим", "org", "школа в Рамат-Гане", "Givolim · https://givolim.example", 0.9, "proposed")
     dana = next(u for u in updates if u[-1] == 2)
-    assert dana[1:3] == ("person", None) and dana[5] == "verified" and dana[7] is True
+    assert dana[1:3] == ("person", None) and dana[5] == "verified" and dana[7] is dana[8] is True
+    assert giv[7] is giv[8] is False                     # proposed: nobody decided yet
 
 
 def test_a_failed_answer_leaves_the_name_a_candidate():

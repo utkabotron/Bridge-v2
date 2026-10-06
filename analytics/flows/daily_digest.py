@@ -19,6 +19,7 @@ import shutil
 from datetime import date, datetime
 
 import httpx
+from bridge_shared import glossary_review
 from prefect import flow, get_run_logger, task
 
 from .shared import db_conn, esc, notify_telegram, redis_client
@@ -134,6 +135,15 @@ def collect_digest() -> dict:
             added += sum(int(m) for m in _ADDED_RE.findall(s))
             removed += sum(int(m) for m in _REMOVED_RE.findall(s))
         data["glossary"] = {"added": added, "removed": removed}
+
+        # The service glossary of names: what the resolver settled by itself, what waits
+        cur.execute("""
+            SELECT count(*) FILTER (WHERE decided_by = 'auto' AND status = 'verified'
+                                    AND decided_at >= current_date - interval '1 day') AS auto_accepted,
+                   count(*) FILTER (WHERE status = 'proposed') AS proposed
+            FROM glossary
+        """)
+        data["names"] = dict(cur.fetchone())
 
         # Users: who is connected, how many bridges, what went through for them yesterday
         cur.execute("""
@@ -301,6 +311,10 @@ def format_digest(data: dict) -> str:
     g = data.get("glossary") or {}
     if g.get("added") or g.get("removed"):
         lines.append(f"<b>Глоссарий:</b> +{g.get('added', 0)} · снято {g.get('removed', 0)}")
+    names = data.get("names") or {}
+    if names.get("auto_accepted") or names.get("proposed"):
+        lines.append(f"<b>Словарь имён:</b> принято автоматически {names.get('auto_accepted') or 0}"
+                     f" · ждут одобрения {names.get('proposed') or 0}")
 
     # Users
     users = data.get("users") or []
@@ -357,13 +371,41 @@ def send_digest(text: str) -> int:
     return notify_telegram(text, timeout=15)
 
 
+def review_message() -> tuple[str, dict] | None:
+    """The first batch of proposed names with ✅ / ✏️ / ❌ buttons; None when nothing waits."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT {glossary_review.REVIEW_COLUMNS} FROM glossary
+            WHERE status = 'proposed' ORDER BY chats_seen DESC, id LIMIT %s
+        """, (glossary_review.BATCH,))
+        rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            return None
+        cur.execute("SELECT count(*) AS n FROM glossary WHERE status = 'proposed'")
+        total = cur.fetchone()["n"]
+    text, keyboard = glossary_review.build(rows, total - len(rows))
+    markup = {"inline_keyboard": [[{"text": label, "callback_data": data} for label, data in row]
+                                  for row in keyboard]}
+    return text, markup
+
+
+@task(retries=1, name="send-name-review")
+def send_name_review() -> int:
+    message = review_message()
+    if message is None:
+        return 0
+    return notify_telegram(message[0], timeout=15, reply_markup=message[1])
+
+
 @flow(name="daily-digest", log_prints=True)
 def daily_digest():
-    """Collect → format → one Telegram message to the admins."""
+    """Collect → format → one Telegram message to the admins, then the names to review."""
     data = collect_digest()
     text = format_digest(data)
     sent = send_digest(text)
-    return {"sent": sent, "chars": len(text)}
+    review = send_name_review()
+    return {"sent": sent, "chars": len(text), "name_review": review}
 
 
 if __name__ == "__main__":
@@ -373,5 +415,9 @@ if __name__ == "__main__":
 
         globals()["get_run_logger"] = lambda: logging.getLogger("digest")
         print(format_digest(collect_digest.fn()))
+        review = review_message()
+        if review:
+            print("\n" + review[0] + "\n" + "\n".join(" ".join(b["text"] for b in row)
+                                                      for row in review[1]["inline_keyboard"]))
     else:
         daily_digest()

@@ -127,3 +127,27 @@ def test_services_down_are_marked_not_crashed():
 def test_russian_plurals():
     assert [_plural(n, "пара", "пары", "пар") for n in (1, 2, 5, 11, 21, 22)] == \
         ["пара", "пары", "пар", "пар", "пара", "пары"]
+
+
+def test_names_line_shows_auto_accepted_and_waiting():
+    text = format_digest(_data(names={"auto_accepted": 456, "proposed": 244}))
+    assert "Словарь имён:</b> принято автоматически 456 · ждут одобрения 244" in text
+    assert "Словарь имён" not in format_digest(_data(names={"auto_accepted": 0, "proposed": 0}))
+
+
+def test_review_message_carries_the_first_batch_and_its_buttons(monkeypatch):
+    from fake_db import FakeConn, patch_db_conn
+
+    from flows import daily_digest
+
+    rows = [{"id": 1, "source": "שגיא", "translation": "Саги", "kind": "person", "status": "proposed",
+             "evidence": None, "chat_renderings": {"Шаги": 2, "Саги": 1}, "also_word": False}]
+    patch_db_conn(monkeypatch, daily_digest, FakeConn(fetchone=[{"n": 31}], fetchall=[rows]))
+    text, markup = daily_digest.review_message()
+    assert "<b>שגיא</b> → Саги" in text
+    buttons = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+    assert buttons == ["gl:ok:1", "gl:ed:1", "gl:no:1", "gl:more:1"]
+    assert markup["inline_keyboard"][-1][0]["text"] == "Следующие → (ещё 30)"
+
+    patch_db_conn(monkeypatch, daily_digest, FakeConn(fetchall=[[]]))
+    assert daily_digest.review_message() is None

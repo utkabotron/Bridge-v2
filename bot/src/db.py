@@ -1,6 +1,7 @@
 """Database helpers for the bot service."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Optional
@@ -303,3 +304,68 @@ async def delete_tg_group(tg_chat_id: int) -> None:
     """Forget a group entirely — the bot is no longer in it."""
     pool = await get_pool()
     await pool.execute("delete from public.tg_groups where tg_chat_id = $1", tg_chat_id)
+
+
+# ── Glossary review (✅ / ✏️ / ❌ under the morning digest) ─────
+
+def _review_row(row) -> dict:
+    d = dict(row)
+    if isinstance(d.get("chat_renderings"), str):
+        d["chat_renderings"] = json.loads(d["chat_renderings"] or "{}")
+    return d
+
+
+async def glossary_rows(ids: list[int]) -> list[dict]:
+    """The entries of a review message, in the message's order, whatever their status now."""
+    from bridge_shared.glossary_review import REVIEW_COLUMNS
+    if not ids:
+        return []
+    pool = await get_pool()
+    rows = await pool.fetch(
+        f"select {REVIEW_COLUMNS} from public.glossary where id = any($1::int[])", ids)
+    by_id = {r["id"]: _review_row(r) for r in rows}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+async def glossary_next_batch(exclude: list[int], limit: int) -> tuple[list[dict], int]:
+    """(next proposed entries not in `exclude`, how many proposed remain after them)."""
+    from bridge_shared.glossary_review import REVIEW_COLUMNS
+    pool = await get_pool()
+    rows = await pool.fetch(
+        f"""
+        select {REVIEW_COLUMNS} from public.glossary
+        where status = 'proposed' and not (id = any($1::int[]))
+        order by chats_seen desc, id limit $2
+        """,
+        exclude, limit,
+    )
+    total = await pool.fetchval(
+        "select count(*) from public.glossary where status = 'proposed' and not (id = any($1::int[]))",
+        exclude,
+    )
+    return [_review_row(r) for r in rows], max(0, total - len(rows))
+
+
+async def glossary_proposed_count(exclude: list[int]) -> int:
+    pool = await get_pool()
+    return await pool.fetchval(
+        "select count(*) from public.glossary where status = 'proposed' and not (id = any($1::int[]))",
+        exclude,
+    )
+
+
+async def glossary_decide(entry_id: int, status: str, translation: str | None = None) -> Optional[dict]:
+    """An admin's decision on a proposed entry. None when it is no longer proposed (another
+    admin got there first). updated_at moves, so the processor reloads within a minute."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        """
+        update public.glossary
+        set status = $2, translation = coalesce($3, translation),
+            decided_by = 'admin', decided_at = now(), updated_at = now()
+        where id = $1 and status = 'proposed'
+        returning id, source, translation, status, also_word
+        """,
+        entry_id, status, translation,
+    )
+    return dict(row) if row else None

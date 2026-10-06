@@ -51,7 +51,7 @@ def db_conn(cursor_factory=psycopg2.extras.RealDictCursor):
         conn.close()
 
 
-def notify_telegram(text: str, timeout: int = 10) -> int:
+def notify_telegram(text: str, timeout: int = 10, reply_markup: dict | None = None) -> int:
     """Send an HTML message to all admin Telegram chats. Returns count of successful sends."""
     logger = get_run_logger()
 
@@ -67,7 +67,8 @@ def notify_telegram(text: str, timeout: int = 10) -> int:
         try:
             resp = httpx.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                      **({"reply_markup": reply_markup} if reply_markup else {})},
                 timeout=timeout,
             )
             resp.raise_for_status()

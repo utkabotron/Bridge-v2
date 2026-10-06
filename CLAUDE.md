@@ -88,6 +88,7 @@ processor и bot НЕ общаются — оба независимо → Postg
   - `scripts.py` — регэкспы письменностей (`HEBREW_RE`, `SOURCE_SCRIPT_RE`, `CYRILLIC_RE`, `LATIN_RE`, `TARGET_SCRIPT_RE`)
   - `chat_context.py` — `format_chat_context` (единственная версия), `with_glossary`
   - `glossary_match.py` — `GlossaryIndex`, `key_of`, `words`, `covers`: поиск имён в иврите по словам
+  - `glossary_review.py` — текст и кнопки сообщения «Имена на одобрение» (шлёт analytics, перестраивает бот)
   - `telegram_html.py` — `esc`; `env.py` — `parse_ids`, `admin_tg_ids`
   - `processor/tests/test_shared.py` — страж: падает, если копия цен/регэкспов/`format_chat_context`/`esc` появится в сервисе
 
@@ -128,6 +129,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 - `bot/src/handlers/analyze.py` — "Analyze" button callback
 - `bot/src/handlers/chats.py` — /chats, /add, /pause, /resume, /done
 - `bot/src/handlers/admin.py` — /users, /broadcast, /whitelist
+- `bot/src/handlers/glossary.py` — кнопки ✅/✏️/❌ под «Имена на одобрение» + ответ с вариантом
 - `bot/src/db.py` — asyncpg pool (command_timeout=10)
 
 ### Analytics
@@ -158,6 +160,10 @@ processor и bot НЕ общаются — оба независимо → Postg
 [--limit N] [--contested] [--kind person|other] [--dry-run]` — веб-поиск латинского написания для мест/
 организаций, пачки для людей; авто-`verified`, если совпал с единогласным вариантом чатов (conf ≥ 0.8);
 `--classify` — `also_word` + подсказка ≤ 3 слов (длинное пояснение модель копировала в перевод).
+Одобрение: после дайджеста analytics шлёт админам «Имена на одобрение» (10 штук, `bridge_shared.glossary_review`),
+кнопки ✅/✏️/❌ и «Следующие» обрабатывает бот (`handlers/glossary.py`, callback `gl:*`); ✏️ — ответ на
+вопрос бота (строка `ref g:` в вопросе). Решения → `verified`/`rejected`, `decided_by='admin'`; ✏️ НЕ `locked`
+(locked = во всех чатах, сломает имена-слова). Автоматика (`decided_by='auto'`) решения админа не трогает.
 
 **Глоссарий чатов:** только имена собственные. `chat_context_builder` видит ТОЛЬКО оригиналы;
 новые записи проходят `glossary.validate_entries`; утром `apply_quality_feedback` читает
@@ -287,6 +293,7 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | 024 | glossary_global (заменена в 025) |
 | 025 | glossary, glossary_override — словарь имён сервиса; glossary_global → locked, удалена |
 | 026 | glossary += also_word, chat_pairs — неоднозначные имена только в своих чатах |
+| 027 | glossary += decided_by (auto / admin) |
 
 ## ANALYTICS FLOWS
 

@@ -383,13 +383,14 @@ def resolve(conn, client, *, limit: int | None = None, contested: bool = False,
             updates.append((
                 _clean_rendering(a.get("translation")) or None, new_kind, note, evidence_of(a),
                 float(a.get("confidence") or 0), d["status"], RESOLVER_MODEL,
-                d["status"] in ("verified", "rejected"), d["id"],
+                d["status"] in ("verified", "rejected"), d["status"] in ("verified", "rejected"), d["id"],
             ))
         cur.executemany("""
             UPDATE glossary
             SET translation = %s, kind = %s, note = coalesce(%s, note), evidence = %s,
                 confidence = %s, status = %s, resolver_model = %s,
                 decided_at = CASE WHEN %s THEN now() ELSE decided_at END,
+                decided_by = CASE WHEN %s THEN 'auto' END,
                 updated_at = now()
             WHERE id = %s AND status = 'candidate'
         """, updates)

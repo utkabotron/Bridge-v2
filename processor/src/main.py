@@ -553,7 +553,8 @@ async def api_profiles():
 # Edits here are by hand, so they are `locked`: the resolver and the digest never touch them.
 
 _GLOSSARY_COLUMNS = """id, source, target_language, translation, kind, note, status, evidence,
-                      confidence, chat_renderings, chats_seen, updated_at, decided_at"""
+                      confidence, chat_renderings, chats_seen, also_word, chat_pairs,
+                      updated_at, decided_at, decided_by"""
 
 
 def _glossary_row(r) -> dict:
@@ -598,11 +599,11 @@ async def api_glossary_upsert(body: GlossaryEntry):
         return JSONResponse({"error": "kind: person | place | org | other"}, status_code=400)
     pool = await get_pool()
     row = await pool.fetchrow(f"""
-        INSERT INTO glossary (source, target_language, translation, kind, note, status, decided_at)
-        VALUES ($1, $2, $3, $4, $5, 'locked', now())
+        INSERT INTO glossary (source, target_language, translation, kind, note, status, decided_at, decided_by)
+        VALUES ($1, $2, $3, $4, $5, 'locked', now(), 'admin')
         ON CONFLICT (source, target_language) DO UPDATE
             SET translation = EXCLUDED.translation, kind = EXCLUDED.kind, note = EXCLUDED.note,
-                status = 'locked', decided_at = now(), updated_at = now()
+                status = 'locked', decided_at = now(), decided_by = 'admin', updated_at = now()
         RETURNING {_GLOSSARY_COLUMNS}
     """, source, body.target_language, translation, body.kind, (body.note or "").strip() or None)
     glossary.reload()
