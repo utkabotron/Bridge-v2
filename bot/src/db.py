@@ -49,11 +49,6 @@ async def create_user(tg_user_id: int, tg_username: Optional[str] = None) -> dic
     return dict(row)
 
 
-async def count_users() -> int:
-    pool = await get_pool()
-    return await pool.fetchval("select count(*) from public.users")
-
-
 async def is_whitelisted(tg_user_id: int) -> bool:
     pool = await get_pool()
     row = await pool.fetchrow(

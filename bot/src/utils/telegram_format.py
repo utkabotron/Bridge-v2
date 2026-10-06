@@ -6,10 +6,6 @@ def esc(text: str) -> str:
     return _html.escape(str(text))
 
 
-def bold(text: str) -> str:
-    return f"<b>{esc(text)}</b>"
-
-
 def italic(text: str) -> str:
     return f"<i>{esc(text)}</i>"
 
