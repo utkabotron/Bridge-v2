@@ -1,7 +1,11 @@
 """Bot-wide constants. Handlers import from here instead of hardcoding."""
 from __future__ import annotations
 
-import re
+from bridge_shared.env import admin_tg_ids
+from bridge_shared.scripts import CYRILLIC_RE, HEBREW_RE, LATIN_RE
+
+# Made admins on /start (see onboarding/wizard.py).
+ADMIN_TG_IDS = admin_tg_ids()
 
 # Languages the inline buttons under a direct translation offer.
 # code → (name the processor's /translate understands, button label)
@@ -19,9 +23,9 @@ DIRECT_LANG_FALLBACK = "he"
 
 # Script of each language, to tell "already written in it" without a model call.
 _SCRIPTS = {
-    "ru": re.compile(r"[\u0400-\u04FF]"),
-    "he": re.compile(r"[\u0590-\u05FF]"),
-    "en": re.compile(r"[A-Za-z]"),
+    "ru": CYRILLIC_RE,
+    "he": HEBREW_RE,
+    "en": LATIN_RE,
 }
 
 

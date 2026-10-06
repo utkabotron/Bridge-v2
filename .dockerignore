@@ -1,0 +1,15 @@
+# Build context of processor, analytics and bot is the repo root, so that their
+# Dockerfiles can copy shared/bridge_shared (see shared/bridge_shared/__init__.py). Send
+# only what they read: on the server the root also holds .env, backups/ (pg_dump files)
+# and wa-service's node_modules — none of it belongs in a build context.
+# wa-service builds from ./wa-service and does not see this file.
+*
+!shared/
+!processor/
+!analytics/
+!bot/
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.venv

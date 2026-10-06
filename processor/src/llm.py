@@ -6,6 +6,8 @@ it was for) — the cost record LangSmith used to keep, now in our own database 
 GET /api/costs.
 
 Callers get a Completion back and never touch the SDK, so tests patch `chat`/`transcribe`.
+Prices, the reasoning-model rule and the request shape come from bridge_shared.llm, the
+table analytics bills by too.
 """
 from __future__ import annotations
 
@@ -15,9 +17,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from bridge_shared.llm import chat_request, token_cost, transcribe_cost
 from openai import AsyncOpenAI
 
-from .config import LLM_MAX_RETRIES, LLM_TIMEOUT, MODEL_PRICES, TRANSCRIBE_PRICES
+from .config import LLM_MAX_RETRIES, LLM_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -36,33 +39,14 @@ def client() -> AsyncOpenAI:
     return _client
 
 
-def is_reasoning(model: str) -> bool:
-    return model.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
-
-
 def build_request(model: str, messages: list[dict], max_tokens: int | None = None) -> dict[str, Any]:
     """Chat Completions kwargs the model family accepts.
 
     Reasoning models (gpt-5/6, o-series) reject `temperature` and `max_tokens`; they take
-    `max_completion_tokens`, and a chat message or a caption needs no thinking.
+    `max_completion_tokens`, and a chat message or a caption needs no thinking — the
+    shared defaults (reasoning "none", temperature 0) are this request.
     """
-    request: dict[str, Any] = {"model": model, "messages": messages}
-    if is_reasoning(model):
-        request["reasoning_effort"] = "none"
-        if max_tokens:
-            request["max_completion_tokens"] = max_tokens
-    else:
-        request["temperature"] = 0
-        if max_tokens:
-            request["max_tokens"] = max_tokens
-    return request
-
-
-def token_cost(model: str, tokens_in: int, tokens_out: int) -> float:
-    price = MODEL_PRICES.get(model)
-    if price is None:
-        return 0.0
-    return (tokens_in * price[0] + tokens_out * price[1]) / 1e6
+    return chat_request(model, messages, max_tokens=max_tokens)
 
 
 @dataclass
@@ -112,7 +96,7 @@ async def transcribe(audio: bytes, filename: str, *, model: str, purpose: str = 
     seconds = getattr(usage, "seconds", None) if usage is not None else None
     tokens_in = getattr(usage, "input_tokens", 0) or 0 if usage is not None else 0
     tokens_out = getattr(usage, "output_tokens", 0) or 0 if usage is not None else 0
-    cost = (seconds / 60 * TRANSCRIBE_PRICES.get(model, 0.0)) if seconds else 0.0
+    cost = transcribe_cost(model, seconds)
     _record(purpose, model, None, tokens_in, tokens_out, cost, ms)
     return (getattr(response, "text", "") or "").strip()
 

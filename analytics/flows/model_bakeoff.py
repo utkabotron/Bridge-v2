@@ -19,11 +19,15 @@ import json
 import logging
 import os
 import random
-import re
 import statistics
 import time
 from datetime import datetime
 
+# The translator's own pieces, not copies of them: the request shape, the chat-context
+# block and the price table are the ones the processor runs on (shared/bridge_shared).
+from bridge_shared.chat_context import format_chat_context
+from bridge_shared.llm import chat_request, token_cost
+from bridge_shared.scripts import HEBREW_RE
 from openai import AsyncOpenAI
 
 from .shared import db_conn
@@ -33,21 +37,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DEFAULT_CANDIDATES = ["gpt-4.1-mini", "gpt-6-luna", "gpt-5.6-luna", "gpt-5.4-mini", "gpt-5-mini"]
 DEFAULT_JUDGE = "gpt-6.1-sol"
 
-# $/1M tokens (input, output), developers.openai.com/api/docs/pricing, 2026-10-06
-PRICES = {
-    "gpt-4.1-mini": (0.40, 1.60),
-    "gpt-4.1": (2.00, 8.00),
-    "gpt-5-mini": (0.25, 2.00),
-    "gpt-5-nano": (0.05, 0.40),
-    "gpt-5.4-mini": (0.75, 4.50),
-    "gpt-5.4-nano": (0.20, 1.25),
-    "gpt-5.6-luna": (0.20, 1.20),
-    "gpt-5.6-terra": (2.00, 12.00),
-    "gpt-6-luna": (0.10, 0.50),
-    "gpt-6-sol": (2.00, 10.00),
-    "gpt-6.1-sol": (2.00, 10.00),
-}
-HEBREW_RE = re.compile(r"[֐-׿]")
 CONCURRENCY = 6
 
 
@@ -97,58 +86,19 @@ def load_prompt() -> str:
     return row[0]
 
 
-def format_chat_context(profile: dict | None) -> str:
-    """Mirror of processor/src/pipeline/prompts.py:format_chat_context."""
-    if not profile:
-        return ""
-    parts = []
-    if profile.get("chat_description"):
-        parts.append(f"- Group: {profile['chat_description']}")
-    if profile.get("tone"):
-        parts.append(f"- Tone: {profile['tone']}")
-    glossary = profile.get("glossary") or {}
-    if glossary:
-        items = []
-        for word, info in glossary.items():
-            if isinstance(info, dict):
-                entry = f"{word} → {info.get('translation', '')}"
-                if info.get("note"):
-                    entry += f" ({info['note']})"
-            else:
-                entry = f"{word} → {info}"
-            items.append(entry)
-        parts.append(
-            "- Glossary — established renderings of names, places, organisations and "
-            "programmes. Use them for these names only; translate everything else normally:\n  "
-            + "\n  ".join(items)
-        )
-    members = profile.get("members") or {}
-    if members:
-        parts.append("- Member names:\n  " + "\n  ".join(f"{k} → {v}" for k, v in members.items()))
-    return "\nChat context:\n" + "\n".join(parts) if parts else ""
-
-
 # ── Translation ───────────────────────────────────────────
 
-def _is_reasoning_model(model: str) -> bool:
-    return model.startswith(("gpt-5", "gpt-6", "o"))
-
-
 async def translate(client: AsyncOpenAI, model: str, system: str, text: str) -> dict:
-    kwargs: dict = {
-        "model": model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": text}],
-    }
-    if _is_reasoning_model(model):
-        # Chat-sized messages do not need thinking; the pipeline wants the lowest latency.
-        kwargs["reasoning_effort"] = "none"
-    else:
-        kwargs["temperature"] = 0
+    # chat_request's defaults are the translator's request: reasoning "none" (chat-sized
+    # messages need no thinking, the pipeline wants the lowest latency), temperature 0.
+    kwargs = chat_request(model, [{"role": "system", "content": system}, {"role": "user", "content": text}])
 
     t0 = time.monotonic()
     try:
         resp = await client.chat.completions.create(**kwargs)
     except Exception as exc:
+        # Some reasoning candidates reject the "none" effort; measure them at "low" rather
+        # than dropping them from the table.
         if "reasoning_effort" in kwargs and "reasoning" in str(exc).lower():
             kwargs["reasoning_effort"] = "low"
             resp = await client.chat.completions.create(**kwargs)
@@ -196,15 +146,15 @@ async def judge(client: AsyncOpenAI, model: str, msg: dict, context: str,
         f"{context}\n\nSource (Hebrew):\n{msg['original_text']}\n\nCandidates:\n{block}"
         if context else f"Source (Hebrew):\n{msg['original_text']}\n\nCandidates:\n{block}"
     )
-    resp = await client.chat.completions.create(
-        model=model,
-        messages=[
+    resp = await client.chat.completions.create(**chat_request(
+        model,
+        [
             {"role": "system", "content": JUDGE_SYSTEM.format(target_language=msg["target_language"])},
             {"role": "user", "content": user},
         ],
-        response_format={"type": "json_object"},
-        reasoning_effort="low",
-    )
+        reasoning="low",
+        json_mode=True,
+    ))
     data = json.loads(resp.choices[0].message.content or "{}")
     scores = {labels[k]: v for k, v in (data.get("scores") or {}).items() if k in labels}
     ranking = [labels[k] for k in (data.get("ranking") or []) if k in labels]
@@ -274,8 +224,7 @@ async def run(limit: int, days: int, candidates: list[str], judge_model: str, ou
     }
     judge_in = sum(v["in"] for v in verdicts.values())
     judge_out = sum(v["out"] for v in verdicts.values())
-    jp = PRICES.get(judge_model, (0, 0))
-    report["judge_cost_usd"] = round((judge_in * jp[0] + judge_out * jp[1]) / 1e6, 3)
+    report["judge_cost_usd"] = round(token_cost(judge_model, judge_in, judge_out), 3)
 
     for model in candidates:
         results = translations[model]
@@ -293,7 +242,6 @@ async def run(limit: int, days: int, candidates: list[str], judge_model: str, ou
         leftover_hebrew = sum(1 for r in ok if HEBREW_RE.search(r["text"]))
         tin = sum(r["in"] for r in ok)
         tout = sum(r["out"] for r in ok)
-        p = PRICES.get(model, (0, 0))
         report["candidates"][model] = {
             "n": len(ok), "errors": len(errors),
             "error_sample": errors[0]["error"] if errors else None,
@@ -306,7 +254,7 @@ async def run(limit: int, days: int, candidates: list[str], judge_model: str, ou
             "hebrew_left_pct": round(100 * leftover_hebrew / len(ok), 1) if ok else None,
             "p50_ms": lat[len(lat) // 2] if lat else None,
             "p95_ms": lat[int(len(lat) * 0.95)] if lat else None,
-            "cost_per_1k_msgs_usd": round((tin * p[0] + tout * p[1]) / 1e6 / max(len(ok), 1) * 1000, 3),
+            "cost_per_1k_msgs_usd": round(token_cost(model, tin, tout) / max(len(ok), 1) * 1000, 3),
         }
 
     # Keep the raw material: every candidate's text per message, for reading by hand.

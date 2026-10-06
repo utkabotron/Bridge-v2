@@ -16,6 +16,7 @@ import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
 
+from ..config import ADMIN_TG_IDS
 from ..db import (
     add_chat_pair,
     add_to_whitelist,
@@ -45,8 +46,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Bootstrap admins from ADMIN_TG_IDS. This used to promote whoever sent /start first
     # while the users table was empty — so a stranger who found the bot right after a
     # volume reset or a fresh deploy inherited /whitelist, /users and /broadcast.
-    admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
-    if tg_id in admin_ids:
+    if tg_id in ADMIN_TG_IDS:
         await add_to_whitelist(tg_id, user.username)
         pool = await get_pool()
         await pool.execute(

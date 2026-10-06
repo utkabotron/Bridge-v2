@@ -1,9 +1,6 @@
-import html as _html
-
-
-def esc(text: str) -> str:
-    """Escape for Telegram HTML."""
-    return _html.escape(str(text))
+# esc is shared with the bot and analytics (bridge_shared.telegram_html); callers import it
+# from here as before.
+from bridge_shared.telegram_html import esc
 
 
 def bold(text: str) -> str:

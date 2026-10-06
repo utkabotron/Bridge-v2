@@ -170,7 +170,11 @@ services:
         condition: service_healthy
 
   processor:
-    build: ./processor
+    # Repo root as the context: the image also gets shared/bridge_shared (code shared with
+    # analytics and bot). The root .dockerignore keeps the context small.
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
     restart: unless-stopped
     mem_limit: 512m
     # The consumer drains for up to BRPOP_TIMEOUT + 30s; killing it sooner is what the
@@ -218,7 +222,10 @@ services:
         condition: service_healthy
 
   bot:
-    build: ./bot
+    # Repo root as the context, for shared/bridge_shared — see processor.
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
     restart: unless-stopped
     mem_limit: 256m
     logging: *default-logging
@@ -242,7 +249,10 @@ services:
         condition: service_healthy
 
   analytics:
-    build: ./analytics
+    # Repo root as the context, for shared/bridge_shared — see processor.
+    build:
+      context: .
+      dockerfile: analytics/Dockerfile
     restart: unless-stopped
     mem_limit: 900m
     logging: *default-logging

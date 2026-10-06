@@ -17,27 +17,14 @@ import inspect
 import re
 from collections.abc import AsyncIterator
 
+# A message written in none of the source scripts, in a chat whose target language uses
+# a script we know, is already readable to the recipient.
+from bridge_shared.scripts import SOURCE_SCRIPT_RE, target_script_re
+
 from ..models.message import MessageState
 from .nodes import deliver_node, format_node, translate_node, validate_node
 
 _URL_RE = re.compile(r'^https?://\S+$')
-
-
-# Scripts the bridge translates FROM. A message written in none of them, in a chat whose
-# target language uses one of them, is already readable to the recipient.
-_SOURCE_SCRIPT_RE = re.compile(r"[\u0590-\u05FF\u0600-\u06FF\u0700-\u074F]")  # Hebrew, Arabic, Syriac
-_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
-_LATIN_RE = re.compile(r"[A-Za-z]")
-
-_TARGET_SCRIPT_RE = {
-    "russian": _CYRILLIC_RE,
-    "ukrainian": _CYRILLIC_RE,
-    "english": _LATIN_RE,
-    "spanish": _LATIN_RE,
-    "french": _LATIN_RE,
-    "german": _LATIN_RE,
-    "portuguese": _LATIN_RE,
-}
 
 
 def _is_translatable(text: str) -> bool:
@@ -68,10 +55,10 @@ def _already_in_target_script(text: str, target_language: str) -> bool:
     AND the target's own script is present, so a mixed Hebrew/Russian message still goes
     through the model.
     """
-    target_re = _TARGET_SCRIPT_RE.get((target_language or "").strip().lower())
+    target_re = target_script_re(target_language)
     if target_re is None:
         return False
-    if _SOURCE_SCRIPT_RE.search(text):
+    if SOURCE_SCRIPT_RE.search(text):
         return False
     return bool(target_re.search(text))
 

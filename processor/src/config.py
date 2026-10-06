@@ -1,8 +1,11 @@
 """Centralized configuration for the processor service.
 
-All env vars with typed defaults in one place.
+All env vars with typed defaults in one place. Model prices live in
+shared/bridge_shared/llm.py — analytics bills by the same table.
 """
 import os
+
+from bridge_shared.env import admin_tg_ids, parse_ids
 
 # ── Redis ────────────────────────────────────────────────
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -54,7 +57,7 @@ MAX_RETRY_AFTER = int(os.getenv("MAX_RETRY_AFTER", 20))
 TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 
 # ── Alerting ─────────────────────────────────────────────
-ADMIN_TG_IDS = [int(x) for x in os.getenv("ADMIN_TG_IDS", "").split(",") if x.strip()]
+ADMIN_TG_IDS = admin_tg_ids()
 # Bridge translation model — variant A of the prompt/model A/B (prompts.VARIANTS).
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 # Model for everything outside the bridge A/B: bot DM translation and media analysis.
@@ -65,7 +68,7 @@ DIRECT_MODEL = os.getenv("DIRECT_MODEL") or OPENAI_MODEL
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-transcribe")
 # Users whose chats always get A/B variant B while the flag is on — the admin dogfoods the
 # candidate in every chat instead of half of them. Defaults to the admins.
-AB_ALWAYS_B_USERS = [int(x) for x in os.getenv("AB_ALWAYS_B_USERS", "").split(",") if x.strip()] or ADMIN_TG_IDS
+AB_ALWAYS_B_USERS = parse_ids(os.getenv("AB_ALWAYS_B_USERS")) or ADMIN_TG_IDS
 UNAUTH_WINDOW = int(os.getenv("UNAUTH_WINDOW", 900))
 UNAUTH_THRESHOLD = int(os.getenv("UNAUTH_THRESHOLD", 3))
 FAILURE_RATE_WINDOW = int(os.getenv("FAILURE_RATE_WINDOW", 900))
@@ -149,24 +152,3 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 # Host Telegram (and the user) reach media on. The bucket is no longer world-readable,
 # so links built on this endpoint must be presigned — see src/s3.py.
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000")
-
-# ── LLM pricing (src/llm.py writes every call's cost to llm_usage) ──
-# $/1M tokens (input, output) — developers.openai.com/api/docs/pricing, 2026-10-06
-MODEL_PRICES: dict[str, tuple[float, float]] = {
-    "gpt-6-astra": (10.00, 50.00),
-    "gpt-6.1-sol": (2.00, 10.00),
-    "gpt-6-luna": (0.10, 0.50),
-    "gpt-5.6-luna": (0.20, 1.20),
-    "gpt-5.4-mini": (0.75, 4.50),
-    "gpt-5-mini": (0.25, 2.00),
-    "gpt-4.1": (2.00, 8.00),
-    "gpt-4.1-mini": (0.40, 1.60),
-    "gpt-4o-mini": (0.15, 0.60),
-}
-# $/minute of audio
-TRANSCRIBE_PRICES: dict[str, float] = {
-    "gpt-transcribe": 0.0045,
-    "gpt-4o-transcribe": 0.006,
-    "gpt-4o-mini-transcribe": 0.003,
-    "whisper-1": 0.006,
-}

@@ -12,6 +12,9 @@ model: set OPENAI_MODEL; to promote a prompt: copy its text into SYSTEM_TRANSLAT
 PROMPT_VERSION; then turn the flag off. A version change lands in analytics_changelog on
 the next processor start (register_prompt), which is how the weekly report learns of it.
 """
+# The chat-context block lives in bridge_shared so the model bake-off (analytics) sends
+# exactly what the translator sends. Re-exported: callers import it from here.
+from bridge_shared.chat_context import format_chat_context as format_chat_context
 
 PROMPT_VERSION = "v2.10"
 
@@ -84,47 +87,6 @@ def choose_variant(chat_pair_id: int | None, ab_enabled: bool, user_id: int | No
     if user_id is not None and user_id in always_b_users:
         return "B"
     return "B" if chat_pair_id % 2 == 1 else "A"
-
-
-def format_chat_context(profile: dict) -> str:
-    """Format chat profile as context block for the translation prompt."""
-    parts = []
-
-    if profile.get("chat_description"):
-        parts.append(f"- Group: {profile['chat_description']}")
-    if profile.get("tone"):
-        parts.append(f"- Tone: {profile['tone']}")
-
-    glossary = profile.get("glossary", {})
-    if glossary:
-        items = []
-        for word, info in glossary.items():
-            if isinstance(info, dict):
-                trans = info.get("translation", "")
-                note = info.get("note", "")
-                entry = f"{word} → {trans}"
-                if note:
-                    entry += f" ({note})"
-            else:
-                entry = f"{word} → {info}"
-            items.append(entry)
-        # Named entities only. This used to say "use these transliterations", and the
-        # glossary held everyday words, so the translator wrote "кадурсаль" for basketball.
-        parts.append(
-            "- Glossary — established renderings of names, places, organisations and "
-            "programmes. Use them for these names only; translate everything else normally:\n  "
-            + "\n  ".join(items)
-        )
-
-    members = profile.get("members", {})
-    if members:
-        items = [f"{k} → {v}" for k, v in members.items()]
-        parts.append("- Member names:\n  " + "\n  ".join(items))
-
-    if not parts:
-        return ""
-
-    return "\nChat context:\n" + "\n".join(parts)
 
 
 def get_translate_prompt(target_language: str, chat_context: str = "", variant: str = "A") -> str:
