@@ -1,9 +1,14 @@
 """Redis translation cache.
 
-Key: translation:{lang}:{chat_pair_id}:{sha256(text)}
+Key: translation:{lang}:{chat_pair_id}:{sha256(prompt_version + chat_context + text)}
 TTL: TRANSLATION_CACHE_TTL env var (default 86400s = 24h)
 
-Global key (no glossary): translation_global:{lang}:{sha256(text)}
+The prompt version and the chat context (glossary, members, tone) are hashed into the
+key, so a new prompt or a glossary fix takes effect on the next message instead of
+serving the old translation for up to 24h — which is how a nightly evaluation used to
+score translations the fix had already made obsolete.
+
+Global key (no glossary): translation_global:{lang}:{sha256(prompt_version + text)}
 Used when chat has no profile — same text across multiple pairs hits cache.
 
 Chat profile cache:
@@ -22,6 +27,7 @@ from ..config import (
     redis_kwargs,
     TRANSLATION_CACHE_TTL, PROFILE_CACHE_TTL, MEDIA_CACHE_TTL,
 )
+from .prompts import PROMPT_VERSION
 
 _client: Optional[aioredis.Redis] = None
 CACHE_TTL = TRANSLATION_CACHE_TTL
@@ -34,28 +40,30 @@ def get_redis() -> aioredis.Redis:
     return _client
 
 
-def _cache_key(text: str, language: str, chat_pair_id: int | None = None) -> str:
-    digest = hashlib.sha256(text.encode()).hexdigest()
+def _cache_key(text: str, language: str, chat_pair_id: int | None = None, context: str = "") -> str:
+    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00{context}\x00{text}".encode()).hexdigest()
     pair_id = chat_pair_id or 0
     return f"translation:{language}:{pair_id}:{digest}"
 
 
-async def get_cached(text: str, language: str, chat_pair_id: int | None = None) -> Optional[str]:
+async def get_cached(text: str, language: str, chat_pair_id: int | None = None,
+                     context: str = "") -> Optional[str]:
     try:
-        return await get_redis().get(_cache_key(text, language, chat_pair_id))
+        return await get_redis().get(_cache_key(text, language, chat_pair_id, context))
     except Exception:
         return None
 
 
-async def set_cached(text: str, language: str, translation: str, chat_pair_id: int | None = None) -> None:
+async def set_cached(text: str, language: str, translation: str, chat_pair_id: int | None = None,
+                     context: str = "") -> None:
     try:
-        await get_redis().setex(_cache_key(text, language, chat_pair_id), CACHE_TTL, translation)
+        await get_redis().setex(_cache_key(text, language, chat_pair_id, context), CACHE_TTL, translation)
     except Exception:
         pass  # cache is best-effort
 
 
 def _global_cache_key(text: str, language: str) -> str:
-    digest = hashlib.sha256(text.encode()).hexdigest()
+    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00{text}".encode()).hexdigest()
     return f"translation_global:{language}:{digest}"
 
 

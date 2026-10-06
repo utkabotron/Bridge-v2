@@ -11,8 +11,26 @@ from unittest.mock import AsyncMock, patch
 
 def test_cache_key_format():
     from processor.src.pipeline.cache import _cache_key
-    digest = hashlib.sha256("hello".encode()).hexdigest()
+    from processor.src.pipeline.prompts import PROMPT_VERSION
+    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00\x00hello".encode()).hexdigest()
     assert _cache_key("hello", "Russian", 42) == f"translation:Russian:42:{digest}"
+
+
+def test_cache_key_changes_with_chat_context():
+    """A glossary fix must not keep serving the translation made with the old glossary."""
+    from processor.src.pipeline.cache import _cache_key
+    before = _cache_key("hello", "Russian", 42, context="Glossary: כדורסל → кадурсаль")
+    after = _cache_key("hello", "Russian", 42, context="Glossary: (empty)")
+    assert before != after
+
+
+def test_cache_key_changes_with_prompt_version(monkeypatch):
+    from processor.src.pipeline import cache
+    pair_before = cache._cache_key("hello", "Russian", 1)
+    global_before = cache._global_cache_key("hello", "Russian")
+    monkeypatch.setattr(cache, "PROMPT_VERSION", "v0.0-test")
+    assert cache._cache_key("hello", "Russian", 1) != pair_before
+    assert cache._global_cache_key("hello", "Russian") != global_before
 
 
 def test_cache_key_no_pair_uses_zero():
@@ -23,7 +41,8 @@ def test_cache_key_no_pair_uses_zero():
 
 def test_global_cache_key_format():
     from processor.src.pipeline.cache import _global_cache_key
-    digest = hashlib.sha256("hello world".encode()).hexdigest()
+    from processor.src.pipeline.prompts import PROMPT_VERSION
+    digest = hashlib.sha256(f"{PROMPT_VERSION}\x00hello world".encode()).hexdigest()
     assert _global_cache_key("hello world", "Hebrew") == f"translation_global:Hebrew:{digest}"
 
 

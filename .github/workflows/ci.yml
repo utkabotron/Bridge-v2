@@ -64,11 +64,11 @@ jobs:
       - name: Run bot tests
         run: pytest bot/tests/ -v --tb=short
 
-      # Only the Jev module is unit-tested; it needs the SDK, not the whole Prefect stack.
+      - name: Install analytics deps
+        run: pip install -r analytics/requirements.lock
+
       - name: Run analytics tests
-        run: |
-          pip install "typesafe-sdk==0.7.2"
-          pytest analytics/tests/ -v --tb=short
+        run: pytest analytics/tests/ -v --tb=short
 
       # wa-service holds the WhatsApp session logic and, since the security pass, the
       # authentication middleware — it was the only suite CI never ran.

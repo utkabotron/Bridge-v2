@@ -24,7 +24,8 @@ Run all tests across all services and report results.
    cd bot && python3 -m pytest tests/ -v 2>&1
    ```
 
-4. Run analytics pytest (Jev tests skip themselves when `typesafe-sdk` is not installed):
+4. Run analytics pytest. Needs `analytics/requirements.lock` installed (Prefect, psycopg2,
+   openai, typesafe-sdk); if `python3` lacks them, use a venv with that lock installed:
    ```
    cd analytics && python3 -m pytest tests/ -v 2>&1
    ```

@@ -3,7 +3,7 @@ Translation prompts — versioned so LangSmith can diff between deployments.
 Change PROMPT_VERSION when updating the system prompt.
 """
 
-PROMPT_VERSION = "v2.9"
+PROMPT_VERSION = "v2.10"
 
 SYSTEM_TRANSLATE = """\
 You are a professional translator. Translate the WhatsApp message below into {target_language}.
@@ -49,7 +49,13 @@ def format_chat_context(profile: dict) -> str:
             else:
                 entry = f"{word} → {info}"
             items.append(entry)
-        parts.append("- Glossary (use these transliterations):\n  " + "\n  ".join(items))
+        # Named entities only. This used to say "use these transliterations", and the
+        # glossary held everyday words, so the translator wrote "кадурсаль" for basketball.
+        parts.append(
+            "- Glossary — established renderings of names, places, organisations and "
+            "programmes. Use them for these names only; translate everything else normally:\n  "
+            + "\n  ".join(items)
+        )
 
     members = profile.get("members", {})
     if members:

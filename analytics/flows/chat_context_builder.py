@@ -1,16 +1,26 @@
 """Prefect flow: per-chat context builder (glossaries, members, tone).
 
-Analyzes recent messages per chat_pair, extracts transliteration glossary,
-member names, and chat tone using LLM. Profiles are merged incrementally
-and injected into the translation prompt.
+Analyzes recent messages per chat_pair, extracts a glossary of named entities, member
+names and chat tone using an LLM. Profiles are merged incrementally and injected into the
+translation prompt.
+
+The glossary is gated both ways (see flows/glossary.py): new entries pass an LLM
+validator before they are merged, and every morning the evaluator's bad ratings from the
+translation-quality run flag the entries they implicate — three flags and the entry is
+removed for good. Without this the glossary only ever grew, and it grew everyday words
+pinned to transliterations.
 
 Deploy:
-  cron "0 5 * * *" (after translation-quality)
+  cron "0 5 * * *" (after translation-quality — the feedback step reads its run)
+
+One-off: python -m flows.chat_context_builder --prune-glossaries
+  Runs the validator over every existing glossary and removes what it rejects.
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import date
 
 import psycopg2
@@ -18,7 +28,8 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
-from .shared import esc, notify_telegram
+from . import glossary as glossary_rules
+from .shared import esc, invalidate_profile_cache, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -28,6 +39,8 @@ ANALYSIS_MODEL = "gpt-4.1"
 # Minimum messages per chat to trigger analysis
 MIN_MESSAGES = 5
 
+PROFILE_FIELDS = ("chat_type", "chat_description", "tone", "glossary", "members", "mentioned_people", "recurring_topics")
+
 
 @task(retries=2, name="collect-per-chat-data")
 def collect_per_chat_data() -> list[dict]:
@@ -35,6 +48,9 @@ def collect_per_chat_data() -> list[dict]:
 
     For chats WITH existing profile: last 24h messages.
     For chats WITHOUT profile: last 90 days (bootstrap).
+
+    Originals only. The builder used to see its own past translations too, and learned
+    the transliterations it had itself caused.
     """
     logger = get_run_logger()
     conn = psycopg2.connect(DB_URL)
@@ -60,7 +76,7 @@ def collect_per_chat_data() -> list[dict]:
         interval = "1 day" if has_profile else "90 days"
 
         cur.execute("""
-            SELECT original_text, sender_name, translated_text
+            SELECT original_text, sender_name
             FROM message_events
             WHERE chat_pair_id = %s
               AND created_at >= current_date - interval %s
@@ -93,6 +109,46 @@ def collect_per_chat_data() -> list[dict]:
     return result
 
 
+def build_extraction_prompt(target_lang: str, existing: dict | None) -> str:
+    removed = sorted((existing or {}).get("glossary_removed") or {})
+    banned_block = ""
+    if removed:
+        banned_block = (
+            "\n- NEVER propose these glossary keys again; they were removed as everyday words "
+            "or bad renderings: " + ", ".join(removed[:60])
+        )
+    return f"""You analyze WhatsApp group chat messages to build a translation context profile.
+The messages are translated from Hebrew to {target_lang}.
+
+Your task: extract ONLY NEW or UPDATED items not already in the existing profile.
+
+Return a JSON object with these fields (include only fields with new data):
+- "chat_type": string — type of chat (e.g. "parents_group", "work_team", "family", "neighbors")
+- "chat_description": string — brief description of what the group is about
+- "tone": string — communication style (e.g. "informal, warm, emoji-heavy")
+- "glossary": object — fixed {target_lang} renderings of NAMED ENTITIES only.
+  {glossary_rules.GLOSSARY_RULES.format(target_lang=target_lang)}
+  Format: {{"hebrew name": {{"translation": "{target_lang} rendering", "note": "what it is"}}}}
+  Example for Russian: {{"אופק": {{"translation": "Офек", "note": "school platform"}}}} — NOT "Ofek".
+  When in doubt, leave it out: a missing entry costs nothing, a wrong one pins a mistake.
+- "members": object — Hebrew names transliterated into {target_lang} script (NOT Latin).
+  Format: {{"hebrew_name": "transliterated_name"}}
+  Example for Russian: {{"גיל": "Гиль"}} — NOT "Gil".
+- "mentioned_people": object — people mentioned in messages who are NOT group members (children, spouses, teachers, doctors, etc.).
+  Format: {{"name": {{"transliteration": "{target_lang} transliteration", "relation": "who they are, e.g. child of [member], teacher at [school]"}}}}
+  This helps the translator correctly transliterate names and understand context.
+- "recurring_topics": list of strings — key recurring themes and topics discussed in the group (e.g. "school events", "holiday planning", "homework", "medical appointments"). Max 10 items.
+
+Rules:
+- Return ONLY a delta (new/changed items), not the full profile
+- If a glossary entry or member already exists in the current profile with the same value, do NOT include it
+- If you see a better rendering than what's in the current profile, include the updated version{banned_block}
+- If nothing new to add, return an empty object {{}}
+- Return ONLY the JSON object, no markdown fences
+- Use web search to verify names of places, schools, organizations, and public figures mentioned in messages. This helps ensure correct renderings in the glossary.
+- ALL renderings MUST use {target_lang} script. For Russian → Cyrillic. Never output Latin transliterations for a Russian target."""
+
+
 @task(retries=1, name="extract-context-with-llm")
 def extract_context_with_llm(chat_data: dict) -> dict | None:
     """Extract chat context (glossary, members, tone) using LLM.
@@ -110,45 +166,15 @@ def extract_context_with_llm(chat_data: dict) -> dict | None:
     for m in messages[:200]:  # cap at 200 for token efficiency
         sender = m.get("sender_name", "?")
         text = (m.get("original_text") or "")[:300]
-        translated = (m.get("translated_text") or "")[:300]
         msg_lines.append(f"[{sender}]: {text}")
-        if translated:
-            msg_lines.append(f"  → {translated}")
 
     messages_text = "\n".join(msg_lines)
 
-    existing_json = json.dumps(existing, ensure_ascii=False, indent=2) if existing else "null"
+    # The removal log is for the prompt's banned list, not for the model to re-read.
+    existing_for_prompt = {k: v for k, v in existing.items() if k not in ("glossary_removed", "glossary_flags")}
+    existing_json = json.dumps(existing_for_prompt, ensure_ascii=False, indent=2) if existing_for_prompt else "null"
 
-    system_prompt = f"""You analyze WhatsApp group chat messages to build a translation context profile.
-The messages are translated from Hebrew to {target_lang}.
-
-Your task: extract ONLY NEW or UPDATED items not already in the existing profile.
-
-Return a JSON object with these fields (include only fields with new data):
-- "chat_type": string — type of chat (e.g. "parents_group", "work_team", "family", "neighbors")
-- "chat_description": string — brief description of what the group is about
-- "tone": string — communication style (e.g. "informal, warm, emoji-heavy")
-- "glossary": object — Hebrew words/phrases that should be transliterated into {target_lang} script (NOT Latin/English).
-  Format: {{"word": {{"translation": "{target_lang} transliteration", "note": "context"}}}}
-  Example for Russian: {{"אופק": {{"translation": "Офек", "note": "school platform"}}}} — NOT "Ofek".
-  Focus on: proper nouns, place names, cultural terms, slang that should stay in original form.
-  Do NOT include common words that translate normally.
-- "members": object — Hebrew names transliterated into {target_lang} script (NOT Latin).
-  Format: {{"hebrew_name": "transliterated_name"}}
-  Example for Russian: {{"גיל": "Гиль"}} — NOT "Gil".
-- "mentioned_people": object — people mentioned in messages who are NOT group members (children, spouses, teachers, doctors, etc.).
-  Format: {{"name": {{"transliteration": "{target_lang} transliteration", "relation": "who they are, e.g. child of [member], teacher at [school]"}}}}
-  This helps the translator correctly transliterate names and understand context.
-- "recurring_topics": list of strings — key recurring themes and topics discussed in the group (e.g. "school events", "holiday planning", "homework", "medical appointments"). Max 10 items.
-
-Rules:
-- Return ONLY a delta (new/changed items), not the full profile
-- If a glossary entry or member already exists in the current profile with the same value, do NOT include it
-- If you see a better transliteration than what's in the current profile, include the updated version
-- If nothing new to add, return an empty object {{}}
-- Return ONLY the JSON object, no markdown fences
-- Use web search to verify names of places, schools, organizations, and public figures mentioned in messages. This helps ensure correct transliterations in the glossary.
-- ALL transliterations MUST use {target_lang} script. For Russian → Cyrillic. Never output Latin transliterations for a Russian target."""
+    system_prompt = build_extraction_prompt(target_lang, existing)
 
     user_prompt = f"""Existing profile:
 {existing_json}
@@ -195,6 +221,7 @@ Recent messages:
 
         return {
             "chat_pair_id": chat_data["chat_pair_id"],
+            "target_language": target_lang,
             "delta": delta,
             "tokens_used": tokens_used,
             "messages_analyzed": len(messages),
@@ -203,6 +230,26 @@ Recent messages:
     except Exception as exc:
         logger.error("LLM extraction failed for chat %d: %s", chat_data["chat_pair_id"], exc)
         return None
+
+
+@task(retries=1, name="validate-delta-glossary")
+def validate_delta_glossary(result: dict, existing_profile: dict | None) -> dict:
+    """Keep only named entities out of the new glossary entries; drop what was removed before."""
+    logger = get_run_logger()
+    proposed = result["delta"].get("glossary") or {}
+    if not proposed:
+        return result
+
+    allowed = glossary_rules.drop_removed(proposed, existing_profile)
+    banned = {k: "removed earlier" for k in proposed if k not in allowed}
+    kept, dropped = glossary_rules.validate_entries(
+        allowed, result["target_language"], OpenAI(api_key=OPENAI_API_KEY), log=logger,
+    )
+    dropped.update(banned)
+    if dropped:
+        logger.info("Chat %d: validator dropped %d of %d proposed glossary entries: %s",
+                    result["chat_pair_id"], len(dropped), len(proposed), ", ".join(dropped))
+    return {**result, "delta": {**result["delta"], "glossary": kept}, "dropped": dropped}
 
 
 def merge_profiles(existing: dict | None, delta: dict) -> dict:
@@ -217,27 +264,27 @@ def merge_profiles(existing: dict | None, delta: dict) -> dict:
         if key in delta and delta[key]:
             merged[key] = delta[key]
 
-    # Glossary: merge dicts, delta priority
+    # Glossary: merge dicts, delta priority — but never what was removed before
     if "glossary" in delta and delta["glossary"]:
-        old_glossary = merged.get("glossary", {})
-        old_glossary.update(delta["glossary"])
+        old_glossary = dict(merged.get("glossary", {}))
+        old_glossary.update(glossary_rules.drop_removed(delta["glossary"], existing))
         merged["glossary"] = old_glossary
 
     # Members: merge dicts, delta priority
     if "members" in delta and delta["members"]:
-        old_members = merged.get("members", {})
+        old_members = dict(merged.get("members", {}))
         old_members.update(delta["members"])
         merged["members"] = old_members
 
     # Mentioned people: merge dicts, delta priority
     if "mentioned_people" in delta and delta["mentioned_people"]:
-        old_people = merged.get("mentioned_people", {})
+        old_people = dict(merged.get("mentioned_people", {}))
         old_people.update(delta["mentioned_people"])
         merged["mentioned_people"] = old_people
 
     # Recurring topics: merge lists, deduplicate
     if "recurring_topics" in delta and delta["recurring_topics"]:
-        old_topics = merged.get("recurring_topics", [])
+        old_topics = list(merged.get("recurring_topics", []))
         seen = {t.lower() for t in old_topics}
         for topic in delta["recurring_topics"]:
             if topic.lower() not in seen:
@@ -248,9 +295,27 @@ def merge_profiles(existing: dict | None, delta: dict) -> dict:
     return merged
 
 
+def _write_profile(cur, chat_pair_id: int, profile: dict, version: int, tokens: int,
+                   cost: float, change_summary: str) -> None:
+    cur.execute("""
+        INSERT INTO chat_profiles (chat_pair_id, profile_data, version, tokens_used, estimated_cost, updated_at)
+        VALUES (%s, %s, %s, %s, %s, now())
+        ON CONFLICT (chat_pair_id) DO UPDATE
+            SET profile_data = EXCLUDED.profile_data,
+                version = EXCLUDED.version,
+                tokens_used = chat_profiles.tokens_used + EXCLUDED.tokens_used,
+                estimated_cost = chat_profiles.estimated_cost + EXCLUDED.estimated_cost,
+                updated_at = now()
+    """, (chat_pair_id, json.dumps(profile, ensure_ascii=False), version, tokens, cost))
+    cur.execute("""
+        INSERT INTO chat_profile_history (chat_pair_id, version, profile_data, change_summary)
+        VALUES (%s, %s, %s, %s)
+    """, (chat_pair_id, version, json.dumps(profile, ensure_ascii=False), change_summary))
+
+
 @task(retries=2, name="store-profiles")
 def store_profiles(results: list[dict]) -> int:
-    """UPSERT profiles into chat_profiles, record history."""
+    """UPSERT profiles into chat_profiles, record history, drop the Redis copy."""
     logger = get_run_logger()
 
     if not results:
@@ -261,14 +326,16 @@ def store_profiles(results: list[dict]) -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     stored = 0
+    touched: list[int] = []
     for r in results:
         chat_pair_id = r["chat_pair_id"]
         delta = r["delta"]
+        dropped = r.get("dropped") or {}
         tokens = r.get("tokens_used", 0)
         messages_analyzed = r.get("messages_analyzed", 0)
 
-        # Skip empty deltas
-        if not any(delta.get(k) for k in ("chat_type", "chat_description", "tone", "glossary", "members", "mentioned_people", "recurring_topics")):
+        # Skip empty deltas (a validator rejection alone is still worth recording)
+        if not any(delta.get(k) for k in PROFILE_FIELDS) and not dropped:
             continue
 
         # Load current profile
@@ -282,28 +349,18 @@ def store_profiles(results: list[dict]) -> int:
 
         # Merge
         merged = merge_profiles(existing, delta)
+        merged = glossary_rules.record_dropped(merged, dropped)
         merged["messages_analyzed"] = (existing or {}).get("messages_analyzed", 0) + messages_analyzed
         new_version = current_version + 1
 
         # Cost estimate: gpt-4.1 ~$2/1M input + $8/1M output
         cost = tokens * 0.005 / 1000
 
-        # UPSERT profile
-        cur.execute("""
-            INSERT INTO chat_profiles (chat_pair_id, profile_data, version, tokens_used, estimated_cost, updated_at)
-            VALUES (%s, %s, %s, %s, %s, now())
-            ON CONFLICT (chat_pair_id) DO UPDATE
-                SET profile_data = EXCLUDED.profile_data,
-                    version = EXCLUDED.version,
-                    tokens_used = chat_profiles.tokens_used + EXCLUDED.tokens_used,
-                    estimated_cost = chat_profiles.estimated_cost + EXCLUDED.estimated_cost,
-                    updated_at = now()
-        """, (chat_pair_id, json.dumps(merged, ensure_ascii=False), new_version, tokens, cost))
-
-        # Record history
         change_parts = []
         if delta.get("glossary"):
             change_parts.append(f"+{len(delta['glossary'])} glossary")
+        if dropped:
+            change_parts.append(f"validator dropped {len(dropped)}")
         if delta.get("members"):
             change_parts.append(f"+{len(delta['members'])} members")
         for k in ("chat_type", "chat_description", "tone"):
@@ -311,37 +368,89 @@ def store_profiles(results: list[dict]) -> int:
                 change_parts.append(f"updated {k}")
         change_summary = ", ".join(change_parts) if change_parts else "no changes"
 
-        cur.execute("""
-            INSERT INTO chat_profile_history (chat_pair_id, version, profile_data, change_summary)
-            VALUES (%s, %s, %s, %s)
-        """, (chat_pair_id, new_version, json.dumps(merged, ensure_ascii=False), change_summary))
-
+        _write_profile(cur, chat_pair_id, merged, new_version, tokens, cost, change_summary)
+        touched.append(chat_pair_id)
         stored += 1
 
     conn.commit()
     cur.close()
     conn.close()
 
+    # The processor caches profiles for an hour; a stale copy would keep serving the old glossary.
+    invalidate_profile_cache(touched)
+
     logger.info("Stored %d chat profiles", stored)
     return stored
 
 
+@task(retries=1, name="apply-quality-feedback")
+def apply_quality_feedback() -> list[dict]:
+    """Flag glossary entries implicated in last night's bad translations; remove at threshold.
+
+    Reads this morning's translation-quality run (it finishes half an hour before us).
+    """
+    logger = get_run_logger()
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute("""
+        SELECT me.chat_pair_id, te.original_text, te.translated_text, te.quality_score, te.issues_found
+        FROM translation_evaluations te
+        JOIN nightly_analysis_runs nar ON nar.id = te.run_id
+        JOIN message_events me ON me.id = te.message_event_id
+        WHERE nar.flow_type = 'translation_quality'
+          AND nar.run_date = current_date
+          AND NOT te.shadow
+          AND me.chat_pair_id IS NOT NULL
+    """)
+    by_pair: dict[int, list[dict]] = {}
+    for r in cur.fetchall():
+        issues = r["issues_found"]
+        if isinstance(issues, str):
+            issues = json.loads(issues or "[]")
+        by_pair.setdefault(r["chat_pair_id"], []).append({**dict(r), "issues": issues})
+
+    outcomes: list[dict] = []
+    touched: list[int] = []
+    for pair_id, evaluations in by_pair.items():
+        cur.execute("SELECT profile_data, version FROM chat_profiles WHERE chat_pair_id = %s", (pair_id,))
+        row = cur.fetchone()
+        if not row or not (row["profile_data"] or {}).get("glossary"):
+            continue
+        profile = dict(row["profile_data"])
+        hits = glossary_rules.find_hits(evaluations, profile["glossary"])
+        if not hits:
+            continue
+        updated, removed = glossary_rules.apply_flags(profile, hits)
+        summary = f"evaluator flagged {len(hits)}"
+        if removed:
+            summary += f", removed {len(removed)}: " + ", ".join(removed)
+        _write_profile(cur, pair_id, updated, row["version"] + 1, 0, 0.0, summary)
+        touched.append(pair_id)
+        outcomes.append({"chat_pair_id": pair_id, "flagged": sorted(hits), "removed": removed})
+        logger.info("Chat %d: %s", pair_id, summary)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    invalidate_profile_cache(touched)
+    return outcomes
+
+
 @task(retries=1, name="notify-profile-changes")
-def notify_profile_changes(results: list[dict]) -> int:
-    """Notify admins about new glossary entries and members."""
+def notify_profile_changes(results: list[dict], feedback: list[dict] | None = None) -> int:
+    """Notify admins about new glossary entries and members, and what got thrown out."""
     logger = get_run_logger()
 
-    if not results:
-        return 0
-
+    feedback = feedback or []
     # Filter to results with actual changes
     changes = []
-    for r in results:
+    for r in results or []:
         delta = r["delta"]
-        if delta.get("glossary") or delta.get("members") or delta.get("mentioned_people"):
+        if delta.get("glossary") or delta.get("members") or delta.get("mentioned_people") or r.get("dropped"):
             changes.append(r)
 
-    if not changes:
+    if not changes and not feedback:
         logger.info("No glossary/member changes to notify")
         return 0
 
@@ -356,6 +465,7 @@ def notify_profile_changes(results: list[dict]) -> int:
         glossary = delta.get("glossary", {})
         members = delta.get("members", {})
         mentioned = delta.get("mentioned_people", {})
+        dropped = r.get("dropped") or {}
 
         total_glossary += len(glossary)
         total_members += len(members)
@@ -372,6 +482,10 @@ def notify_profile_changes(results: list[dict]) -> int:
                 else:
                     items.append(f"{esc(word)} → {esc(str(info))}")
             lines.append(f"  Glossary: {', '.join(items)}")
+
+        if dropped:
+            items = [f"{esc(k)} ({esc(v)})" for k, v in list(dropped.items())[:8]]
+            lines.append(f"  Rejected: {', '.join(items)}")
 
         if members:
             items = [f"{esc(k)} → {esc(v)}" for k, v in list(members.items())[:8]]
@@ -390,9 +504,17 @@ def notify_profile_changes(results: list[dict]) -> int:
 
         lines.append("")
 
+    for fb in feedback[:10]:
+        line = f"🧹 pair #{fb['chat_pair_id']}: evaluator flagged {esc(', '.join(fb['flagged']))}"
+        if fb["removed"]:
+            line += f" — <b>removed {esc(', '.join(fb['removed']))}</b>"
+        lines.append(line)
+    if feedback:
+        lines.append("")
+
     lines.append(f"<b>Total:</b> +{total_glossary} glossary, +{total_members} members across {len(changes)} chats")
 
-    total_tokens = sum(r.get("tokens_used", 0) for r in results)
+    total_tokens = sum(r.get("tokens_used", 0) for r in results or [])
     if total_tokens:
         lines.append(f"Tokens: {total_tokens}")
 
@@ -405,36 +527,81 @@ def notify_profile_changes(results: list[dict]) -> int:
 
 @flow(name="chat-context-builder", log_prints=True)
 def chat_context_builder():
-    """Build per-chat translation context: collect → extract → merge → store → notify."""
+    """Build per-chat translation context: feedback → collect → extract → validate → store → notify."""
     logger = get_run_logger()
+
+    feedback = apply_quality_feedback()
 
     chat_data_list = collect_per_chat_data()
 
-    if not chat_data_list:
-        logger.info("No chats with enough messages, skipping")
-        return {"chats_processed": 0, "profiles_stored": 0}
-
-    # Extract context for each chat
     results = []
     for chat_data in chat_data_list:
         result = extract_context_with_llm(chat_data)
         if result:
-            results.append(result)
+            results.append(validate_delta_glossary(result, chat_data["existing_profile"]))
 
-    # Store profiles
-    stored = store_profiles(results)
+    stored = store_profiles(results) if results else 0
+    if not chat_data_list:
+        logger.info("No chats with enough messages to extract from")
 
-    # Notify admins
-    notified = notify_profile_changes(results)
+    notified = notify_profile_changes(results, feedback)
 
     return {
         "chats_analyzed": len(chat_data_list),
         "profiles_extracted": len(results),
         "profiles_stored": stored,
+        "glossary_feedback": len(feedback),
         "admins_notified": notified,
         "total_tokens": sum(r.get("tokens_used", 0) for r in results),
     }
 
 
+def prune_glossaries() -> None:
+    """One-off: run the validator over every existing glossary and remove what it rejects."""
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    log = logging.getLogger("prune_glossaries")
+
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT prof.chat_pair_id, prof.profile_data, prof.version,
+               coalesce(cp.target_language, u.target_language, 'Russian') AS target_language
+        FROM chat_profiles prof
+        JOIN chat_pairs cp ON cp.id = prof.chat_pair_id
+        JOIN users u ON u.id = cp.user_id
+        ORDER BY prof.chat_pair_id
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    touched: list[int] = []
+    for row in rows:
+        profile = dict(row["profile_data"] or {})
+        glossary = profile.get("glossary") or {}
+        if not glossary:
+            continue
+        _, dropped = glossary_rules.validate_entries(glossary, row["target_language"], client, log=log)
+        if not dropped:
+            log.info("pair %d: %d entries, nothing to drop", row["chat_pair_id"], len(glossary))
+            continue
+        updated = glossary_rules.record_dropped(profile, dropped)
+        summary = f"prune: validator dropped {len(dropped)}: " + ", ".join(dropped)
+        _write_profile(cur, row["chat_pair_id"], updated, row["version"] + 1, 0, 0.0, summary)
+        touched.append(row["chat_pair_id"])
+        log.info("pair %d: dropped %d of %d — %s", row["chat_pair_id"], len(dropped), len(glossary),
+                 "; ".join(f"{k} ({v})" for k, v in dropped.items()))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    invalidate_profile_cache(touched)
+    log.info("Done: %d profiles changed", len(touched))
+
+
 if __name__ == "__main__":
-    chat_context_builder()
+    if "--prune-glossaries" in sys.argv:
+        prune_glossaries()
+    else:
+        chat_context_builder()

@@ -69,3 +69,27 @@ def send_to_chat(chat_id: int, text: str, parse_mode: str = "HTML", timeout: int
     except Exception as e:
         logger.error("Failed to send to chat %d: %s", chat_id, e)
         return None
+
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+
+
+def invalidate_profile_cache(chat_pair_ids: list[int]) -> int:
+    """Drop the processor's Redis copy of these chat profiles (chat_profile:{id}).
+
+    The processor caches a profile for an hour; without this a glossary fix kept being
+    served from the stale copy. Best-effort: a Redis hiccup must not fail the flow, the
+    cache expires on its own.
+    """
+    if not chat_pair_ids:
+        return 0
+    import redis
+
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_timeout=3)
+        return int(r.delete(*[f"chat_profile:{pid}" for pid in chat_pair_ids]))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Could not invalidate profile cache: %s", exc)
+        return 0

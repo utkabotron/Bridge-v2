@@ -179,7 +179,7 @@ async def translate_node(state: MessageState) -> MessageState:
     has_profile = bool(chat_context)
 
     # Cache lookup: pair-specific first; for chats without profile also check global cache
-    cached = await get_cached(text, lang, chat_pair_id)
+    cached = await get_cached(text, lang, chat_pair_id, context=chat_context)
     if cached:
         logger.debug("Translation cache HIT (pair-specific)")
         return {**state, "translated_text": cached, "translation_ms": 0, "cache_hit": True}
@@ -188,7 +188,7 @@ async def translate_node(state: MessageState) -> MessageState:
         cached_global = await get_cached_global(text, lang)
         if cached_global:
             logger.debug("Translation cache HIT (global)")
-            await set_cached(text, lang, cached_global, chat_pair_id)  # populate pair cache too
+            await set_cached(text, lang, cached_global, chat_pair_id, context=chat_context)  # populate pair cache too
             return {**state, "translated_text": cached_global, "translation_ms": 0, "cache_hit": True}
 
     # LLM call — traced by LangSmith automatically
@@ -255,7 +255,7 @@ async def translate_node(state: MessageState) -> MessageState:
             len(text), len(translated), lang,
         )
     if not (is_degenerate or passthrough):
-        await set_cached(text, lang, translated, chat_pair_id)
+        await set_cached(text, lang, translated, chat_pair_id, context=chat_context)
         if not has_profile:
             await set_cached_global(text, lang, translated)
 
