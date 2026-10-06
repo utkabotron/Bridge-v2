@@ -170,3 +170,45 @@ def test_classify_marks_everyday_words_and_shortens_notes():
     conn = FakeConn(fetchall=[rows])
     gr.classify(conn, client, dry_run=True)
     assert conn.executed("executemany") == []
+
+
+def test_arbiter_admits_only_a_confident_single_reading():
+    one = {"decision": "one", "translation": "Саги", "confidence": 0.9, "evidence": "Sagi · https://he.wikipedia.org"}
+    assert gr.arbiter_decision(one) == ("verified", "Саги", "Sagi · https://he.wikipedia.org")
+    status, tr, ev = gr.arbiter_decision({"decision": "several", "readings": ["Ори", "Ури"], "confidence": 0.9})
+    assert (status, tr) == ("rejected", None) and ev == "решает чат: несколько прочтений: Ори, Ури"
+    assert gr.arbiter_decision({"decision": "not_name", "confidence": 0.9})[2] == "решает чат: не имя"
+    assert gr.arbiter_decision({**one, "confidence": 0.5})[0] == "rejected"
+    assert gr.arbiter_decision({**one, "translation": ""})[0] == "rejected"
+    assert gr.arbiter_decision(None) == ("proposed", None, None)
+
+
+def test_arbitrate_commits_as_it_goes_and_never_touches_admin_decisions():
+    rows = [{"id": i, "source": f"שם{i}", "target_language": "Russian", "kind": "person", "note": None,
+             "translation": "Х", "evidence": None, "chat_renderings": json.dumps({"А": 1, "Б": 1})}
+            for i in range(1, 12)]
+    answers = iter([{"decision": "one", "translation": "Саги", "confidence": 0.9}] * 10 + [None])
+
+    def respond(**_):
+        a = next(answers)
+        if a is None:
+            raise RuntimeError("down")
+        return SimpleNamespace(output_text=json.dumps(a, ensure_ascii=False), output=[SimpleNamespace(type="web_search_call")],
+                               usage=SimpleNamespace(input_tokens=10, output_tokens=10))
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=respond))
+    conn = FakeConn(fetchall=[rows])
+    result = gr.arbitrate(conn, client)
+
+    select = conn.executed("execute")[0][1]
+    assert "decided_by IS DISTINCT FROM 'admin'" in select
+    updates = conn.executed("execute")[1:]
+    assert len(updates) == 10                         # the failed one stays proposed
+    assert all("decided_by IS DISTINCT FROM 'admin'" in u[1] for u in updates)
+    assert conn.events.count("commit") == 1           # every 10
+    assert result["decisions"][-1]["status"] == "proposed" and result["searches"] == 10
+
+    conn = FakeConn(fetchall=[rows[:1]])
+    answers = iter([{"decision": "one", "translation": "Саги", "confidence": 0.9}])
+    gr.arbitrate(conn, client, dry_run=True)
+    assert len(conn.executed("execute")) == 1         # the SELECT only

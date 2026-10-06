@@ -18,6 +18,11 @@ is `proposed` for the admin's approval in the digest. A confident "not a name" i
   python -m flows.glossary_resolver --resolve --limit 20 --contested --dry-run
   python -m flows.glossary_resolver --resolve [--limit N] [--kind person|other]
   python -m flows.glossary_resolver --classify [--dry-run]       also_word + short hint
+  python -m flows.glossary_resolver --arbitrate [--limit N] [--dry-run]
+
+Contested names are settled by --arbitrate, not by hand: one web check per proposed entry;
+a confident single reading is verified, "several real readings" (אורי: Ори / Ури), "not a
+name" and "unsure" are rejected for the service — left to each chat's own profile.
 
 A name spelled like an everyday word (עמוס Amos / "busy") is `also_word`: the processor
 applies it only in the chats it was seen in (chat_pairs). In every prompt it turned
@@ -218,18 +223,7 @@ def resolve_people(client, sources: list[str], target_lang: str) -> tuple[dict[s
 
 def resolve_entity(client, source: str, note: str | None, target_lang: str) -> tuple[dict | None, float, int]:
     """(answer, cost, web searches) for one place / organisation / other name."""
-    request = {
-        "model": RESOLVER_MODEL,
-        "instructions": entity_prompt(target_lang),
-        "input": json.dumps({"name": source, "context_from_chat": note or ""}, ensure_ascii=False),
-        "max_output_tokens": 2000,
-        "reasoning": {"effort": "low"},
-        "tools": [{
-            "type": "web_search",
-            "search_context_size": "low",
-            "user_location": {"type": "approximate", "country": "IL", "timezone": "Asia/Jerusalem"},
-        }],
-    }
+    request = _web_request(entity_prompt(target_lang), {"name": source, "context_from_chat": note or ""})
     try:
         response = llm.respond(client, request, log=logger)
         searches = sum(1 for o in (response.output or []) if getattr(o, "type", "") == "web_search_call")
@@ -398,6 +392,115 @@ def resolve(conn, client, *, limit: int | None = None, contested: bool = False,
     return {"decisions": decisions, "cost": round(cost, 4), "searches": searches}
 
 
+# ── Arbiter: settling what the chats disagree on, from the web ──
+
+ARBITER_CONFIDENCE = float(os.getenv("GLOSSARY_ARBITER_CONFIDENCE", 0.75))
+NOT_SETTLED_NOTE = "решает чат"
+
+
+def arbiter_prompt(target_lang: str) -> str:
+    return f"""You settle how one name from Israeli WhatsApp groups is written in {target_lang}.
+The groups' own guesses disagree, or a first reading was unsure. Hebrew has no vowels, so
+check the web, do not guess:
+- a place, school, organisation, brand, app: its official Latin spelling (own website,
+  maps, Wikipedia, municipal / Ministry of Education pages);
+- a person's first name or surname: how the Hebrew name is pronounced (Hebrew name lists,
+  Wikipedia, behindthename) and how {target_lang}-speaking Israeli media write it.
+Decide:
+  "one"       the spelling has ONE usual reading — give it in {target_lang} script
+              (for Russian: ח/כ → х, צ → ц, the article ה → ха-; transliterate, never
+              translate the meaning: שער הדר → Шаар Хадар).
+  "several"   several real readings are common (אורי — Ори and Ури are both names): which
+              one is meant depends on the person or place, not on the spelling.
+  "not_name"  it is an everyday word or phrase, not a name.
+Return ONLY JSON: {{"decision": "one|several|not_name", "translation": "... or null",
+"readings": ["..."], "evidence": "official Latin spelling and/or URL", "confidence": 0.9,
+"why": "a few words"}}"""
+
+
+def _web_request(instructions: str, payload: dict) -> dict:
+    return {
+        "model": RESOLVER_MODEL,
+        "instructions": instructions,
+        "input": json.dumps(payload, ensure_ascii=False),
+        "max_output_tokens": 2000,
+        "reasoning": {"effort": "low"},
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "low",
+            "user_location": {"type": "approximate", "country": "IL", "timezone": "Asia/Jerusalem"},
+        }],
+    }
+
+
+def arbitrate_entry(client, row: dict) -> tuple[dict | None, float, int]:
+    """(answer, cost, web searches) for one proposed entry."""
+    payload = {"name": row["source"], "kind": row["kind"], "what_it_is": row.get("note") or "",
+               "variants_in_chats": row.get("chat_renderings") or {},
+               "first_reading": row.get("translation"), "first_reading_source": row.get("evidence") or ""}
+    try:
+        response = llm.respond(client, _web_request(arbiter_prompt(row["target_language"]), payload), log=logger)
+        searches = sum(1 for o in (response.output or []) if getattr(o, "type", "") == "web_search_call")
+        return _parse_json(response.output_text), llm.usage_cost(RESOLVER_MODEL, response.usage), searches
+    except Exception as exc:
+        logger.warning("Arbitrating %s failed: %s", row["source"], exc)
+        return None, 0.0, 0
+
+
+def arbiter_decision(answer: dict | None, threshold: float = ARBITER_CONFIDENCE) -> tuple[str, str | None, str | None]:
+    """(status, translation, evidence). Only a confident single reading enters the service
+    glossary; everything else is `rejected` there — which leaves the name to each chat's own
+    profile, where it is known who is meant. None answer → stays proposed (retry later)."""
+    if not answer:
+        return "proposed", None, None
+    try:
+        confidence = float(answer.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = _clean_rendering(answer.get("evidence"))[:400] or None
+    translation = _clean_rendering(answer.get("translation")) or None
+    decision = answer.get("decision")
+    if decision == "one" and translation and confidence >= threshold:
+        return "verified", translation, evidence
+    readings = ", ".join(_clean_rendering(r) for r in (answer.get("readings") or []) if _clean_rendering(r))
+    why = {"several": f"несколько прочтений: {readings}" if readings else "несколько прочтений",
+           "not_name": "не имя"}.get(decision, f"не уверен ({confidence:.2f})")
+    return "rejected", None, f"{NOT_SETTLED_NOTE}: {why}"[:400]
+
+
+def arbitrate(conn, client, *, limit: int | None = None, dry_run: bool = False) -> dict:
+    """Settle `proposed` entries no admin has decided, one web check each. Each decision is
+    committed as it comes, so a long run that dies keeps what it did."""
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT id, source, target_language, kind, note, translation, evidence, chat_renderings
+        FROM glossary WHERE status = 'proposed' AND decided_by IS DISTINCT FROM 'admin'
+        ORDER BY chats_seen DESC, id {"LIMIT %(limit)s" if limit else ""}
+    """, {"limit": limit})
+    rows = [dict(r) for r in cur.fetchall()]
+    cost, searches, decisions = 0.0, 0, []
+    for i, r in enumerate(rows, 1):
+        if isinstance(r.get("chat_renderings"), str):
+            r["chat_renderings"] = json.loads(r["chat_renderings"] or "{}")
+        answer, c, s = arbitrate_entry(client, r)
+        cost, searches = cost + c, searches + s
+        status, translation, evidence = arbiter_decision(answer)
+        decisions.append({"id": r["id"], "source": r["source"], "chats": r["chat_renderings"],
+                          "first": r.get("translation"), "status": status, "translation": translation,
+                          "evidence": evidence, "answer": answer})
+        if dry_run or status == "proposed":
+            continue
+        cur.execute("""
+            UPDATE glossary
+            SET status = %s, translation = coalesce(%s, translation), evidence = coalesce(%s, evidence),
+                confidence = %s, decided_by = 'auto', decided_at = now(), updated_at = now()
+            WHERE id = %s AND status = 'proposed' AND decided_by IS DISTINCT FROM 'admin'
+        """, (status, translation, evidence, float((answer or {}).get("confidence") or 0), r["id"]))
+        if i % 10 == 0:
+            conn.commit()
+    return {"decisions": decisions, "cost": round(cost, 4), "searches": searches}
+
+
 def _print_decisions(result: dict) -> None:
     for d in result["decisions"]:
         a = d["answer"] or {}
@@ -420,6 +523,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--import", dest="do_import", action="store_true")
     parser.add_argument("--resolve", action="store_true")
     parser.add_argument("--classify", action="store_true")
+    parser.add_argument("--arbitrate", action="store_true")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--contested", action="store_true")
     parser.add_argument("--kind", choices=("person", "other"))
@@ -436,6 +540,18 @@ def main(argv: list[str] | None = None) -> None:
             result = resolve(conn, client, limit=args.limit, contested=args.contested,
                              kind=args.kind, dry_run=args.dry_run)
         _print_decisions(result)
+    if args.arbitrate:
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        with db_conn() as conn:
+            result = arbitrate(conn, client, limit=args.limit, dry_run=args.dry_run)
+        for d in result["decisions"]:
+            chats = ", ".join(f"{r}×{n}" for r, n in d["chats"].items())
+            print(f"{d['status']:9} {d['source']:<20} → {d['translation'] or '—':<18} "
+                  f"chats: {chats}  [{d['evidence'] or ''}]")
+        counts = defaultdict(int)
+        for d in result["decisions"]:
+            counts[d["status"]] += 1
+        print(f"\n{dict(counts)} · cost ${result['cost']} · web searches {result['searches']}")
     if args.classify or (args.resolve and not args.dry_run):
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
         with db_conn() as conn:
