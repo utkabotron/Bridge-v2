@@ -19,7 +19,6 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
-from .shared import esc, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -521,106 +520,14 @@ def store_weekly_insights(data: dict, o3_result: dict) -> int:
     return insight_id
 
 
-@task(retries=1, name="notify-weekly-report")
-def notify_weekly_report(data: dict, o3_result: dict) -> int:
-    """Send executive summary + key metrics + recommendations via Telegram."""
-    logger = get_run_logger()
-
-    analysis = o3_result["analysis"]
-    msgs = data["messages"]
-    total = msgs["total_messages"]
-    delivered = msgs["delivered"]
-    failed = msgs["failed"]
-    mapped_total = msgs.get("mapped_total", 0)
-    mapped_failed = msgs.get("mapped_failed", 0)
-    fail_rate = round(mapped_failed / mapped_total * 100, 1) if mapped_total else 0
-    avg_ms = msgs.get("avg_translation_ms")
-    avg_str = f"{float(avg_ms):.0f}ms" if avg_ms else "—"
-
-    lines = [
-        "🧠 <b>Weekly Intelligence Report</b>",
-        f"📅 {data['period_start']} → {data['period_end']}\n",
-    ]
-
-    # Executive summary
-    summary = analysis.get("executive_summary", "")
-    if summary:
-        lines.append(f"<b>TL;DR:</b> {esc(summary)}\n")
-
-    # Key metrics
-    lines.append("<b>📊 Metrics:</b>")
-    lines.append(f"  Messages: {total} (delivered: {delivered}, failed: {failed})")
-    lines.append(f"  Failure rate: {fail_rate}% | Avg translation: {avg_str}")
-
-    # Direct interactions
-    di = data.get("direct_interactions", {})
-    if di.get("total", 0) > 0:
-        lines.append(f"  Direct: {di['translations']} translations, {di['analyses']} analyses ({di['failed']} failed)")
-
-    # Quality trend
-    tq = analysis.get("translation_quality", {})
-    scores = tq.get("avg_scores", {})
-    trend = tq.get("trend", "unknown")
-    trend_emoji = {"improving": "📈", "stable": "➡️", "degrading": "📉"}.get(trend, "❓")
-    if scores:
-        lines.append(
-            f"  Quality: {scores.get('quality', '—')} | "
-            f"Accuracy: {scores.get('accuracy', '—')} | "
-            f"Naturalness: {scores.get('naturalness', '—')} {trend_emoji}"
-        )
-    lines.append("")
-
-    # Top recommendations
-    recommendations = analysis.get("recommendations", [])
-    if recommendations:
-        lines.append(f"<b>🎯 Recommendations ({len(recommendations)}):</b>")
-        for rec in recommendations[:3]:
-            area = rec.get("area", "").upper()
-            action = esc(rec.get("action", ""))
-            lines.append(f"  {rec.get('priority', '•')}. [{area}] {action}")
-        if len(recommendations) > 3:
-            lines.append(f"  ... +{len(recommendations) - 3} more in DB")
-        lines.append("")
-
-    # Prompt status
-    prompt_eval = analysis.get("prompt_evaluation", {})
-    reviews = prompt_eval.get("suggestion_reviews", [])
-    new_draft = prompt_eval.get("new_prompt_draft")
-    if reviews or new_draft:
-        applied = sum(1 for r in reviews if r.get("verdict") == "apply")
-        rejected = sum(1 for r in reviews if r.get("verdict") == "reject")
-        lines.append("<b>📝 Prompt:</b>")
-        if reviews:
-            lines.append(f"  Reviewed {len(reviews)} suggestions: ✅{applied} ❌{rejected}")
-        if new_draft:
-            lines.append("  ⚡ New prompt draft available in DB!")
-        lines.append("")
-
-    # Backlog count
-    open_backlog = len(data.get("open_backlog", []))
-    if open_backlog:
-        lines.append(f"🔴 Open backlog issues: {open_backlog}")
-
-    # Cost
-    tokens = o3_result.get("tokens_used", 0)
-    cost = tokens * 0.010 / 1000
-    lines.append(f"\n💰 o3: {tokens:,} tokens (~${cost:.2f})")
-
-    text = "\n".join(lines)
-    sent = notify_telegram(text, timeout=15)
-
-    logger.info("Sent weekly intelligence report to %d admins", sent)
-    return sent
-
-
 @flow(name="weekly-report", log_prints=True)
 def weekly_report():
-    """Weekly intelligence: collect data → load history → o3 analysis → store → notify."""
+    """Weekly intelligence: collect data → load history → o3 analysis → store."""
     data = collect_weekly_data()
     previous_insights = load_previous_insights()
     o3_result = analyze_with_o3(data, previous_insights)
     insight_id = store_weekly_insights(data, o3_result)
-    notified = notify_weekly_report(data, o3_result)
+    # No Telegram message of its own: Monday's digest carries the summary and top three.
 
     analysis = o3_result.get("analysis", {})
     return {
@@ -636,7 +543,6 @@ def weekly_report():
         ),
         "tokens_used": o3_result.get("tokens_used", 0),
         "insight_id": insight_id,
-        "admins_notified": notified,
     }
 
 

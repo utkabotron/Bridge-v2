@@ -26,7 +26,6 @@ from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import jev_eval, quality_stats
-from .shared import esc, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -562,125 +561,6 @@ def store_quality_results(
     return run_id
 
 
-@task(retries=1, name="notify-quality-report")
-def notify_quality_report(suggestion_result: dict, jev_info: dict | None = None) -> int:
-    """Send translation quality report and prompt suggestions to admins."""
-    logger = get_run_logger()
-
-    avg_scores = suggestion_result.get("avg_scores", {})
-    issue_counts = suggestion_result.get("issue_counts", {})
-    suggestions = suggestion_result.get("suggestions", [])
-    worst_examples = suggestion_result.get("worst_examples", [])
-
-    # Count pending suggestions from all previous runs
-    pending_count = 0
-    try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT count(*) FROM prompt_suggestions WHERE status = 'pending'")
-        pending_count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-    except Exception:
-        pass
-
-    if not suggestions and not issue_counts:
-        logger.info("No suggestions or issues, skipping notification")
-        return 0
-
-    def _trunc(s: str, limit: int = 120) -> str:
-        return s[:limit] + "…" if len(s) > limit else s
-
-    lines = ["📊 <b>Translation Quality Report</b>\n"]
-
-    # Scores
-    if avg_scores:
-        lines.append("<b>Avg scores (1-5):</b>")
-        lines.append(f"  Quality: {avg_scores.get('quality', '—')}")
-        lines.append(f"  Accuracy: {avg_scores.get('accuracy', '—')}")
-        lines.append(f"  Naturalness: {avg_scores.get('naturalness', '—')}\n")
-
-    breakdown = suggestion_result.get("breakdown") or {}
-    by_source = breakdown.get("by_source") or {}
-    if by_source:
-        parts = [
-            f"{esc(src)} {st['quality'] if st['quality'] is not None else '—'} (n={st['n']}, bad {st['bad_pct'] or 0}%)"
-            for src, st in by_source.items()
-        ]
-        lines.append("<b>By source:</b> " + ", ".join(parts))
-    worst = suggestion_result.get("worst_pair")
-    if worst:
-        lines.append(
-            f"⚠️ <b>Worst pair #{worst['key']}:</b> {worst['bad']}/{worst['n']} bad "
-            f"({worst['bad_pct']}%), avg {worst['quality']}"
-        )
-    if by_source or worst:
-        lines.append("")
-
-    # Issues
-    if issue_counts:
-        lines.append("<b>Issues found:</b>")
-        for itype, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"  {esc(itype)}: {count}")
-        lines.append("")
-
-    # Worst translation examples
-    if worst_examples:
-        lines.append(f"<b>Worst translations ({len(worst_examples[:3])}):</b>\n")
-        for ex in worst_examples[:3]:
-            orig = _trunc(esc(ex.get("original", "")))
-            trans = _trunc(esc(ex.get("translated", "")))
-            lang = esc(ex.get("target_language", "?"))
-            score = ex.get("quality_score", "?")
-            issues = ", ".join(ex.get("issue_types", []))
-            lines.append(f"<code>{orig}</code>")
-            lines.append(f"→ <code>{trans}</code>")
-            lines.append(f"  [{lang}, score {score}] {esc(issues)}\n")
-
-    # Suggestions
-    if suggestions:
-        lines.append(f"<b>Prompt suggestions ({len(suggestions)}):</b>\n")
-        for i, sug in enumerate(suggestions, 1):
-            lines.append(f"{i}. {esc(sug['suggestion'])}")
-            if sug.get("rationale"):
-                lines.append(f"   <i>{esc(sug['rationale'])}</i>\n")
-
-    if pending_count > 0:
-        lines.append(f"⏳ <b>Pending suggestions: {pending_count}</b> — review in DB\n")
-
-    jev_line = _jev_report_line(jev_info or {})
-    if jev_line:
-        lines.append(jev_line)
-
-    text = "\n".join(lines)
-    sent = notify_telegram(text)
-
-    logger.info("Sent quality report to %d admins", sent)
-    return sent
-
-
-def _jev_report_line(jev_info: dict) -> str:
-    """One line in the admin report on what Jev did tonight."""
-    if jev_info.get("fallback"):
-        return f"⚠️ <b>Jev unavailable</b> — LLM only tonight: <code>{esc(jev_info['fallback'])}</code>"
-    if jev_info.get("mode") == "primary":
-        return (
-            f"🤖 Jev scored {jev_info.get('evaluated', 0)} translations "
-            f"({jev_info.get('failed', 0)} failed); LLM explained the worst {jev_info.get('detailed', 0)}."
-        )
-    agreement = jev_info.get("agreement") or {}
-    if jev_info.get("mode") == "shadow" and agreement.get("n"):
-        def pct(v):
-            return "—" if v is None else f"{v:.0%}"
-        return (
-            f"🔬 <b>Jev vs LLM</b> on {agreement['n']} translations: "
-            f"MAE {agreement['mae']}, within ±1 {pct(agreement['within_1'])}, "
-            f"bad recall {pct(agreement['bad_recall'])} / precision {pct(agreement['bad_precision'])} "
-            f"(Jev scored {jev_info.get('evaluated', 0)})"
-        )
-    return ""
-
-
 def _resolve_jev_mode(logger) -> str:
     if JEV_MODE not in ("off", "shadow", "primary"):
         logger.warning("Unknown JEV_MODE=%r — treating as off", JEV_MODE)
@@ -699,7 +579,7 @@ def _merge_detailed(jev_evals: list[dict], llm_evals: list[dict]) -> list[dict]:
 
 @flow(name="translation-quality", log_prints=True)
 def translation_quality():
-    """Nightly translation quality: sample → evaluate → suggest → store → notify."""
+    """Nightly translation quality: sample → evaluate → suggest → store."""
     logger = get_run_logger()
     mode = _resolve_jev_mode(logger)
     jev_info: dict = {"mode": mode}
@@ -756,7 +636,7 @@ def translation_quality():
     pending = fetch_pending_suggestions()
     suggestion_result = generate_suggestions(eval_result.get("evaluations", []), pending)
     run_id = store_quality_results(eval_result, suggestion_result, shadow_evaluations, jev_info)
-    notified = notify_quality_report(suggestion_result, jev_info)
+    # No Telegram message of its own: the morning digest (daily_digest.py) reads this run.
     return {
         "run_id": run_id,
         "jev_mode": jev_info["mode"],
@@ -764,7 +644,6 @@ def translation_quality():
         "evaluations": len(eval_result.get("evaluations", [])),
         "shadow_evaluations": len(shadow_evaluations),
         "suggestions": len(suggestion_result.get("suggestions", [])),
-        "admins_notified": notified,
     }
 
 

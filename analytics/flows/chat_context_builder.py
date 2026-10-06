@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import date
 
 import psycopg2
 import psycopg2.extras
@@ -29,7 +28,7 @@ from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
 from . import glossary as glossary_rules
-from .shared import esc, invalidate_profile_cache, notify_telegram
+from .shared import invalidate_profile_cache
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -437,97 +436,9 @@ def apply_quality_feedback() -> list[dict]:
     return outcomes
 
 
-@task(retries=1, name="notify-profile-changes")
-def notify_profile_changes(results: list[dict], feedback: list[dict] | None = None) -> int:
-    """Notify admins about new glossary entries and members, and what got thrown out."""
-    logger = get_run_logger()
-
-    feedback = feedback or []
-    # Filter to results with actual changes
-    changes = []
-    for r in results or []:
-        delta = r["delta"]
-        if delta.get("glossary") or delta.get("members") or delta.get("mentioned_people") or r.get("dropped"):
-            changes.append(r)
-
-    if not changes and not feedback:
-        logger.info("No glossary/member changes to notify")
-        return 0
-
-    lines = [f"📖 <b>Chat Context Update</b> ({date.today().isoformat()})\n"]
-
-    total_glossary = 0
-    total_members = 0
-
-    for r in changes[:10]:  # cap at 10 chats to avoid message_too_long
-        delta = r["delta"]
-        pair_id = r["chat_pair_id"]
-        glossary = delta.get("glossary", {})
-        members = delta.get("members", {})
-        mentioned = delta.get("mentioned_people", {})
-        dropped = r.get("dropped") or {}
-
-        total_glossary += len(glossary)
-        total_members += len(members)
-
-        chat_desc = delta.get("chat_description") or f"pair #{pair_id}"
-        lines.append(f"<b>{esc(str(chat_desc))}</b>")
-
-        if glossary:
-            items = []
-            for word, info in list(glossary.items())[:8]:
-                if isinstance(info, dict):
-                    trans = info.get("translation", "")
-                    items.append(f"{esc(word)} → {esc(trans)}")
-                else:
-                    items.append(f"{esc(word)} → {esc(str(info))}")
-            lines.append(f"  Glossary: {', '.join(items)}")
-
-        if dropped:
-            items = [f"{esc(k)} ({esc(v)})" for k, v in list(dropped.items())[:8]]
-            lines.append(f"  Rejected: {', '.join(items)}")
-
-        if members:
-            items = [f"{esc(k)} → {esc(v)}" for k, v in list(members.items())[:8]]
-            lines.append(f"  Members: {', '.join(items)}")
-
-        if mentioned:
-            items = []
-            for name, info in list(mentioned.items())[:8]:
-                if isinstance(info, dict):
-                    trans = info.get("transliteration", "")
-                    rel = info.get("relation", "")
-                    items.append(f"{esc(name)} → {esc(trans)} ({esc(rel)})")
-                else:
-                    items.append(f"{esc(name)} → {esc(str(info))}")
-            lines.append(f"  Mentioned: {', '.join(items)}")
-
-        lines.append("")
-
-    for fb in feedback[:10]:
-        line = f"🧹 pair #{fb['chat_pair_id']}: evaluator flagged {esc(', '.join(fb['flagged']))}"
-        if fb["removed"]:
-            line += f" — <b>removed {esc(', '.join(fb['removed']))}</b>"
-        lines.append(line)
-    if feedback:
-        lines.append("")
-
-    lines.append(f"<b>Total:</b> +{total_glossary} glossary, +{total_members} members across {len(changes)} chats")
-
-    total_tokens = sum(r.get("tokens_used", 0) for r in results or [])
-    if total_tokens:
-        lines.append(f"Tokens: {total_tokens}")
-
-    text = "\n".join(lines)
-    sent = notify_telegram(text)
-
-    logger.info("Sent context update to %d admins", sent)
-    return sent
-
-
 @flow(name="chat-context-builder", log_prints=True)
 def chat_context_builder():
-    """Build per-chat translation context: feedback → collect → extract → validate → store → notify."""
+    """Build per-chat translation context: feedback → collect → extract → validate → store."""
     logger = get_run_logger()
 
     feedback = apply_quality_feedback()
@@ -544,14 +455,13 @@ def chat_context_builder():
     if not chat_data_list:
         logger.info("No chats with enough messages to extract from")
 
-    notified = notify_profile_changes(results, feedback)
-
+    # No Telegram message of its own: the morning digest counts glossary additions and
+    # removals from chat_profile_history.
     return {
         "chats_analyzed": len(chat_data_list),
         "profiles_extracted": len(results),
         "profiles_stored": stored,
         "glossary_feedback": len(feedback),
-        "admins_notified": notified,
         "total_tokens": sum(r.get("tokens_used", 0) for r in results),
     }
 

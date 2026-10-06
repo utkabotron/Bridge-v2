@@ -254,6 +254,12 @@ PostgreSQL 16. asyncpg (processor, bot), psycopg2 (analytics). No ORM.
 | weekly-report | 0 5 * * 1 | o3 |
 | daily-chat-summary | */30 * * * * | gpt-4.1-mini |
 | nightly-backup | 30 2 * * * | — (pg_dump, 7 копий) |
+| daily-digest | 20 5 * * * | — (единственное утреннее сообщение админам) |
+
+Ночные flow (problems, quality, context, weekly) в Telegram НЕ пишут — только `daily-digest`
+(`analytics/flows/daily_digest.py`) читает их результаты из БД и шлёт один дайджест на русском.
+Алерты по событиям (health, DLQ, кредиты OpenAI, бэкап) — отдельно, как были.
+Проверить текст без отправки: `docker compose exec -e DIGEST_DRY_RUN=1 analytics python -m flows.daily_digest`.
 
 ## ONBOARDING
 

@@ -18,7 +18,6 @@ import psycopg2.extras
 from openai import OpenAI
 from prefect import flow, get_run_logger, task
 
-from .shared import esc, notify_telegram
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://bridge:bridge@postgres:5432/bridge")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -316,79 +315,18 @@ def store_results(stats: dict, analysis: dict) -> int:
     return run_id
 
 
-@task(retries=1, name="notify-admin")
-def notify_admin(stats: dict, analysis: dict) -> int:
-    """Send full nightly problems report to admins."""
-    logger = get_run_logger()
-
-    issues = analysis.get("issues", [])
-
-    today = date.today().isoformat()
-    lines = [f"🔍 <b>Nightly Problems Report</b> ({today})\n"]
-
-    # Stats overview
-    overview = stats.get("overview", {})
-    if overview:
-        total = overview.get("total_messages", 0)
-        delivered = overview.get("delivered", 0)
-        failed = overview.get("failed", 0)
-        avg_ms = overview.get("avg_translation_ms")
-        avg_str = f"{avg_ms:.0f}ms" if avg_ms else "—"
-        slow = overview.get("slow_translations", 0)
-        mapped_total = overview.get("mapped_total", 0)
-        mapped_failed = overview.get("mapped_failed", 0)
-        fail_rate = round(mapped_failed / mapped_total * 100, 1) if mapped_total else 0
-        lines.append("<b>Stats (24h):</b>")
-        lines.append(f"  Total: {total}  Delivered: {delivered}  Failed: {failed}")
-        lines.append(f"  Mapped: {mapped_total} (failed: {mapped_failed}, rate: {fail_rate}%)")
-        lines.append(f"  Avg translation: {avg_str}  Slow (>3s): {slow}")
-        di = stats.get("direct_interactions", {})
-        if di.get("total", 0) > 0:
-            lines.append(f"  Direct: {di['translations']} translations, {di['analyses']} analyses ({di['failed']} failed)")
-        lines.append("")
-
-    # Issues by severity
-    critical = [i for i in issues if i["severity"] == "critical"]
-    warnings = [i for i in issues if i["severity"] == "warning"]
-    infos = [i for i in issues if i["severity"] == "info"]
-
-    if not issues:
-        lines.append("✅ No issues detected")
-    else:
-        lines.append(f"<b>Issues ({len(issues)}):</b> 🚨{len(critical)} ⚠️{len(warnings)} ℹ️{len(infos)}\n")
-
-        for severity_label, severity_issues, emoji in [
-            ("Critical", critical, "🚨"),
-            ("Warning", warnings, "⚠️"),
-            ("Info", infos, "ℹ️"),
-        ]:
-            for issue in severity_issues:
-                lines.append(f"{emoji} <b>{esc(issue['title'])}</b>")
-                lines.append(f"  {esc(issue.get('description', ''))}")
-                if issue.get("suggested_fix"):
-                    lines.append(f"  Fix: <i>{esc(issue['suggested_fix'])}</i>")
-                lines.append("")
-
-    text = "\n".join(lines)
-    sent = notify_telegram(text)
-
-    logger.info("Sent nightly report to %d admins (%d issues)", sent, len(issues))
-    return sent
-
-
 @flow(name="nightly-problems", log_prints=True)
 def nightly_problems():
-    """Nightly problem detection: collect stats → LLM analysis → store → notify."""
+    """Nightly problem detection: collect stats → LLM analysis → store."""
     stats = collect_stats()
     open_issues = fetch_open_issues()
     analysis = analyze_with_llm(stats, open_issues)
     run_id = store_results(stats, analysis)
-    notified = notify_admin(stats, analysis)
+    # No Telegram message of its own: the morning digest (daily_digest.py) reads this run.
     return {
         "run_id": run_id,
         "issues_found": len(analysis.get("issues", [])),
         "critical": len([i for i in analysis.get("issues", []) if i["severity"] == "critical"]),
-        "admins_notified": notified,
     }
 
 

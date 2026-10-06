@@ -9,6 +9,7 @@ from flows.weekly_report import weekly_report
 from flows.chat_context_builder import chat_context_builder
 from flows.daily_chat_summary import daily_chat_summary
 from flows.backup import nightly_backup
+from flows.daily_digest import daily_digest
 if __name__ == "__main__":
     serve(
         nightly_problems.to_deployment(
@@ -42,5 +43,9 @@ if __name__ == "__main__":
         nightly_backup.to_deployment(
             name="nightly-backup",
             cron="30 2 * * *",
+        ),
+        daily_digest.to_deployment(
+            name="daily-digest",
+            cron="20 5 * * *",
         ),
     )
