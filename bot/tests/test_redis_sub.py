@@ -87,3 +87,22 @@ def test_buffered_events_keep_their_own_handler():
         ({"userId": 1}, redis_sub.handle_wa_disconnected),
         ({"userId": 2}, redis_sub.handle_qr_event),
     ]
+
+
+def test_pubsub_client_authenticates_when_password_set(monkeypatch):
+    monkeypatch.setenv("REDIS_PASSWORD", "s3cret")
+    with patch.object(redis_sub.redis, "Redis") as client:
+        redis_sub._make_pubsub_redis()
+    assert client.call_args.kwargs["password"] == "s3cret"
+
+
+@pytest.mark.parametrize("value", ["", None])
+def test_pubsub_client_skips_auth_when_password_empty(monkeypatch, value):
+    # AUTH "" against a Redis without requirepass is an error, so empty must mean "no AUTH".
+    if value is None:
+        monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("REDIS_PASSWORD", value)
+    with patch.object(redis_sub.redis, "Redis") as client:
+        redis_sub._make_pubsub_redis()
+    assert client.call_args.kwargs["password"] is None

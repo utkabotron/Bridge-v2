@@ -55,6 +55,40 @@ describe('retryStrategy', () => {
   });
 });
 
+// ── connection options ───────────────────────────────────
+
+describe('connection options', () => {
+  const original = process.env.REDIS_PASSWORD;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.REDIS_PASSWORD;
+    else process.env.REDIS_PASSWORD = original;
+  });
+
+  // config.js reads the env once at require time, so load a fresh copy per case.
+  function optionsWith(password) {
+    if (password === undefined) delete process.env.REDIS_PASSWORD;
+    else process.env.REDIS_PASSWORD = password;
+    let opts;
+    jest.isolateModules(() => {
+      const Redis = require('ioredis');
+      require('../src/redis-publisher');
+      opts = Redis.mock.calls[0][0];
+    });
+    return opts;
+  }
+
+  test('passes REDIS_PASSWORD to ioredis', () => {
+    expect(optionsWith('s3cret').password).toBe('s3cret');
+  });
+
+  test('empty or unset REDIS_PASSWORD means no AUTH', () => {
+    // A missing .env line must keep a passwordless Redis reachable, not send AUTH "".
+    expect(optionsWith('').password).toBeUndefined();
+    expect(optionsWith(undefined).password).toBeUndefined();
+  });
+});
+
 // ── publishMessage ───────────────────────────────────────
 
 describe('publishMessage', () => {

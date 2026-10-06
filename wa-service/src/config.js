@@ -8,6 +8,8 @@ module.exports = {
   REDIS_HOST: process.env.REDIS_HOST || 'localhost',
   REDIS_PORT: parseInt(process.env.REDIS_PORT) || 6379,
   REDIS_DB: parseInt(process.env.REDIS_DB) || 0,
+  // Empty/unset = no AUTH, so a missing .env line keeps a passwordless Redis reachable.
+  REDIS_PASSWORD: process.env.REDIS_PASSWORD || undefined,
   REDIS_RETRY_LIMIT: parseInt(process.env.REDIS_RETRY_LIMIT) || 10,
   REDIS_RETRY_DELAY_BASE: parseInt(process.env.REDIS_RETRY_DELAY_BASE) || 500,
   REDIS_RETRY_DELAY_MAX: parseInt(process.env.REDIS_RETRY_DELAY_MAX) || 5000,

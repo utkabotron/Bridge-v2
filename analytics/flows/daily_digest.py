@@ -21,13 +21,10 @@ from datetime import date, datetime
 import httpx
 from prefect import flow, get_run_logger, task
 
-from .shared import db_conn, esc, notify_telegram
+from .shared import db_conn, esc, notify_telegram, redis_client
 
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
 PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://processor:8000")
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 DISK_PCT_THRESHOLD = int(os.getenv("DISK_PCT_THRESHOLD", "85"))
 
 MAX_USERS = 12
@@ -49,9 +46,7 @@ def _system_state() -> dict:
     except Exception as exc:
         out["wa_error"] = str(exc)[:80]
     try:
-        import redis
-
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_timeout=3)
+        r = redis_client()
         out["queue"] = r.llen("messages:in") + r.llen("messages:processing")
         out["dlq"] = r.llen("messages:dlq")
         out["dlq_dead"] = r.llen("messages:dlq:dead")

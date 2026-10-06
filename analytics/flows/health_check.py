@@ -18,16 +18,12 @@ import shutil
 from datetime import datetime, timedelta, timezone
 
 import httpx
-import redis
 from prefect import flow, get_run_logger, task
 
-from .shared import db_conn, notify_telegram
+from .shared import db_conn, notify_telegram, redis_client
 
 WA_SERVICE_URL = os.getenv("WA_SERVICE_URL", "http://wa-service:3000")
 PROCESSOR_URL = os.getenv("PROCESSOR_URL", "http://processor:8000")
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
 FAILURE_RATE_THRESHOLD = float(os.getenv("FAILURE_RATE_THRESHOLD", "0.05"))
 FAILURE_RATE_MIN_MSGS = int(os.getenv("FAILURE_RATE_MIN_MSGS", "5"))
@@ -48,8 +44,7 @@ _ALERT_COOLDOWN = int(os.getenv("HEALTH_ALERT_COOLDOWN", "3600"))
 
 
 def _redis():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
-                       decode_responses=True, socket_timeout=5)
+    return redis_client(decode_responses=True, socket_timeout=5)
 
 
 def _alert_once(key: str, message: str) -> bool:

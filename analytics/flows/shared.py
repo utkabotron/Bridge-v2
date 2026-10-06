@@ -102,6 +102,22 @@ def send_to_chat(chat_id: int, text: str, parse_mode: str = "HTML", timeout: int
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+# Empty/unset = no AUTH, so a missing .env line keeps a passwordless Redis reachable.
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+
+
+def redis_client(**kw):
+    """A Redis client with the bridge's connection settings; keyword args override them.
+
+    Each flow used to build its own client from copied host/port/db constants, so a new
+    connection setting (the password) had to be remembered in every one of them.
+    """
+    import redis
+
+    opts = {"host": REDIS_HOST, "port": REDIS_PORT, "db": REDIS_DB,
+            "password": REDIS_PASSWORD, "socket_timeout": 3}
+    opts.update(kw)
+    return redis.Redis(**opts)
 
 
 def invalidate_profile_cache(chat_pair_ids: list[int]) -> int:
@@ -113,10 +129,8 @@ def invalidate_profile_cache(chat_pair_ids: list[int]) -> int:
     """
     if not chat_pair_ids:
         return 0
-    import redis
-
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, socket_timeout=3)
+        r = redis_client()
         return int(r.delete(*[f"chat_profile:{pid}" for pid in chat_pair_ids]))
     except Exception as exc:
         logging.getLogger(__name__).warning("Could not invalidate profile cache: %s", exc)
