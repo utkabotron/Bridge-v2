@@ -76,3 +76,39 @@ def test_nothing_is_called_while_suggestions_are_disabled(patched, monkeypatch):
 
     assert requests == [] and client.calls == []
     assert result["suggestions"] == [] and result["tokens_used"] == 0
+
+
+def test_parse_evaluations_accepts_json_mode_and_rejects_broken_answers():
+    assert tq._parse_evaluations('{"evaluations": [{"sample_index": 0}]}') == [{"sample_index": 0}]
+    assert tq._parse_evaluations('```json\n[{"sample_index": 1}]\n```') == [{"sample_index": 1}]
+    assert tq._parse_evaluations('[{"detail": "ביה"ס"}]') is None          # 07.10: unescaped quote
+    assert tq._parse_evaluations('{"other": 1}') is None
+    assert tq._parse_evaluations("") is None
+
+
+def test_a_broken_batch_is_retried_alone_then_skipped(monkeypatch):
+    """One bad answer used to fail the task and Prefect re-paid every batch."""
+    answers = iter([
+        json.dumps({"evaluations": [{"sample_index": i, "quality_score": 5, "issues": []} for i in range(10)]}),
+        '{"evaluations": [{"detail": "broken"',          # batch 2, attempt 1
+        '[{"detail": "ביה"ס"}]',                          # batch 2, attempt 2: skipped
+        json.dumps({"evaluations": [{"sample_index": 0, "quality_score": 4, "issues": []}]}),
+    ])
+    calls = []
+
+    def create(**kw):
+        calls.append(kw)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=next(answers)))],
+                               usage=SimpleNamespace(prompt_tokens=10, completion_tokens=10, total_tokens=20))
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(tq, "OpenAI", lambda **_: client)
+    monkeypatch.setattr(tq, "get_run_logger", lambda: logging.getLogger("test"))
+    samples = [{"id": i, "original_text": f"טקסט {i}", "translated_text": f"текст {i}",
+                "target_language": "Russian", "source": "bridge"} for i in range(21)]
+
+    result = tq.evaluate_translations.fn(samples)
+
+    assert len(calls) == 4                                     # 3 batches, one retried
+    assert all(c.get("response_format") == {"type": "json_object"} for c in calls)
+    assert [e["message_event_id"] for e in result["evaluations"]] == list(range(10)) + [20]

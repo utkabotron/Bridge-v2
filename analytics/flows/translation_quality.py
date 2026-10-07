@@ -191,6 +191,25 @@ def jev_score(samples: list[dict]) -> dict:
     return result
 
 
+def _parse_evaluations(content: str | None) -> list[dict] | None:
+    """The judge's evaluations, or None when the answer is not usable JSON.
+
+    Accepts {"evaluations": [...]} (JSON mode) and a bare array (what the prompt asked for
+    before), with or without markdown fences."""
+    content = (content or "").strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(data, dict):
+        data = data.get("evaluations")
+    if not isinstance(data, list):
+        return None
+    return [e for e in data if isinstance(e, dict)]
+
+
 @task(retries=1, name="evaluate-translations")
 def evaluate_translations(samples: list[dict]) -> dict:
     """Evaluate translation quality in batches of 10."""
@@ -208,7 +227,8 @@ def evaluate_translations(samples: list[dict]) -> dict:
     cost_total = 0.0
 
     system_prompt = """You are a translation quality evaluator for a WhatsApp→Telegram bridge.
-Evaluate each translation pair and return a JSON array with one object per sample.
+Evaluate each translation pair and return a JSON object {"evaluations": [...]} with one
+object per sample in the array.
 
 Each object must have:
 - sample_index: int (0-based index matching input order)
@@ -230,8 +250,9 @@ Scoring guide:
 
 Consider the target_language field when evaluating — check that the translation is actually in the expected language and natural for that language.
 
-Return ONLY the JSON array, no markdown fences."""
+Return ONLY the JSON object, no markdown fences."""
 
+    skipped = 0
     for i in range(0, len(evaluable), BATCH_SIZE):
         batch = evaluable[i : i + BATCH_SIZE]
         pairs = []
@@ -243,23 +264,30 @@ Return ONLY the JSON array, no markdown fences."""
                 "target_language": s.get("target_language", "Unknown"),
             })
 
-        response = llm.complete(client, llm.build_request(
+        request = llm.build_request(
             EVAL_MODEL,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(pairs, ensure_ascii=False)},
             ],
-            max_tokens=3000,
-        ), log=logger)
-
-        content = (response.choices[0].message.content or "").strip()
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-        batch_evals = json.loads(content)
-        tokens = llm.total_tokens(response.usage)
+            max_tokens=3000, json_mode=True,
+        )
+        # One unparseable answer used to fail the whole task, and Prefect's retry then paid
+        # for every batch again (07.10: an unescaped quote at char 2092 of batch 30-40). JSON
+        # mode makes that rare; a bad batch is retried once on its own, then skipped.
+        batch_evals, tokens = None, 0
+        for attempt in (1, 2):
+            response = llm.complete(client, request, log=logger)
+            tokens += llm.total_tokens(response.usage)
+            cost_total += llm.usage_cost(EVAL_MODEL, response.usage)
+            batch_evals = _parse_evaluations(response.choices[0].message.content)
+            if batch_evals is not None:
+                break
+            logger.warning("Batch %d-%d: unparseable judge answer (attempt %d)", i, i + len(batch), attempt)
         total_tokens += tokens
-        cost_total += llm.usage_cost(EVAL_MODEL, response.usage)
+        if batch_evals is None:
+            skipped += len(batch)
+            continue
 
         # Attach message_event_id to each evaluation
         for ev in batch_evals:
@@ -277,7 +305,8 @@ Return ONLY the JSON array, no markdown fences."""
         all_evals.extend(batch_evals)
         logger.info("Evaluated batch %d-%d (%d tokens)", i, i + len(batch), tokens)
 
-    logger.info("Total evaluations: %d, tokens: %d, cost $%.3f (%s)", len(all_evals), total_tokens, cost_total, EVAL_MODEL)
+    logger.info("Total evaluations: %d, tokens: %d, cost $%.3f (%s)%s", len(all_evals), total_tokens, cost_total,
+                EVAL_MODEL, f", skipped {skipped} in unparseable batches" if skipped else "")
     return {"evaluations": all_evals, "tokens_used": total_tokens, "cost_usd": cost_total, "judge": EVAL_MODEL}
 
 
