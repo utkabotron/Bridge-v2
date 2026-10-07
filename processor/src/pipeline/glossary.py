@@ -21,7 +21,7 @@ import logging
 import time
 
 from bridge_shared.chat_context import covered_by_global
-from bridge_shared.glossary_match import GlossaryIndex
+from bridge_shared.glossary_match import GlossaryIndex, render_name
 
 from ..config import GLOSSARY_REFRESH_SECONDS, GLOSSARY_USED_STATUSES
 
@@ -36,6 +36,7 @@ _checked_at = 0.0
 _by_language: dict[str, GlossaryIndex] = {}
 _scoped: dict[tuple[int, str], GlossaryIndex] = {}     # ambiguous names, per chat
 _overrides: dict[tuple[int, str], GlossaryIndex] = {}
+_people: dict[str, GlossaryIndex] = {}                  # every person, any scope — for headers
 
 
 def _entry(row) -> dict:
@@ -48,7 +49,7 @@ def _is_global(row) -> bool:
 
 
 async def _refresh() -> None:
-    global _signature, _checked_at, _by_language, _scoped, _overrides
+    global _signature, _checked_at, _by_language, _scoped, _overrides, _people
     now = time.monotonic()
     if _signature is not None and now - _checked_at < GLOSSARY_REFRESH_SECONDS:
         return
@@ -82,7 +83,12 @@ async def _refresh() -> None:
 
         by_language: dict[str, dict] = {}
         scoped: dict[tuple[int, str], dict] = {}
+        people: dict[str, dict] = {}
         for r in rows:
+            if r.get("kind") == "person":
+                # In a sender's name the word IS a name, so names that are also words
+                # (עמוס) are safe here even where the prompt keeps them to their chats.
+                people.setdefault(r["target_language"], {})[r["source"]] = _entry(r)
             if _is_global(r):
                 by_language.setdefault(r["target_language"], {})[r["source"]] = _entry(r)
             else:
@@ -95,6 +101,7 @@ async def _refresh() -> None:
         _by_language = {lang: GlossaryIndex(e) for lang, e in by_language.items()}
         _scoped = {k: GlossaryIndex(e) for k, e in scoped.items()}
         _overrides = {k: GlossaryIndex(e) for k, e in overrides.items()}
+        _people = {lang: GlossaryIndex(e) for lang, e in people.items()}
         _signature = signature
         logger.info("Glossary loaded (%s): global %s, chat-scoped %d entries in %d chats, %d overrides",
                     ",".join(USED_STATUSES), {lang: len(i) for lang, i in _by_language.items()},
@@ -121,6 +128,16 @@ async def lookup(language: str, text: str, chat_pair_id: int | None = None) -> d
             hits = {k: v for k, v in hits.items() if not covered_by_global(k, own)}
             hits.update(own)
     return hits
+
+
+def sender_display(language: str, name: str) -> str:
+    """The sender's name for the message header: in the target script when every Hebrew
+    word of it is a known person's name, otherwise as WhatsApp gave it. No I/O — uses what
+    the last lookup loaded."""
+    people = _people.get(language)
+    if people is None or not name:
+        return name
+    return render_name(name, people) or name
 
 
 def index_for(language: str) -> GlossaryIndex | None:

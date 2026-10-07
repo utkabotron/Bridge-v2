@@ -114,3 +114,31 @@ class GlossaryIndex:
         """Exact entry for one word, no prefix stripping (a name in a header, not in prose)."""
         found = self._by_phrase.get(key_of(word))
         return found[1] if found else None
+
+
+_HEBREW_WORD = re.compile(r"[\u05d0-\u05ea][\u05d0-\u05ea׳״'\"]*")
+_OTHER_LETTERS = re.compile(r"[A-Za-z\u0400-\u04ff]")
+
+
+def render_name(name: str, people: GlossaryIndex) -> str | None:
+    """A Hebrew display name in the target script, word by word — or None to keep it as is.
+
+    Only when EVERY Hebrew word is a known person's name: "גילה דוד" → "Гила Давид", but a
+    channel ("מבצעים באושר 5 💥") or a half-known name stays as it is — half-transliterated
+    reads worse than either. A name that already has Latin or Cyrillic letters ("Isaac -
+    אייזיק") is readable as is. Emoji, digits and punctuation are kept in place.
+    """
+    if not name or _OTHER_LETTERS.search(name) or not _HEBREW_WORD.search(name):
+        return None
+    missing = False
+
+    def swap(m: re.Match) -> str:
+        nonlocal missing
+        entry = people.lookup_word(m.group(0))
+        if not entry or not entry.get("translation"):
+            missing = True
+            return m.group(0)
+        return entry["translation"]
+
+    out = _HEBREW_WORD.sub(swap, name)
+    return None if missing else out

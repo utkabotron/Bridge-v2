@@ -45,3 +45,18 @@ def test_lookup_word_is_exact():
     assert index.lookup_word("לדנה") is None
     assert len(index) == 1
     assert GlossaryIndex({}).find("דנה") == {}
+
+
+def test_render_name_only_when_every_hebrew_word_is_a_known_person():
+    from bridge_shared.glossary_match import render_name
+
+    people = GlossaryIndex({"גילה": {"translation": "Гила"}, "דוד": {"translation": "Давид"},
+                            "דנה": {"translation": "Дана"}, "ג׳ורג׳": {"translation": "Джордж"}})
+    assert render_name("גילה דוד", people) == "Гила Давид"
+    assert render_name("דנה 🌸", people) == "Дана 🌸"
+    assert render_name("ג'ורג'", people) == "Джордж"                      # ASCII geresh
+    assert render_name("דנה דרחי", people) is None                         # half-known: keep
+    assert render_name("מבצעים באושר 5 💥", people) is None                # a channel, not a person
+    assert render_name("Isaac - אייזיק", people) is None                   # already readable
+    assert render_name("Марина דנה", people) is None
+    assert render_name("", people) is None and render_name("💥", people) is None

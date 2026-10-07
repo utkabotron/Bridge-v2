@@ -345,7 +345,8 @@ def format_node(state: MessageState) -> MessageState:
     """
     original = state.get("original_text", "")
     translated = state.get("translated_text")
-    sender = state.get("sender_name", "")
+    # A Hebrew display name in the reader's script when the glossary knows every word of it.
+    sender = glossary.sender_display(state.get("target_language", "Russian"), state.get("sender_name", ""))
 
     parts = []
     header = []
@@ -573,7 +574,7 @@ async def _deliver_location(state: MessageState, tg_chat_id: int) -> MessageStat
         latitude=loc["latitude"],
         longitude=loc["longitude"],
         title=loc.get("name"),
-        sender=state.get("sender_name"),
+        sender=glossary.sender_display(state.get("target_language", "Russian"), state.get("sender_name") or ""),
         reply_to_message_id=state.get("reply_to_message_id"),
     )
 

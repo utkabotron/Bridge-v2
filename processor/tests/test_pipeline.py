@@ -1105,3 +1105,27 @@ async def test_names_that_are_also_words_stay_in_their_chats(fresh_glossary):
         assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת", chat_pair_id=9)) == {"עמוס", "עידו"}
         assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת", chat_pair_id=2)) == {"עידו"}
         assert set(await fresh_glossary.lookup("Russian", "עמוס ועידו וקשת")) == {"עידו"}  # DM
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_glossary
+async def test_sender_header_in_the_readers_script(fresh_glossary):
+    """עמוס is kept to its chats in the prompt, but in a sender's name it is surely a name."""
+    from processor.src.pipeline.nodes import format_node
+
+    row = {"target_language": "Russian", "note": None, "kind": "person", "status": "verified"}
+    pool = _glossary_pool(rows=[
+        {**row, "source": "עמוס", "translation": "Амос", "also_word": True, "chat_pairs": [5]},
+        {**row, "source": "כהן", "translation": "Коэн", "also_word": True, "chat_pairs": []},
+        {**row, "source": "דנה", "translation": "Дана", "also_word": False, "chat_pairs": []},
+    ])
+    with patch("processor.src.db.get_pool", new=AsyncMock(return_value=pool)):
+        await fresh_glossary.lookup("Russian", "x")
+
+    known = format_node(_base_state(sender_name="עמוס כהן", target_language="Russian"))
+    assert known["formatted_text"].startswith("<b>Амос Коэн</b>")
+    assert known["formatted_text_plain"].startswith("<b>Амос Коэн</b>")
+    half = format_node(_base_state(sender_name="דנה דרחי", target_language="Russian"))
+    assert half["formatted_text"].startswith("<b>דנה דרחי</b>")
+    english = format_node(_base_state(sender_name="עמוס כהן", target_language="English"))
+    assert english["formatted_text"].startswith("<b>עמוס כהן</b>")      # no English entries
