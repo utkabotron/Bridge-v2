@@ -120,6 +120,9 @@ _HEBREW_WORD = re.compile(r"[\u05d0-\u05ea][\u05d0-\u05ea׳״'\"]*")
 _OTHER_LETTERS = re.compile(r"[A-Za-z\u0400-\u04ff]")
 
 
+_NAME_TAIL = re.compile(r"\s+[-–—|]\s+")
+
+
 def render_name(name: str, people: GlossaryIndex) -> str | None:
     """A Hebrew display name in the target script, word by word — or None to keep it as is.
 
@@ -127,8 +130,19 @@ def render_name(name: str, people: GlossaryIndex) -> str | None:
     channel ("מבצעים באושר 5 💥") or a half-known name stays as it is — half-transliterated
     reads worse than either. A name that already has Latin or Cyrillic letters ("Isaac -
     אייזיק") is readable as is. Emoji, digits and punctuation are kept in place.
+
+    What follows " - " (or –, —, |) is a profession or a note, not the name: "ליאור יהודאי
+    כהן - קלינאית תקשורת" → "Лиор Яхудай Коэн - קלינאית תקשורת"; the tail is kept as is.
     """
-    if not name or _OTHER_LETTERS.search(name) or not _HEBREW_WORD.search(name):
+    if not name:
+        return None
+    parts = _NAME_TAIL.split(name, maxsplit=1)
+    if len(parts) == 2:
+        head = render_name(parts[0], people)
+        if head is None:
+            return None
+        return head + name[len(parts[0]):len(name) - len(parts[1])] + parts[1]
+    if _OTHER_LETTERS.search(name) or not _HEBREW_WORD.search(name):
         return None
     missing = False
 

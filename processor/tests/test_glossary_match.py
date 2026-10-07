@@ -60,3 +60,14 @@ def test_render_name_only_when_every_hebrew_word_is_a_known_person():
     assert render_name("Isaac - אייזיק", people) is None                   # already readable
     assert render_name("Марина דנה", people) is None
     assert render_name("", people) is None and render_name("💥", people) is None
+
+
+def test_render_name_leaves_the_profession_after_a_dash():
+    from bridge_shared.glossary_match import render_name
+
+    people = GlossaryIndex({"ליאור": {"translation": "Лиор"}, "כהן": {"translation": "Коэн"}})
+    assert render_name("ליאור כהן - קלינאית תקשורת", people) == "Лиор Коэн - קלינאית תקשורת"
+    assert render_name("ליאור | Speech therapist", people) == "Лиор | Speech therapist"
+    assert render_name("ליאור-כהן", people) == "Лиор-Коэн"                 # a hyphen inside is not a tail
+    assert render_name("Isaac - אייזיק", people) is None                   # the head is Latin
+    assert render_name("מיטל - בוטיק", people) is None                     # head unknown
