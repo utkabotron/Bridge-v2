@@ -260,9 +260,9 @@ async def test_translate_node_llm_call():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flag_on,pair,expected_version,expected_model", [
-    (True, 29, "v2.10@gpt-6-luna", "gpt-6-luna"),
-    (True, 12, "v2.10", "default"),
-    (False, 29, "v2.10", "default"),
+    (True, 29, "v3.0@gpt-6-luna", "default"),
+    (True, 12, "v2.10@gpt-6-luna", "default"),
+    (False, 29, "v2.10@gpt-6-luna", "default"),
 ])
 async def test_translate_node_runs_the_ab_variant_and_records_its_version(flag_on, pair, expected_version, expected_model):
     """Odd pairs get variant B while the flag is on; the version rides along for the evaluation."""

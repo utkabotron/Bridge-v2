@@ -66,16 +66,16 @@ def test_admins_get_variant_b_in_every_chat():
 
 
 def test_variant_b_changes_exactly_one_thing():
-    """Right now B is the same prompt on another model, so the test measures the model."""
+    """After the model A/B (luna promoted), B is the v3.0 prompt on the same model."""
+    from processor.src.config import OPENAI_MODEL
     from processor.src.pipeline.prompts import VARIANTS, SYSTEM_TRANSLATE_B
     a, b = VARIANTS["A"], VARIANTS["B"]
-    assert a["template"] == b["template"]
-    assert a["model"] is None and b["model"] == "gpt-6-luna"
-    assert b["version"] != a["version"] and b["version"].startswith(PROMPT_VERSION)
-    assert get_translate_prompt("Russian", variant="B") == get_translate_prompt("Russian", variant="A")
+    assert a["model"] is None and b["model"] is None
+    assert a["version"] == f"{PROMPT_VERSION}@{OPENAI_MODEL}" and b["version"] == f"{PROMPT_VERSION_B}@{OPENAI_MODEL}"
+    assert b["template"] == SYSTEM_TRANSLATE_B and a["template"] != b["template"]
+    assert "Compound nouns" in get_translate_prompt("Russian", variant="B")
     assert get_translate_prompt("Russian", variant="nonsense") == get_translate_prompt("Russian")
-    # The v3.0 prompt text is kept for the next experiment
-    assert "Compound nouns" in SYSTEM_TRANSLATE_B and PROMPT_VERSION_B != PROMPT_VERSION
+    assert OPENAI_MODEL == "gpt-6-luna"
 
 
 @pytest.mark.asyncio

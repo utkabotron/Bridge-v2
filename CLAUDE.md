@@ -180,7 +180,7 @@ processor и bot НЕ общаются — оба независимо → Postg
 меняется только через A/B → `/weekly-improve` (продвижение B → A описано в скилле). Разовая чистка:
 `docker compose exec analytics python -m flows.chat_context_builder --prune-glossaries`.
 
-**Модели processor:** `OPENAI_MODEL` — вариант A моста (A/B); `DIRECT_MODEL` — личка бота
+**Модели processor:** `OPENAI_MODEL` — вариант A моста (A/B), по умолчанию `gpt-6-luna` с 09.10 (bake-off 06.10 и 09.10 + живой A/B); версия перевода = `v2.10@<модель>`, голая `v2.10` в старых строках = gpt-4.1-mini; `DIRECT_MODEL` — личка бота
 (`/translate`) и анализ медиа, по умолчанию = `OPENAI_MODEL`; `TRANSCRIBE_MODEL` — голосовые.
 
 **Jev:** нужен `TYPESAFE_API_KEY` в `.env`, без него любой режим = off. `shadow` пишет строки
@@ -271,7 +271,7 @@ Module: `processor/src/feature_flags.py`. API: `GET/PATCH /api/flags/{name}`.
 | translation_enabled | POST /translate |
 | media_analysis_enabled | POST /analyze, /analyze-direct |
 | admin_alerts_enabled | 401 + failure rate alerts to admins |
-| prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (сейчас gpt-6-luna на промпте v2.10), чётные/DM → A; чаты `AB_ALWAYS_B_USERS` (по умолчанию админы) — всегда B; сравнение по `prompt_version` в оценках |
+| prompt_ab_enabled | A/B переводчика: нечётные пары → вариант B из `prompts.VARIANTS` (ВЫКЛЮЧЕН с 09.10: модельный A/B завершён, luna стала A; B ждёт — промпт v3.0 на luna), чётные/DM → A; чаты `AB_ALWAYS_B_USERS` (по умолчанию админы) — всегда B; сравнение по `prompt_version` в оценках |
 
 ## DATABASE
 

@@ -5,9 +5,10 @@ Change PROMPT_VERSION when updating the system prompt.
 A/B: with the `prompt_ab_enabled` feature flag on, odd-numbered chat pairs are translated
 with variant B — a prompt text and/or a model (VARIANTS below). Every message and
 evaluation records the variant's version string, so translation_evaluations.prompt_version
-compares the two after a week. One change per experiment: the bake-off of 2026-10-06
-(docs/model-bakeoff-2026-10-06.md) put gpt-6-luna far ahead of gpt-4.1-mini, so B is now
-the production prompt on gpt-6-luna; the v3.0 prompt text waits its turn. To promote a
+compares the two after a week. One change per experiment. 2026-10-09: the model A/B
+(gpt-6-luna vs gpt-4.1-mini) ended with luna promoted to OPENAI_MODEL; B is now the v3.0
+prompt text on the same model, waiting with the flag off. The version string carries the
+model ("v2.10@gpt-6-luna"; a bare "v2.10" in old rows is gpt-4.1-mini). To promote a
 model: set OPENAI_MODEL; to promote a prompt: copy its text into SYSTEM_TRANSLATE and bump
 PROMPT_VERSION; then turn the flag off. A version change lands in analytics_changelog on
 the next processor start (register_prompt), which is how the weekly report learns of it.
@@ -15,6 +16,8 @@ the next processor start (register_prompt), which is how the weekly report learn
 # The chat-context block lives in bridge_shared so the model bake-off (analytics) sends
 # exactly what the translator sends. Re-exported: callers import it from here.
 from bridge_shared.chat_context import format_chat_context as format_chat_context
+
+from ..config import OPENAI_MODEL
 
 PROMPT_VERSION = "v2.10"
 
@@ -72,8 +75,8 @@ Rules:
 # A variant: the version string recorded with every translation, the prompt template, and
 # the model (None = OPENAI_MODEL). B differs from A in exactly one thing at a time.
 VARIANTS: dict[str, dict] = {
-    "A": {"version": PROMPT_VERSION, "template": SYSTEM_TRANSLATE, "model": None},
-    "B": {"version": f"{PROMPT_VERSION}@gpt-6-luna", "template": SYSTEM_TRANSLATE, "model": "gpt-6-luna"},
+    "A": {"version": f"{PROMPT_VERSION}@{OPENAI_MODEL}", "template": SYSTEM_TRANSLATE, "model": None},
+    "B": {"version": f"{PROMPT_VERSION_B}@{OPENAI_MODEL}", "template": SYSTEM_TRANSLATE_B, "model": None},
 }
 
 

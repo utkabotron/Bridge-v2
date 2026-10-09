@@ -59,7 +59,9 @@ TARGET_LANGUAGE = os.getenv("TARGET_LANGUAGE", "Hebrew")
 # ── Alerting ─────────────────────────────────────────────
 ADMIN_TG_IDS = admin_tg_ids()
 # Bridge translation model — variant A of the prompt/model A/B (prompts.VARIANTS).
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+# gpt-6-luna since 2026-10-09: won the bake-offs (docs/model-bakeoff-2026-10-06.md, -09.md)
+# and the live A/B (4.37 vs 3.50, 18% vs 50% bad) at a quarter of gpt-4.1-mini's price.
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-6-luna")
 # Model for everything outside the bridge A/B: bot DM translation and media analysis.
 # OPENAI_MODEL stays variant A of the A/B, so promoting a model here does not touch it.
 DIRECT_MODEL = os.getenv("DIRECT_MODEL") or OPENAI_MODEL
