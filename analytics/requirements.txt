@@ -6,6 +6,7 @@ python-dotenv>=1.0.0
 sqlalchemy>=2.0.0
 httpx>=0.27.0
 openai>=1.68.0
+anthropic>=1.12.0  # model bake-off only (flows/model_bakeoff.py)
 # Jev classifier for translation_quality (JEV_MODE); dormant without TYPESAFE_API_KEY
 typesafe-sdk>=0.7.2
 ruff>=0.4.0

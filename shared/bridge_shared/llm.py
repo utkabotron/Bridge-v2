@@ -28,6 +28,12 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
     "gpt-4.1-mini": (0.40, 1.60),
     "gpt-4o-mini": (0.15, 0.60),
     "o3": (2.00, 8.00),
+    # Anthropic — platform.claude.com/docs/en/about-claude/pricing, 2026-10-09 (Haiku 5.5:
+    # prompts up to 100k tokens; ours are ~2k). Candidates in the model bake-off.
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-haiku-4-5": (1.00, 5.00),
 }
 # $/minute of audio
 TRANSCRIBE_PRICES: dict[str, float] = {

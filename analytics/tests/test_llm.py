@@ -50,3 +50,10 @@ def test_cost_uses_the_price_table_and_halves_on_flex():
     assert llm.usage_cost("unknown-model", usage) == 0.0
     responses_usage = SimpleNamespace(input_tokens=10, output_tokens=5)
     assert llm.total_tokens(responses_usage) == 15
+
+
+def test_claude_models_are_priced_and_never_sent_to_flex():
+    from bridge_shared.llm import supports_flex, token_cost
+    assert token_cost("claude-haiku-5-5", 1_000_000, 1_000_000) == 0.60
+    assert token_cost("claude-sonnet-5-5", 1_000_000, 0) == 2.00
+    assert not supports_flex("claude-opus-5-5")
