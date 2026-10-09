@@ -8,6 +8,7 @@ import pytest
 from processor.src.pipeline.prompts import (
     PROMPT_VERSION,
     PROMPT_VERSION_B,
+    VARIANTS,
     choose_variant,
     format_chat_context,
     get_translate_prompt,
@@ -89,14 +90,24 @@ async def test_register_prompt_logs_a_version_change_for_the_weekly_report():
     assert keys == ["translate", "translate_b"]
     changelog = [call for call in pool.execute.await_args_list if "analytics_changelog" in call.args[0]]
     assert len(changelog) == 1
-    assert changelog[0].args[1] == f"translate prompt v2.9 → {PROMPT_VERSION}"
+    assert changelog[0].args[1] == f"translate prompt v2.9 → {VARIANTS['A']['version']}"
     assert "gpt-6-luna" in changelog[0].args[2]
 
 
 @pytest.mark.asyncio
 async def test_register_prompt_is_silent_when_the_version_is_unchanged():
     pool = AsyncMock()
-    pool.fetchrow = AsyncMock(return_value={"version": PROMPT_VERSION})
+    pool.fetchrow = AsyncMock(return_value={"version": VARIANTS["A"]["version"]})
     await register_prompt(pool)
     assert not [c for c in pool.execute.await_args_list if "analytics_changelog" in c.args[0]]
 
+
+
+@pytest.mark.asyncio
+async def test_register_prompt_logs_a_model_change_with_the_same_prompt_text():
+    """2026-10-09: v2.10 → v2.10@gpt-6-luna is a change the weekly report must see."""
+    pool = AsyncMock()
+    pool.fetchrow = AsyncMock(return_value={"version": PROMPT_VERSION})   # old bare label
+    await register_prompt(pool)
+    changelog = [c for c in pool.execute.await_args_list if "analytics_changelog" in c.args[0]]
+    assert len(changelog) == 1 and "@" in changelog[0].args[1]

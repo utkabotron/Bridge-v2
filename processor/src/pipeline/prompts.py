@@ -124,13 +124,16 @@ async def register_prompt(pool) -> None:
             key, version, content,
         )
 
-    if previous and previous != PROMPT_VERSION:
+    # The full version of A, model included: comparing the bare PROMPT_VERSION missed the
+    # 2026-10-09 switch to gpt-6-luna, where only the model changed.
+    current = VARIANTS["A"]["version"]
+    if previous and previous != current:
         await pool.execute(
             """
             INSERT INTO analytics_changelog (change_type, description, impact_notes)
             VALUES ('prompt_version', $1, $2)
             """,
-            f"translate prompt {previous} → {PROMPT_VERSION}",
+            f"translate prompt {previous} → {current}",
             f"Variant B for the A/B flag is {VARIANTS['B']['version']}. "
             "Compare translation_evaluations.prompt_version from this date.",
         )
