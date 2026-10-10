@@ -36,7 +36,7 @@ from .config import (
 from .alerts import SlidingWindow, notify_admins
 from .pipeline.events import emit, subscribe, unsubscribe
 from .pipeline.graph import pipeline
-from .media_analyzer import analyze_image, transcribe_audio, analyze_document
+from .media_analyzer import analyze_image, direct_voice, transcribe_audio, analyze_document
 from .pipeline.cache import lookup_chat_pairs
 from .db import get_pool, fetch_delivered_pair_ids, insert_direct_translation, insert_direct_media_analysis
 
@@ -911,7 +911,11 @@ async def analyze_direct(
     import hashlib as _hashlib
     from .pipeline.cache import get_cached_media, set_cached_media
     file_hash = _hashlib.sha256(content_bytes).hexdigest()
-    cached = await get_cached_media(file_hash, target_lang)
+    is_audio = mime_type.startswith("audio/") or mime_type == "application/ogg"
+    # A voice note's reply does not depend on the account language (direct_voice); its own
+    # cache key also keeps replies cached in the old one-text format from coming back.
+    cache_lang = "voice-v2" if is_audio else target_lang
+    cached = await get_cached_media(file_hash, cache_lang)
     if cached:
         logger.info("Media analysis cache hit for %s (hash=%s…)", filename, file_hash[:12])
         return {"result_text": cached, "analysis_type": "cached", "processing_ms": 0}
@@ -921,15 +925,15 @@ async def analyze_direct(
         if mime_type.startswith("image/"):
             analysis_type = "image"
             result_text = await analyze_image(content_bytes, mime_type, target_lang)
-        elif mime_type.startswith("audio/") or mime_type == "application/ogg":
+        elif is_audio:
             analysis_type = "audio"
-            result_text = await transcribe_audio(content_bytes, filename, target_lang)
+            result_text = await direct_voice(content_bytes, filename)
         else:
             analysis_type = "document"
             result_text = await analyze_document(content_bytes, filename, mime_type, target_lang)
 
         processing_ms = int((time.monotonic() - t0) * 1000)
-        await set_cached_media(file_hash, target_lang, result_text)
+        await set_cached_media(file_hash, cache_lang, result_text)
         await insert_direct_media_analysis(
             user_id, analysis_type, mime_type, filename, result_text, processing_ms,
         )

@@ -7,13 +7,21 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 from typing import Optional
+
+from bridge_shared.scripts import CYRILLIC_RE, HEBREW_RE, LATIN_RE
 
 from . import llm
 from .config import (
     AUDIO_ANALYSIS_TIMEOUT,
     DIRECT_MODEL,
+    DIRECT_VOICE_FROM_HEBREW,
+    DIRECT_VOICE_TARGET,
+    VOICE_LANGUAGE_MARKS,
+    VOICE_LATIN_MARK,
+    VOICE_ORIGINAL_MARK,
     DOCUMENT_ANALYSIS_TIMEOUT,
     IMAGE_ANALYSIS_TIMEOUT,
     TRANSCRIBE_MODEL,
@@ -93,6 +101,60 @@ async def transcribe_audio(audio_bytes: bytes, filename: str, target_lang: str) 
         timeout=AUDIO_ANALYSIS_TIMEOUT,
     )
     return result.text
+
+
+# ── Voice note sent to the bot in private ────────────────
+
+def is_hebrew_speech(text: str) -> bool:
+    """Mostly Hebrew letters — a Hebrew name inside a Russian sentence does not count."""
+    return len(HEBREW_RE.findall(text)) > len(CYRILLIC_RE.findall(text)) + len(LATIN_RE.findall(text))
+
+
+def _voice_prompt(target: str, hebrew_side: str) -> str:
+    return (
+        f"Translate the user's text (a voice-note transcription) into {target}. Then write the "
+        f"{hebrew_side} Hebrew text in Latin letters, the way an Israeli pronounces it (e.g. "
+        "שלום, מה נשמע → Shalom, ma nishma), for someone who cannot read Hebrew script.\n"
+        'Return ONLY JSON: {"translation": "...", "latin": "..."}. Translate the whole text, '
+        "keep its tone, add nothing."
+    )
+
+
+async def direct_voice(audio_bytes: bytes, filename: str) -> str:
+    """Transcript + translation + Hebrew in Latin letters, for the bot's private chat.
+
+    It used to be "transcript, then translate to the account language" — for Russian
+    speech and a Russian account that returned the same text twice.
+    """
+    transcript = await llm.transcribe(
+        audio_bytes, filename, model=TRANSCRIBE_MODEL, timeout=AUDIO_ANALYSIS_TIMEOUT,
+    )
+    if not transcript:
+        return "(empty audio)"
+
+    from_hebrew = is_hebrew_speech(transcript)
+    target = DIRECT_VOICE_FROM_HEBREW if from_hebrew else DIRECT_VOICE_TARGET
+    result = await llm.chat(
+        [
+            {"role": "system", "content": _voice_prompt(target, "original" if from_hebrew else "translated")},
+            {"role": "user", "content": transcript},
+        ],
+        model=DIRECT_MODEL, purpose="voice_translate", max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT,
+    )
+    try:
+        raw = result.text.strip()
+        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        translation, latin = str(data.get("translation") or "").strip(), str(data.get("latin") or "").strip()
+    except (ValueError, AttributeError):
+        logger.warning("Voice translation was not JSON — sending it as is")
+        translation, latin = result.text.strip(), ""
+
+    mark = VOICE_LANGUAGE_MARKS.get(target, "🌐")
+    original = f"{VOICE_ORIGINAL_MARK} {transcript}"
+    reading = f"\n{VOICE_LATIN_MARK} {latin}" if latin else ""
+    if from_hebrew:
+        return f"{original}{reading}\n\n{mark} {translation}"
+    return f"{original}\n\n{mark} {translation}{reading}"
 
 
 # ── Document analysis (PDF/text) ─────────────────────────

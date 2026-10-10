@@ -155,6 +155,15 @@ STATS_CACHE_TTL = int(os.getenv("STATS_CACHE_TTL", 60))
 # ── Media analysis ───────────────────────────────────────
 IMAGE_ANALYSIS_TIMEOUT = int(os.getenv("IMAGE_ANALYSIS_TIMEOUT", 60))
 AUDIO_ANALYSIS_TIMEOUT = int(os.getenv("AUDIO_ANALYSIS_TIMEOUT", 120))
+
+# Voice notes sent to the bot in private (media_analyzer.direct_voice): non-Hebrew speech is
+# translated into Hebrew, Hebrew speech into Russian; the Hebrew side always comes with a
+# Latin-letter reading. The labels open each line of the reply.
+DIRECT_VOICE_TARGET = os.getenv("DIRECT_VOICE_TARGET", "Hebrew")
+DIRECT_VOICE_FROM_HEBREW = os.getenv("DIRECT_VOICE_FROM_HEBREW", "Russian")
+VOICE_ORIGINAL_MARK = "🎙"
+VOICE_LATIN_MARK = "🔤"
+VOICE_LANGUAGE_MARKS = {"Hebrew": "🇮🇱", "Russian": "🇷🇺", "English": "🇬🇧"}
 DOCUMENT_ANALYSIS_TIMEOUT = int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", 60))
 
 # ── S3/MinIO ────────────────────────────────────────────
