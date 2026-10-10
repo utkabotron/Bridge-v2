@@ -18,6 +18,9 @@ LATIN_RE = re.compile(r"[A-Za-z]")
 # Target language as stored on users/chat_pairs (any case) → the script it is written in.
 TARGET_SCRIPT_RE: dict[str, re.Pattern[str]] = {
     "russian": CYRILLIC_RE,
+    # The bot's voice notes are translated into Hebrew (processor media_analyzer.direct_voice);
+    # without this entry its "is the answer really Hebrew" check silently passed everything.
+    "hebrew": HEBREW_RE,
     "ukrainian": CYRILLIC_RE,
     "english": LATIN_RE,
     "spanish": LATIN_RE,

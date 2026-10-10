@@ -63,6 +63,7 @@ def test_the_processors_models_are_priced():
 def test_target_script_lookup():
     assert scripts.target_script_re(" Russian ") is scripts.CYRILLIC_RE
     assert scripts.target_script_re("ENGLISH") is scripts.LATIN_RE
+    assert scripts.target_script_re("Hebrew") is scripts.HEBREW_RE
     assert scripts.target_script_re("Thai") is None
     assert scripts.target_script_re(None) is None
     assert scripts.SOURCE_SCRIPT_RE.search("مرحبا") and scripts.HEBREW_RE.search("שלום")

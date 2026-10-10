@@ -7,11 +7,10 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import logging
 from typing import Optional
 
-from bridge_shared.scripts import CYRILLIC_RE, HEBREW_RE, LATIN_RE
+from bridge_shared.scripts import CYRILLIC_RE, HEBREW_RE, LATIN_RE, target_script_re
 
 from . import llm
 from .config import (
@@ -110,14 +109,49 @@ def is_hebrew_speech(text: str) -> bool:
     return len(HEBREW_RE.findall(text)) > len(CYRILLIC_RE.findall(text)) + len(LATIN_RE.findall(text))
 
 
-def _voice_prompt(target: str, hebrew_side: str) -> str:
-    return (
-        f"Translate the user's text (a voice-note transcription) into {target}. Then write the "
-        f"{hebrew_side} Hebrew text in Latin letters, the way an Israeli pronounces it (e.g. "
-        "שלום, מה נשמע → Shalom, ma nishma), for someone who cannot read Hebrew script.\n"
-        'Return ONLY JSON: {"translation": "...", "latin": "..."}. Translate the whole text, '
-        "keep its tone, add nothing."
-    )
+LATIN_READING_PROMPT = (
+    "Write the user's Hebrew text in Latin letters, the way an Israeli pronounces it "
+    "(e.g. שלום, מה נשמע → Shalom, ma nishma), for someone who cannot read Hebrew script. "
+    "Output only the Latin-letter text, nothing else."
+)
+
+
+async def _translate_voice(transcript: str, target: str) -> str:
+    """The transcript in `target`, by the bridge translator's own prompt; one corrective turn
+    when the answer is not in the target script. Asking for translation and reading in one
+    JSON once returned the Russian text under the Hebrew flag."""
+    from .pipeline.prompts import get_translate_prompt
+
+    messages = [{"role": "system", "content": get_translate_prompt(target)},
+                {"role": "user", "content": transcript}]
+    translated = (await llm.chat(messages, model=DIRECT_MODEL, purpose="voice_translate",
+                                 max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT)).text.strip()
+    script = target_script_re(target)
+    if script is None or script.search(translated):
+        return translated
+    logger.warning("Voice translation came back outside %s script — retrying once", target)
+    retry = messages + [
+        {"role": "assistant", "content": translated},
+        {"role": "user", "content": f"That is not {target}. Translate the original text into {target} "
+                                    f"now, in {target} script. Output only the translation."},
+    ]
+    retried = (await llm.chat(retry, model=DIRECT_MODEL, purpose="voice_translate_retry",
+                              max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT)).text.strip()
+    return retried if script.search(retried) else translated
+
+
+async def _latin_reading(hebrew: str) -> str:
+    """The Hebrew text in Latin letters; "" when it cannot be had (the reply still goes out)."""
+    if not HEBREW_RE.search(hebrew):
+        return ""
+    try:
+        return (await llm.chat(
+            [{"role": "system", "content": LATIN_READING_PROMPT}, {"role": "user", "content": hebrew}],
+            model=DIRECT_MODEL, purpose="voice_latin", max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT,
+        )).text.strip()
+    except Exception as exc:
+        logger.warning("Latin reading failed (%s) — sending without it", exc)
+        return ""
 
 
 async def direct_voice(audio_bytes: bytes, filename: str) -> str:
@@ -134,20 +168,8 @@ async def direct_voice(audio_bytes: bytes, filename: str) -> str:
 
     from_hebrew = is_hebrew_speech(transcript)
     target = DIRECT_VOICE_FROM_HEBREW if from_hebrew else DIRECT_VOICE_TARGET
-    result = await llm.chat(
-        [
-            {"role": "system", "content": _voice_prompt(target, "original" if from_hebrew else "translated")},
-            {"role": "user", "content": transcript},
-        ],
-        model=DIRECT_MODEL, purpose="voice_translate", max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT,
-    )
-    try:
-        raw = result.text.strip()
-        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
-        translation, latin = str(data.get("translation") or "").strip(), str(data.get("latin") or "").strip()
-    except (ValueError, AttributeError):
-        logger.warning("Voice translation was not JSON — sending it as is")
-        translation, latin = result.text.strip(), ""
+    translation = await _translate_voice(transcript, target)
+    latin = await _latin_reading(transcript if from_hebrew else translation)
 
     mark = VOICE_LANGUAGE_MARKS.get(target, "🌐")
     original = f"{VOICE_ORIGINAL_MARK} {transcript}"
