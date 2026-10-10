@@ -17,10 +17,8 @@ from .config import (
     AUDIO_ANALYSIS_TIMEOUT,
     DIRECT_MODEL,
     DIRECT_VOICE_FROM_HEBREW,
+    DIRECT_VOICE_RULES,
     DIRECT_VOICE_TARGET,
-    VOICE_LANGUAGE_MARKS,
-    VOICE_LATIN_MARK,
-    VOICE_ORIGINAL_MARK,
     DOCUMENT_ANALYSIS_TIMEOUT,
     IMAGE_ANALYSIS_TIMEOUT,
     TRANSCRIBE_MODEL,
@@ -122,7 +120,7 @@ async def _translate_voice(transcript: str, target: str) -> str:
     JSON once returned the Russian text under the Hebrew flag."""
     from .pipeline.prompts import get_translate_prompt
 
-    messages = [{"role": "system", "content": get_translate_prompt(target)},
+    messages = [{"role": "system", "content": get_translate_prompt(target) + DIRECT_VOICE_RULES},
                 {"role": "user", "content": transcript}]
     translated = (await llm.chat(messages, model=DIRECT_MODEL, purpose="voice_translate",
                                  max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT)).text.strip()
@@ -141,21 +139,34 @@ async def _translate_voice(transcript: str, target: str) -> str:
 
 
 async def _latin_reading(hebrew: str) -> str:
-    """The Hebrew text in Latin letters; "" when it cannot be had (the reply still goes out)."""
+    """The Hebrew text in Latin letters; "" when it cannot be had (the reply still goes out).
+    A word left in Hebrew letters gets one corrective turn (10.10: "Mi shalcha הודעה …")."""
     if not HEBREW_RE.search(hebrew):
         return ""
+    messages = [{"role": "system", "content": LATIN_READING_PROMPT}, {"role": "user", "content": hebrew}]
     try:
-        return (await llm.chat(
-            [{"role": "system", "content": LATIN_READING_PROMPT}, {"role": "user", "content": hebrew}],
-            model=DIRECT_MODEL, purpose="voice_latin", max_tokens=2000, timeout=AUDIO_ANALYSIS_TIMEOUT,
-        )).text.strip()
+        latin = (await llm.chat(messages, model=DIRECT_MODEL, purpose="voice_latin", max_tokens=2000,
+                                timeout=AUDIO_ANALYSIS_TIMEOUT)).text.strip()
+        if HEBREW_RE.search(latin):
+            retried = (await llm.chat(messages + [
+                {"role": "assistant", "content": latin},
+                {"role": "user", "content": "Some words are still in Hebrew letters. Rewrite the whole "
+                                            "text in Latin letters only."},
+            ], model=DIRECT_MODEL, purpose="voice_latin_retry", max_tokens=2000,
+                timeout=AUDIO_ANALYSIS_TIMEOUT)).text.strip()
+            latin = retried if not HEBREW_RE.search(retried) else latin
+        return latin
     except Exception as exc:
         logger.warning("Latin reading failed (%s) — sending without it", exc)
         return ""
 
 
-async def direct_voice(audio_bytes: bytes, filename: str) -> str:
-    """Transcript + translation + Hebrew in Latin letters, for the bot's private chat.
+async def direct_voice(audio_bytes: bytes, filename: str) -> list[dict]:
+    """The reply for the bot's private chat as paragraphs: [{"text", "copy"}].
+
+    Non-Hebrew speech: transcript / Hebrew translation / its Latin reading. Hebrew speech:
+    transcript / its Latin reading / Russian translation. The Hebrew paragraph is marked
+    copy — the bot sends it as <code>, which Telegram copies with a tap.
 
     It used to be "transcript, then translate to the account language" — for Russian
     speech and a Russian account that returned the same text twice.
@@ -164,19 +175,23 @@ async def direct_voice(audio_bytes: bytes, filename: str) -> str:
         audio_bytes, filename, model=TRANSCRIBE_MODEL, timeout=AUDIO_ANALYSIS_TIMEOUT,
     )
     if not transcript:
-        return "(empty audio)"
+        return [{"text": "(empty audio)", "copy": False}]
 
     from_hebrew = is_hebrew_speech(transcript)
     target = DIRECT_VOICE_FROM_HEBREW if from_hebrew else DIRECT_VOICE_TARGET
     translation = await _translate_voice(transcript, target)
     latin = await _latin_reading(transcript if from_hebrew else translation)
 
-    mark = VOICE_LANGUAGE_MARKS.get(target, "🌐")
-    original = f"{VOICE_ORIGINAL_MARK} {transcript}"
-    reading = f"\n{VOICE_LATIN_MARK} {latin}" if latin else ""
     if from_hebrew:
-        return f"{original}{reading}\n\n{mark} {translation}"
-    return f"{original}\n\n{mark} {translation}{reading}"
+        parts = [(transcript, True), (latin, False), (translation, False)]
+    else:
+        parts = [(transcript, False), (translation, bool(HEBREW_RE.search(translation))), (latin, False)]
+    return [{"text": t, "copy": c} for t, c in parts if t]
+
+
+def voice_text(parts: list[dict]) -> str:
+    """The paragraphs as plain text (the stored analysis, clients without formatting)."""
+    return "\n\n".join(p["text"] for p in parts)
 
 
 # ── Document analysis (PDF/text) ─────────────────────────

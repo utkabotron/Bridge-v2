@@ -213,7 +213,15 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
             analysis_type = data.get("analysis_type", "")
             ms = data.get("processing_ms")
 
-            reply = esc(result_text)
+            parts = data.get("parts")
+            if parts:
+                # A voice note: paragraphs with a blank line between, the Hebrew one as
+                # <code> — a tap copies it whole.
+                reply = "\n\n".join(
+                    f"<code>{esc(p['text'])}</code>" if p.get("copy") else esc(p["text"]) for p in parts
+                )
+            else:
+                reply = esc(result_text)
             if ms:
                 reply += f"\n\n{italic(f'{ms}ms, {analysis_type}')}"
 

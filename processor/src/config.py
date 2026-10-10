@@ -158,12 +158,18 @@ AUDIO_ANALYSIS_TIMEOUT = int(os.getenv("AUDIO_ANALYSIS_TIMEOUT", 120))
 
 # Voice notes sent to the bot in private (media_analyzer.direct_voice): non-Hebrew speech is
 # translated into Hebrew, Hebrew speech into Russian; the Hebrew side always comes with a
-# Latin-letter reading. The labels open each line of the reply.
+# Latin-letter reading.
 DIRECT_VOICE_TARGET = os.getenv("DIRECT_VOICE_TARGET", "Hebrew")
 DIRECT_VOICE_FROM_HEBREW = os.getenv("DIRECT_VOICE_FROM_HEBREW", "Russian")
-VOICE_ORIGINAL_MARK = "🎙"
-VOICE_LATIN_MARK = "🔤"
-VOICE_LANGUAGE_MARKS = {"Hebrew": "🇮🇱", "Russian": "🇷🇺", "English": "🇬🇧"}
+# Added to the translator's prompt for voice notes: on 10.10 "Хэн" (a name) came back as
+# מי ("who") and the cigarette brand "Palmal Demi Silver" as דקל כסף ("palm silver").
+DIRECT_VOICE_RULES = (
+    "\nThis is a transcribed voice note. Keep brand and product names written in Latin "
+    "letters exactly as they are (e.g. Palmal Demi Silver). Write people's names in the "
+    "target script by their sound (e.g. Хэн → חן, Дана → דנה); never translate a name as "
+    "if it were an ordinary word.\n"
+)
+
 DOCUMENT_ANALYSIS_TIMEOUT = int(os.getenv("DOCUMENT_ANALYSIS_TIMEOUT", 60))
 
 # ── S3/MinIO ────────────────────────────────────────────

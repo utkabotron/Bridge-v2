@@ -498,3 +498,27 @@ async def test_pasted_hebrew_is_translated_into_russian_by_default():
     keyboard = preview_msg.edit_text.call_args.kwargs["reply_markup"]
     labels = [b.text for row in keyboard.inline_keyboard for b in row]
     assert labels == ["✓ Русский", "עברית", "English"]
+
+
+@pytest.mark.asyncio
+async def test_voice_note_reply_is_paragraphs_with_the_hebrew_tap_to_copy():
+    from bot.src.handlers.translate import handle_direct_media
+
+    msg = MagicMock()
+    msg.photo, msg.document, msg.audio, msg.video_note = None, None, None, None
+    msg.voice.get_file = AsyncMock(return_value=MagicMock(download_as_bytearray=AsyncMock(return_value=bytearray(b"ogg"))))
+    msg.voice.mime_type = "audio/ogg"
+    preview = MagicMock(edit_text=AsyncMock())
+    msg.reply_text = AsyncMock(return_value=preview)
+    update = MagicMock(message=msg)
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"result_text": "…", "analysis_type": "audio", "processing_ms": 900, "parts": [
+        {"text": "Привет <всем>", "copy": False}, {"text": "שלום לכולם", "copy": True}, {"text": "Shalom lekulam", "copy": False}]}
+
+    with patch("bot.src.handlers.translate.http_client.post", new_callable=AsyncMock, return_value=resp), \
+         patch("bot.src.handlers.translate.is_whitelisted", new=AsyncMock(return_value=True)):
+        await handle_direct_media(update, MagicMock())
+
+    text = preview.edit_text.await_args.args[0]
+    assert text.startswith("Привет &lt;всем&gt;\n\n<code>שלום לכולם</code>\n\nShalom lekulam")
+    assert "🎙" not in text and "🇮🇱" not in text
