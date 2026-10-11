@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bridge Tools</title>
-  <meta name="description" content="WhatsApp chats linked to Telegram groups, every message translated within seconds.">
+  <meta name="description" content="Work in WhatsApp groups in another language: chats mirrored into Telegram, translated with a glossary and context, with summaries, voice notes and document analysis.">
   <style>
     @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Regular.woff2') format('woff2'); font-weight: 400; font-display: swap; }
     @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Medium.woff2') format('woff2'); font-weight: 500; font-display: swap; }
@@ -18,9 +18,12 @@
       display: flex; align-items: center; justify-content: center; gap: 64px;
       padding: 48px 32px;
     }
-    main { max-width: 340px; display: flex; flex-direction: column; gap: 1.2em; }
+    main { max-width: 380px; display: flex; flex-direction: column; gap: 1.2em; }
     h1 { font-size: 15px; font-weight: 500; }
-    p { color: rgba(var(--ink),0.7); }
+    p, li { color: rgba(var(--ink),0.7); }
+    ul { list-style: none; display: flex; flex-direction: column; gap: 0.5em; }
+    li { padding-left: 1em; text-indent: -1em; }
+    li::before { content: '–  '; color: rgba(var(--ink),0.45); }
     .label { font-size: 11px; letter-spacing: 0.2em; color: rgba(var(--ink),0.45); }
     a { color: inherit; text-decoration: none; border-bottom: 1px solid rgba(var(--ink),0.25); }
     a:hover { color: var(--accent); border-bottom-color: var(--accent); }
@@ -35,7 +38,15 @@
   <main>
     <span class="label">coming soon</span>
     <h1>Bridge Tools</h1>
-    <p>Link a WhatsApp chat to a Telegram group, and every message arrives translated within seconds, both ways, photos and files included.</p>
+    <p>For working in group chats in a language you are still learning: many groups, one place, nothing lost in translation.</p>
+    <ul>
+      <li>Every WhatsApp chat mirrored into a Telegram group and translated within seconds, with photos, files, edits and replies.</li>
+      <li>A glossary for each chat keeps names and terms exact.</li>
+      <li>The model reads the conversation so far, so meaning carries from one message to the next.</li>
+      <li>A daily summary of each group catches you up.</li>
+      <li>Voice notes transcribed and translated; photos and documents explained on request.</li>
+      <li>A private translator in the bot, for text and voice, both ways.</li>
+    </ul>
     <p>Write to <a href="mailto:pavel@brik.vc">pavel@brik.vc</a> for early access.</p>
   </main>
   <img src="/landing/bridge.webp" alt="Bridge Tools: a translated chat in Telegram">
