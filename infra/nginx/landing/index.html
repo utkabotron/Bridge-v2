@@ -5,42 +5,44 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bridge Tools</title>
   <link rel="icon" href="/landing/favicon.svg" type="image/svg+xml">
-  <meta name="description" content="Work in WhatsApp groups in another language: chats mirrored into Telegram, translated with a glossary and context, with summaries, voice notes and document analysis.">
+  <meta name="description" content="Dozens of WhatsApp groups in a language you are still learning, carried into Telegram in yours, with names, context and voice notes intact.">
   <style>
     @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Regular.woff2') format('woff2'); font-weight: 400; font-display: swap; }
     @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Medium.woff2') format('woff2'); font-weight: 500; font-display: swap; }
     /* Brand: blue #3000FF, night #0F053E, mint #64FFEB, white */
     :root { --ink: 255,255,255; --bg: #3000FF; --accent: #64FFEB; }
-    @media (prefers-color-scheme: dark) { :root { --bg: #0F053E; } }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { height: 100%; }
     body {
       background: var(--bg); color: rgb(var(--ink));
-      font: 400 14px/1.45 'ABC Areal', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
-      display: flex; align-items: center; justify-content: center; gap: 64px;
-      padding: 48px 32px;
+      font: 400 15px/1.5 'ABC Areal', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
     }
-    main { max-width: 380px; display: flex; flex-direction: column; gap: 1.2em; }
-    h1 { line-height: 0; }
-    .logo { width: 200px; height: auto; color: #fff; }
-    p, li { color: rgba(var(--ink),0.8); }
-    ul { list-style: none; display: flex; flex-direction: column; gap: 0.5em; }
-    li { padding-left: 1em; text-indent: -1em; }
-    li::before { content: '–  '; color: var(--accent); }
-    .label { font-size: 11px; letter-spacing: 0.2em; color: var(--accent); }
+    .logo { position: absolute; top: 36px; right: 40px; width: 168px; height: auto; color: #fff; }
+    .wrap {
+      max-width: 1040px; margin: 0 auto; padding: 120px 40px 96px;
+      display: grid; grid-template-columns: minmax(0, 520px) auto; gap: 80px; align-items: start;
+    }
+    article { display: flex; flex-direction: column; gap: 2.4em; }
+    .lede h1 { font-size: 32px; line-height: 1.15; font-weight: 500; letter-spacing: -0.01em; }
+    .lede p { margin-top: 1em; color: rgba(var(--ink),0.8); }
+    section h2 { font-size: 15px; font-weight: 500; color: var(--accent); margin-bottom: 0.35em; }
+    section p { color: rgba(var(--ink),0.8); }
+    [lang="he"] { font-family: 'Arial Hebrew', Arial, sans-serif; }
+    footer { color: rgba(var(--ink),0.6); }
     a { color: var(--accent); text-decoration: none; border-bottom: 1px solid rgba(100,255,235,0.4); }
     a:hover { border-bottom-color: var(--accent); }
-    img { height: min(852px, 86vh); width: auto; border-radius: 28px; }
-    @media (max-width: 700px) {
-      body { flex-direction: column; justify-content: flex-start; gap: 40px; height: auto; padding: 40px 20px; }
-      img { height: auto; width: 100%; max-width: 360px; }
+    figure { position: sticky; top: 48px; }
+    figure img { display: block; height: min(760px, 86vh); width: auto; border-radius: 28px; }
+    @media (max-width: 860px) {
+      .logo { top: 24px; right: 20px; width: 128px; }
+      .wrap { grid-template-columns: 1fr; gap: 56px; padding: 88px 20px 64px; }
+      .lede h1 { font-size: 26px; }
+      figure { position: static; }
+      figure img { height: auto; width: 100%; max-width: 360px; }
     }
   </style>
 </head>
 <body>
-  <main>
-    <span class="label">coming soon</span>
-    <h1><svg class="logo" role="img" aria-label="Bridge Tools" viewBox="0 0 638 122" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <svg class="logo" role="img" aria-label="Bridge Tools" viewBox="0 0 638 122" fill="none" xmlns="http://www.w3.org/2000/svg">
 <path d="M58.595 68.7513C58.595 84.9916 47.0017 94.7476 27.3424 94.7476H10.1293C3.90044 94.7476 0 90.356 0 84.3727V19.1853C0 13.3297 4.02816 8.92822 10.2571 8.92822H28.5704C45.7835 8.92822 55.7949 17.3481 55.7949 30.415C55.7949 37.9801 51.5211 44.5725 44.0739 47.7459C52.985 50.8014 58.6048 58.6121 58.6048 68.7415L58.595 68.7513ZM27.8336 24.5594H17.0951V42.8728H28.3248C35.8899 42.8728 39.3089 37.872 39.3089 33.4705C39.3089 28.5876 35.5264 24.5594 27.8336 24.5594ZM27.0967 78.9985C38.0808 78.9985 41.7455 73.2608 41.7455 67.5232C41.7455 60.8129 36.7447 55.8022 26.7332 55.8022H17.0853V78.9985H27.0967Z" fill="currentColor"/>
 <path d="M84.2164 37.9907V87.311C84.2164 91.9287 80.5026 95.7996 75.8948 95.7309C71.0905 95.6621 67.7402 92.1448 67.7402 87.311V37.9907C67.7402 32.7344 71.5031 29.2368 76.6317 29.5905C80.9546 29.8951 84.2164 33.6579 84.2164 37.9907ZM110.213 39.091C110.213 43.974 106.067 47.8842 100.447 47.8842C94.0117 47.8842 89.2565 42.5297 91.0741 36.517C92.312 32.4298 96.1731 29.5807 100.437 29.5807C106.057 29.5807 110.213 34.0902 110.213 39.1009V39.091Z" fill="currentColor"/>
 <path d="M131.603 25.6601C131.603 30.5431 127.575 34.4533 121.837 34.4533C114.557 34.4533 109.065 27.2714 113.899 20.2074C115.333 18.1147 117.573 16.6705 120.079 16.2775C126.74 15.2459 131.603 20.1583 131.603 25.6601ZM153.945 15.9336V85.719C153.945 92.3114 151.017 95.6027 145.77 95.6027C140.524 95.6027 137.832 92.3114 137.832 85.719V15.8943C137.832 10.5398 141.614 6.99307 146.625 7.52361C150.84 7.96572 153.945 11.6991 153.945 15.9336Z" fill="currentColor"/>
@@ -48,18 +50,40 @@
 <path d="M305.256 99.8767C305.256 114.889 289.506 121 272.175 121C254.845 121 238.486 115.144 238.486 101.468C238.486 94.6303 242.514 89.7474 250.453 86.8196C243.615 84.6188 240.196 79.7359 240.196 74.2439C240.196 69.361 242.514 64.5959 249.47 62.2773C246.788 58.8583 245.197 54.7122 245.197 49.8293C245.197 37.6269 256.554 29.1973 270.829 29.1973C286.451 29.1973 296.217 39.2087 296.217 50.0749C296.217 60.9411 286.451 71.3161 270.829 71.3161C265.947 71.3161 261.427 70.3434 257.527 68.5062C255.454 69.4788 254.353 71.0705 254.353 73.0256C254.353 78.6454 263.756 79.3724 273.767 79.5001C290.007 79.618 305.265 85.2378 305.265 99.8865L305.256 99.8767ZM289.015 100.614C289.015 94.3847 282.541 92.3116 272.775 92.3116C262.518 92.3116 254.835 94.8759 254.835 100.859C254.835 106.842 262.164 108.915 272.166 108.915C282.167 108.915 289.015 106.469 289.015 100.614ZM260.091 50.0749C260.091 55.3213 265.337 58.0133 271.075 58.0133C277.785 58.0133 281.814 54.4764 281.814 50.0749C281.814 45.6734 277.785 42.5098 271.075 42.5098C265.337 42.5098 260.091 44.9562 260.091 50.0749Z" fill="currentColor"/>
 <path d="M359.332 66.7965L321.732 66.5508C323.196 75.4619 330.034 81.1996 338.818 81.1996C345.047 81.1996 349.929 79.1266 353.221 74.8528C354.93 72.8976 356.885 72.0429 358.841 72.0429C362.26 72.0429 365.187 74.8528 365.187 78.8809C365.187 80.7083 364.578 82.7912 363.114 84.9821C358.172 92.5275 348.466 96.0546 338.317 95.9662C319.856 95.7992 304.962 80.3153 305.256 61.8546C305.571 42.3229 319.856 29.3149 337.717 29.3149C355.579 29.3149 367.378 41.645 367.378 59.2216C367.378 64.1045 364.568 66.7866 359.322 66.7866L359.332 66.7965ZM321.978 55.0755H352.248C350.784 47.6283 344.801 43.2367 337.236 43.2367C329.671 43.2367 323.688 47.6283 321.978 55.0755Z" fill="currentColor"/>
 <path d="M598.061 17.868C574.406 6.99004 543.036 1 509.73 1C476.424 1 445.054 6.99004 421.399 17.868C396.878 29.1445 383.379 44.462 383.379 61C383.379 77.538 396.878 92.8555 421.399 104.132C445.054 115.01 476.424 121 509.73 121C543.036 121 574.406 115.01 598.061 104.132C622.576 92.8555 636.081 77.538 636.081 61C636.081 44.462 622.582 29.1445 598.061 17.868ZM595.141 24.2254C615.153 33.4284 626.941 45.1407 628.815 57.5068H586.735C585.652 42.6252 577.65 28.802 563.933 18.2727C560.82 15.8817 557.482 13.7273 553.97 11.8095C569.238 14.5616 583.229 18.746 595.141 24.2254ZM530.757 57.5068H488.709C489.5 28.1544 500.141 7.99253 509.736 7.99253C519.332 7.99253 529.973 28.1482 530.764 57.5068H530.757ZM489.151 19.655C484.686 29.9228 482.084 43.254 481.716 57.5068H439.743C441.816 33.5778 464.985 13.9328 495.297 9.12578C493.036 11.9465 490.963 15.477 489.145 19.655H489.151ZM481.71 64.4994C482.078 78.7522 484.68 92.0834 489.145 102.351C490.963 106.529 493.03 110.054 495.297 112.88C464.985 108.073 441.81 88.4284 439.743 64.4994H481.716H481.71ZM488.703 64.4994H530.751C529.96 93.8518 519.319 114.014 509.724 114.014C500.129 114.014 489.487 93.858 488.696 64.4994H488.703ZM530.309 102.351C534.774 92.0834 537.376 78.7522 537.744 64.4994H579.718C577.644 88.4284 554.475 108.073 524.163 112.88C526.424 110.06 528.497 106.529 530.315 102.351H530.309ZM537.75 57.5068C537.383 43.254 534.78 29.9228 530.315 19.655C528.497 15.477 526.43 11.9527 524.163 9.12578C554.475 13.9328 577.65 33.5778 579.718 57.5068H537.744H537.75ZM424.319 24.2254C436.231 18.746 450.228 14.5554 465.49 11.8095C461.972 13.7273 458.64 15.8879 455.527 18.2727C441.804 28.802 433.809 42.6252 432.725 57.5068H390.645C392.52 45.1407 404.307 33.4284 424.319 24.2254ZM424.319 97.7808C404.307 88.5778 392.52 76.8655 390.645 64.4994H432.725C433.809 79.3811 441.81 93.2042 455.527 103.733C458.64 106.125 461.978 108.279 465.49 110.197C450.222 107.445 436.231 103.26 424.319 97.7808ZM595.141 97.7808C583.229 103.26 569.232 107.451 553.97 110.197C557.488 108.279 560.82 106.118 563.933 103.733C577.657 93.2042 585.652 79.3811 586.735 64.4994H628.815C626.941 76.8655 615.153 88.5778 595.141 97.7808Z" fill="currentColor" stroke="currentColor" stroke-width="2"/>
-</svg></h1>
-    <p>For working in group chats in a language you are still learning: many groups, one place, nothing lost in translation.</p>
-    <ul>
-      <li>Every WhatsApp chat mirrored into a Telegram group and translated within seconds, with photos, files, edits and replies.</li>
-      <li>A glossary for each chat keeps names and terms exact.</li>
-      <li>The model reads the conversation so far, so meaning carries from one message to the next.</li>
-      <li>A daily summary of each group catches you up.</li>
-      <li>Voice notes transcribed and translated; photos and documents explained on request.</li>
-      <li>A private translator in the bot, for text and voice, both ways.</li>
-    </ul>
-    <p>Write to <a href="mailto:pavel@brik.vc">pavel@brik.vc</a> for early access.</p>
-  </main>
-  <img src="/landing/bridge.webp" alt="Bridge Tools: a translated chat in Telegram">
+</svg>
+  <div class="wrap">
+    <article>
+      <div class="lede">
+        <h1>Dozens of group chats in a language you are still learning.</h1>
+        <p>School, kindergarten, the building committee, work. Everyone writes fast, in slang and half-sentences. Bridge Tools carries each of these WhatsApp chats into Telegram, in your language. Translating the words is the easy part; this is about everything a plain translator gets wrong.</p>
+      </div>
+      <section>
+        <h2>“Amos is busy.”</h2>
+        <p>In Hebrew <span lang="he">עמוס</span> is a name and the word for busy; <span lang="he">אופק</span> is Ofek and also the horizon. Every name the service meets goes into a glossary, settled against the web or by hand, so a classmate never turns into the weather.</p>
+      </section>
+      <section>
+        <h2>“Yes, Thursday works.”</h2>
+        <p>Half of any chat answers something said an hour ago. The model reads the conversation so far, along with a profile of each group rebuilt every night: who is in it, how they talk, what keeps coming up.</p>
+      </section>
+      <section>
+        <h2>The copy behaves like the original.</h2>
+        <p>Fix a typo in WhatsApp and the message already delivered to Telegram is rewritten. Replies stay replies, deletions are marked, your own messages are not doubled.</p>
+      </section>
+      <section>
+        <h2>Voice, photos, paperwork.</h2>
+        <p>A voice note from a noisy street is transcribed and translated, with no words invented over the noise. A photo of a notice or a scanned letter is read and explained when you ask.</p>
+      </section>
+      <section>
+        <h2>A second opinion every night.</h2>
+        <p>A separate model grades the day’s translations, and the weak spots become next week’s fixes. A blind test of six models chose the translator and cut bad translations from one in three to one in ten.</p>
+      </section>
+      <section>
+        <h2>One page in the morning.</h2>
+        <p>Each group gets a daily summary, so a morning across all your groups reads like a single page.</p>
+      </section>
+      <footer>Running since 2024. Built by <a href="https://brik.vc/">brik.vc</a>.</footer>
+    </article>
+    <figure><img src="/landing/bridge.webp" alt="A Hebrew class chat translated in Telegram"></figure>
+  </div>
 </body>
 </html>
