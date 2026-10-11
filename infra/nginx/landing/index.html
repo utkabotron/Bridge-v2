@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bridge Tools</title>
+  <meta name="description" content="WhatsApp chats linked to Telegram groups, every message translated within seconds.">
+  <style>
+    @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Regular.woff2') format('woff2'); font-weight: 400; font-display: swap; }
+    @font-face { font-family: 'ABC Areal'; src: url('/landing/ABCAreal-Medium.woff2') format('woff2'); font-weight: 500; font-display: swap; }
+    :root { --ink: 26,26,26; --bg: #fff; --accent: #b35a2a; }
+    @media (prefers-color-scheme: dark) { :root { --ink: 240,236,226; --bg: #000; --accent: #e08a55; } }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      background: var(--bg); color: rgb(var(--ink));
+      font: 400 14px/1.45 'ABC Areal', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+      display: flex; align-items: center; justify-content: center; gap: 64px;
+      padding: 48px 32px;
+    }
+    main { max-width: 340px; display: flex; flex-direction: column; gap: 1.2em; }
+    h1 { font-size: 15px; font-weight: 500; }
+    p { color: rgba(var(--ink),0.7); }
+    .label { font-size: 11px; letter-spacing: 0.2em; color: rgba(var(--ink),0.45); }
+    a { color: inherit; text-decoration: none; border-bottom: 1px solid rgba(var(--ink),0.25); }
+    a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+    img { height: min(852px, 86vh); width: auto; border-radius: 28px; }
+    @media (max-width: 700px) {
+      body { flex-direction: column; justify-content: flex-start; gap: 40px; height: auto; padding: 40px 20px; }
+      img { height: auto; width: 100%; max-width: 360px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="label">coming soon</span>
+    <h1>Bridge Tools</h1>
+    <p>Link a WhatsApp chat to a Telegram group, and every message arrives translated within seconds, both ways, photos and files included.</p>
+    <p>Write to <a href="mailto:pavel@brik.vc">pavel@brik.vc</a> for early access.</p>
+  </main>
+  <img src="/landing/bridge.webp" alt="Bridge Tools: a translated chat in Telegram">
+</body>
+</html>

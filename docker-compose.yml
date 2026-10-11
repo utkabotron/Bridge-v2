@@ -109,6 +109,7 @@ services:
     volumes:
       - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
       - ./infra/nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+      - ./infra/nginx/landing:/var/www/landing:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
       - certbot_webroot:/var/www/certbot:ro
     depends_on:
