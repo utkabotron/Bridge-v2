@@ -9,7 +9,7 @@ from telegram import Update
 from ..utils import http_client
 from telegram.ext import ContextTypes
 
-from ..utils.telegram_format import esc
+from ..utils.telegram_format import esc, pack_messages, split_text
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +76,15 @@ async def cb_analyze_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             header = f"{type_emoji} <b>Analysis</b>"
             if processing_ms:
                 header += f" ({processing_ms}ms)"
-            reply_text = f"{header}\n\n{esc(result_text)}"
-
-            # Send as reply to the original message
+            # Send as reply to the original message — in several when it is long
             msg = query.message
-            await context.bot.send_message(
-                chat_id=msg.chat_id,
-                text=reply_text,
-                reply_to_message_id=msg.message_id,
-                parse_mode="HTML",
-            )
+            for text in pack_messages([header] + [esc(c) for c in split_text(result_text)]):
+                await context.bot.send_message(
+                    chat_id=msg.chat_id,
+                    text=text,
+                    reply_to_message_id=msg.message_id,
+                    parse_mode="HTML",
+                )
 
             # Update button to "Analyzed"
             try:

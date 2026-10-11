@@ -9,7 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters
 from telegram.error import BadRequest
 from ..utils import http_client
 from telegram.ext import ContextTypes
-from ..utils.telegram_format import esc, italic
+from ..utils.telegram_format import esc, italic, pack_messages, split_text
 from ..config import DIRECT_LANGUAGES, DIRECT_LANG_BY_NAME, default_direct_language
 from ..db import is_whitelisted
 from ..templates.messages import render
@@ -213,19 +213,19 @@ async def handle_direct_media(update: Update, context: ContextTypes.DEFAULT_TYPE
             analysis_type = data.get("analysis_type", "")
             ms = data.get("processing_ms")
 
-            parts = data.get("parts")
-            if parts:
-                # A voice note: paragraphs with a blank line between, the Hebrew one as
-                # <code> — a tap copies it whole.
-                reply = "\n\n".join(
-                    f"<code>{esc(p['text'])}</code>" if p.get("copy") else esc(p["text"]) for p in parts
-                )
-            else:
-                reply = esc(result_text)
+            parts = data.get("parts") or [{"text": result_text, "copy": False}]
+            # Paragraphs with a blank line between; a voice note's Hebrew one as <code> — a
+            # tap copies it whole. Long text goes out in several messages (Telegram's limit).
+            blocks = [
+                f"<code>{esc(chunk)}</code>" if p.get("copy") else esc(chunk)
+                for p in parts for chunk in split_text(p["text"])
+            ]
             if ms:
-                reply += f"\n\n{italic(f'{ms}ms, {analysis_type}')}"
-
-            await preview_msg.edit_text(reply, parse_mode="HTML")
+                blocks.append(italic(f"{ms}ms, {analysis_type}"))
+            first, *rest = pack_messages(blocks)
+            await preview_msg.edit_text(first, parse_mode="HTML")
+            for text in rest:
+                await msg.reply_text(text, parse_mode="HTML")
         else:
             error = r.text
             logger.error("Processor /analyze-direct returned %s: %s", r.status_code, error)
